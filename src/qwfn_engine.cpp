@@ -466,7 +466,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     ec_cfg.max_promotions_per_layer = cfg.promote_per_layer;
     ec_cfg.ram_frac      = cfg.ram_frac;
     ec_cfg.ram_headroom  = cfg.ram_headroom;
-    ec_cfg.io_backend  = cfg.io_threads ? io_engine::backend::threads : io_engine::backend::uring;
+    ec_cfg.io_backend  = cfg.io_threads ? io_engine::backend::threads : io_engine::backend::async;
     if (cfg.io_threads) ec_cfg.queue_depth = cfg.io_workers;
     ec_cfg.policy = cfg.evict_policy == 1 ? expert_cache::config::evict_policy::lfu
                   : cfg.evict_policy == 2 ? expert_cache::config::evict_policy::hybrid

@@ -1,11 +1,8 @@
 #include "qwfn_weights.h"
+#include "qwfn_plat.h"
 
-#include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 #include <vector>
 
 namespace qwfn {
@@ -13,7 +10,7 @@ namespace qwfn {
 weights::~weights() {
     for (auto b : map_buf_) if (b) ggml_backend_buffer_free(b);
     for (size_t i = 0; i < map_base_.size(); i++)
-        if (map_base_[i]) munmap(map_base_[i], map_size_[i]);
+        if (map_base_[i]) plat_unmap(map_base_[i], map_size_[i]);
     if (buf_)     ggml_backend_buffer_free(buf_);
     if (ctx_)     ggml_free(ctx_);
     if (backend_) ggml_backend_free(backend_);
@@ -107,15 +104,17 @@ bool weights::commit(std::string & err) {
 
     // One fd per shard, plain buffered reads: this is a single 5.35 GB pass at load
     // time, not a hot path, and the page cache warming here is harmless.
-    std::vector<int> fds;
+    std::vector<file_handle> fds;
     for (const auto & p : mi_->shard_paths()) {
-        int fd = ::open(p.c_str(), O_RDONLY);
-        if (fd < 0) {
-            for (int f : fds) ::close(f);
-            err = "open failed: " + p + ": " + strerror(errno);
+        // Buffered: this is a single 5.35 GB pass at load time, and the page
+        // cache warming it leaves behind is harmless.
+        const file_handle h = plat_open_read(p.c_str(), /*direct=*/false, nullptr);
+        if (h == FILE_NONE) {
+            for (file_handle f : fds) plat_close(f);
+            err = "open failed: " + p + ": " + plat_last_error();
             return false;
         }
-        fds.push_back(fd);
+        fds.push_back(h);
     }
 
     std::vector<uint8_t> staging;
@@ -124,16 +123,16 @@ bool weights::commit(std::string & err) {
         staging.resize(ref->nbytes);
         size_t done = 0;
         while (done < ref->nbytes) {
-            const ssize_t n = ::pread(fds[ref->shard], staging.data() + done,
-                                      ref->nbytes - done, (off_t) (ref->file_offset + done));
-            if (n <= 0) { err = "short read on " + ref->name; ok = false; break; }
+            const int64_t n = plat_pread(fds[ref->shard], staging.data() + done,
+                                         ref->nbytes - done, ref->file_offset + done);
+            if (n <= 0) { err = "short read on " + ref->name + ": " + plat_last_error(); ok = false; break; }
             done += (size_t) n;
         }
         if (!ok) break;
         ggml_backend_tensor_set(t, staging.data(), 0, ref->nbytes);
     }
 
-    for (int f : fds) ::close(f);
+    for (file_handle f : fds) plat_close(f);
     return ok;
 }
 
@@ -145,21 +144,16 @@ ggml_tensor * weights::get(const std::string & name) const {
 
 bool weights::map_shards(std::string & err) {
     for (const auto & p : mi_->shard_paths()) {
-        int fd = ::open(p.c_str(), O_RDONLY);
-        if (fd < 0) { err = "open failed: " + p; return false; }
-        const off_t sz = ::lseek(fd, 0, SEEK_END);
-        void * base = ::mmap(nullptr, (size_t) sz, PROT_READ, MAP_PRIVATE, fd, 0);
-        ::close(fd);
-        if (base == MAP_FAILED) { err = "mmap failed: " + p; return false; }
-
-        // Expert access is scattered by the router; sequential readahead would
-        // only evict pages we still want.
-        ::madvise(base, (size_t) sz, MADV_RANDOM);
+        // The random-access hint the router's scatter needs is applied inside
+        // plat_map_read, where each platform spells it differently.
+        size_t sz = 0;
+        void * base = plat_map_read(p.c_str(), &sz);
+        if (!base) { err = "mapping failed: " + p + ": " + plat_last_error(); return false; }
 
         map_base_.push_back(base);
-        map_size_.push_back((size_t) sz);
-        map_buf_.push_back(ggml_backend_cpu_buffer_from_ptr(base, (size_t) sz));
-        mapped_bytes_ += (size_t) sz;
+        map_size_.push_back(sz);
+        map_buf_.push_back(ggml_backend_cpu_buffer_from_ptr(base, sz));
+        mapped_bytes_ += sz;
     }
     return true;
 }

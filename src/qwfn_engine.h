@@ -67,7 +67,25 @@ struct engine_config {
     // image at a long context asked for 440 MB and aborted the server (2026-09-10).
     uint64_t  cbatch_kv_product = 12ull << 20;
     bool      reuse_graphs = true;   // replay the position-independent layer graphs
+    // Which read engine the expert cache and the prefill streamer use.
+    //
+    // true on Linux for a measured reason: io_uring_submit() executes the reads
+    // inline on the reference filesystem, so a burst never gets the concurrency
+    // it asked for, and blocking preads on worker threads beat it by 10% end to
+    // end. The comment further up, above prefill_on_gpu, is about this field.
+    //
+    // On Windows the arithmetic points the other way and the default is still
+    // this one only because the IOCP path is new and unmeasured. A worker there
+    // costs TWO system calls per read -- an overlapped handle has no positional
+    // read that both issues and waits, so it is ReadFile plus
+    // GetOverlappedResult -- on top of the queue mutex and the thread handoff,
+    // while a completion port costs one ReadFile per read, no wait and no
+    // thread, and one batched GetQueuedCompletionStatusEx per burst. Measure
+    // both with qwfn-iobench, which now runs each, and set this from the result
+    // rather than from the reasoning.
     bool      io_threads = true;
+    // Workers for the thread backend. NOT the queue depth: the async backend's
+    // ring is sized from the read window instead (see PREFILL_READ_WINDOW).
     unsigned  io_workers = 16;
     bool      speculate = true;     // prefetch the next layer's predicted experts
     // How many of the predicted top-k to actually fetch (clamped to

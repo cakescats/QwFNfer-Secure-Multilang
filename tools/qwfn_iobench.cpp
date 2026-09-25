@@ -8,6 +8,7 @@
 #include "qwfn_expert_cache.h"
 #include "qwfn_io.h"
 #include "qwfn_model.h"
+#include "qwfn_plat.h"
 #include "qwfn_ple.h"
 
 #include <algorithm>
@@ -16,11 +17,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <random>
 #include <string>
-#include <sys/mman.h>
-#include <unistd.h>
 #include <vector>
 
 using namespace qwfn;
@@ -55,11 +53,29 @@ static void pick_experts(const zipf & z, std::mt19937_64 & g, uint32_t n_expert,
 }
 
 // ---------------------------------------------------------------- raw ceiling
-static void bench_ceiling(model_index & mi, unsigned qd, int n_tokens_equiv) {
-    printf("\n== raw expert-slice fetch over io_uring (no cache, every access a miss) ==\n");
+// Both read engines on the same access pattern, because which one wins is a
+// property of the machine and not something to reason about from first
+// principles: on the reference Linux box the thread pool beat io_uring by 30%
+// (io_uring_submit executing the reads inline on that filesystem), which is why
+// it is the engine's default. Windows inverts the arithmetic -- the thread pool
+// costs two system calls per read there, since an overlapped handle has no
+// positional read that both issues and waits, while a completion port costs one
+// ReadFile per read and one batched dequeue per burst -- but arithmetic is not
+// a measurement. Run both, take the winner.
+static void bench_ceiling(model_index & mi, unsigned qd, int n_tokens_equiv,
+                          io_engine::backend be) {
+    const char * name = be == io_engine::backend::threads
+        ? "a pool of worker threads"
+#if defined(_WIN32)
+        : "a Win32 I/O completion port";
+#else
+        : "io_uring";
+#endif
+    printf("\n== raw expert-slice fetch over %s (no cache, every access a miss) ==\n", name);
     std::string err;
     io_engine io;
-    if (!io.init(mi.shard_paths(), qd, true, err)) { printf("  init failed: %s\n", err.c_str()); return; }
+    if (!io.init(mi.shard_paths(), qd, true, err, be)) { printf("  init failed: %s\n", err.c_str()); return; }
+    if (!io.direct_io()) printf("  NOTE: unbuffered I/O was refused; these reads go through the page cache\n");
 
     const hparams & hp = mi.hp();
     const uint32_t k = hp.n_expert_used;
@@ -116,14 +132,10 @@ static void bench_mmap(model_index & mi, int n_tokens_equiv) {
     std::vector<void *> maps(mi.shard_paths().size(), nullptr);
     std::vector<size_t> sizes(mi.shard_paths().size(), 0);
     for (size_t i = 0; i < mi.shard_paths().size(); i++) {
-        int fd = open(mi.shard_paths()[i].c_str(), O_RDONLY);
-        if (fd < 0) { printf("  open failed\n"); return; }
-        const off_t sz = lseek(fd, 0, SEEK_END);
-        void * p = mmap(nullptr, (size_t) sz, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (p == MAP_FAILED) { printf("  mmap failed\n"); return; }
-        madvise(p, (size_t) sz, MADV_RANDOM);
-        maps[i] = p; sizes[i] = (size_t) sz;
+        size_t sz = 0;
+        void * p = plat_map_read(mi.shard_paths()[i].c_str(), &sz);
+        if (!p) { printf("  mapping failed: %s\n", plat_last_error()); return; }
+        maps[i] = p; sizes[i] = sz;
     }
 
     std::mt19937_64 g(1234);
@@ -146,7 +158,7 @@ static void bench_mmap(model_index & mi, int n_tokens_equiv) {
     const double dt = secs(t0, clk::now());
     printf("  demand paging: %6.2f GB/s -> %6.2f tok/s if every access misses  (checksum %" PRIu64 ")\n",
            bytes / dt / 1e9, n_tokens_equiv / dt, acc & 0xFF);
-    for (size_t i = 0; i < maps.size(); i++) if (maps[i]) munmap(maps[i], sizes[i]);
+    for (size_t i = 0; i < maps.size(); i++) if (maps[i]) plat_unmap(maps[i], sizes[i]);
 }
 
 // ------------------------------------------------------- cached decode loop
@@ -269,7 +281,8 @@ int main(int argc, char ** argv) {
         else fprintf(stderr, "cold tier unavailable: %s\n", err.c_str());
     }
 
-    bench_ceiling(mi, 64, 3);
+    bench_ceiling(mi, 64, 3, io_engine::backend::async);
+    bench_ceiling(mi, 64, 3, io_engine::backend::threads);
     if (!skip_mmap) bench_mmap(mi, 1);
     bench_ple(mi, 256ull << 20, 4000);
     bench_tokens(mi, coldp, (size_t) (ram_gb * 1e9), alpha, n_tokens, false);

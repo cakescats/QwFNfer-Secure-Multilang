@@ -12,6 +12,8 @@
 // tier ourselves; letting the page cache mirror it would halve our effective
 // capacity on a 30 GB machine.
 
+#include "qwfn_plat.h"
+
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -20,7 +22,8 @@
 #include <string>
 #include <vector>
 
-struct io_uring;
+struct io_uring;                 // liburing, on Linux
+namespace qwfn { struct iocp_state; }   // the Win32 completion port, in qwfn_io.cpp
 
 namespace qwfn {
 
@@ -68,18 +71,21 @@ public:
 
     // Two backends behind one interface.
     //
-    //   uring   : io_uring. On this filesystem io_uring_submit() turns out to
-    //             execute the reads inline rather than queueing them, so a
-    //             burst gets far less than the concurrency it asked for --
-    //             measured 4.07 GB/s on the engine's 8-read burst.
-    //   threads : a pool of workers doing blocking positional preadv. Real
+    //   async   : the platform's own asynchronous read engine -- io_uring on
+    //             Linux, an I/O completion port on Windows. On the reference
+    //             Linux filesystem io_uring_submit() turns out to execute the
+    //             reads inline rather than queueing them, so a burst gets far
+    //             less than the concurrency it asked for -- measured 4.07 GB/s
+    //             on the engine's 8-read burst. Windows is unmeasured.
+    //   threads : a pool of workers doing blocking positional reads. Real
     //             kernel-level parallelism; measured 5.30 GB/s on the same
-    //             burst shape.
-    enum class backend { uring, threads };
+    //             burst shape, which is why it is the default.
+    //
+    enum class backend { async, threads };
 
     // queue_depth is the io_uring ring size / the worker count.
     bool init(const std::vector<std::string> & paths, unsigned queue_depth,
-              bool direct_io, std::string & err, backend be = backend::uring);
+              bool direct_io, std::string & err, backend be = backend::async);
 
     backend which() const { return be_; }
     void shutdown();
@@ -106,8 +112,9 @@ public:
     bool     registered_files = false;
 
 private:
-    backend          be_ = backend::uring;
-    io_uring *       ring_ = nullptr;
+    backend          be_ = backend::async;
+    io_uring *       ring_ = nullptr;    // the async backend on Linux
+    iocp_state *     iocp_ = nullptr;    // ... and on Windows
 
     // Tags of requests rejected at submit time (bad shard index, null
     // destination, zero length). Every caller here counts completions, not
@@ -126,9 +133,21 @@ private:
     std::condition_variable   cv_work_, cv_done_;
     bool                      stop_ = false;
     void worker_loop();
-    std::vector<int> fds_;
+
+    // --- Win32 completion-port backend ---
+    // Defined in qwfn_io.cpp under _WIN32 and never referenced anywhere else,
+    // so the declarations need no guard of their own.
+    bool   iocp_init(std::string & err);
+    void   iocp_shutdown();
+    size_t iocp_submit(const io_request * reqs, size_t n);
+    size_t iocp_reap(uint64_t * tags_out, size_t max_tags, size_t min_complete);
+    std::vector<file_handle> fds_;
     bool             direct_ = true;
-    bool             bounce_ = false;   // direct reads through a page-aligned per-worker buffer (512-byte slot layout)
+    bool             bounce_ = false;   // direct reads through a device-aligned per-worker buffer (512-byte slot layout)
+    // What the storage stack demands of an unbuffered read's offset, length and
+    // destination. The slot layout may be finer than this (the Q3 file steps by
+    // 512 mod 4096), and `bounce_` is exactly the case where it is.
+    uint32_t         dev_align_ = QWFN_DIO_PAGE;
     size_t           in_flight_ = 0;
     unsigned         qd_ = 0;
     uint32_t         expect_[1024] = {};

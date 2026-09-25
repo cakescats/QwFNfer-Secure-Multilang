@@ -6,19 +6,25 @@ project(qwfnfer LANGUAGES C CXX)
 # We own the model graph and the memory hierarchy; ggml supplies the quantized
 # math kernels. The entire performance thesis of this engine lives in
 # qwfn_io / qwfn_expert_cache / qwfn_ple: fetch expert slices at their natural
-# 627KB-921KB granularity over io_uring instead of 4KiB demand paging.
+# 627KB-921KB granularity over the platform's asynchronous read engine instead
+# of 4KiB demand paging.
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
-if(NOT CMAKE_BUILD_TYPE)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Where llama.cpp/ggml lives. Override with -DLLAMA_CPP_ROOT=...
-set(LLAMA_CPP_ROOT "$ENV{HOME}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
+if(WIN32)
+  set(LLAMA_CPP_ROOT "$ENV{USERPROFILE}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
+else()
+  set(LLAMA_CPP_ROOT "$ENV{HOME}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
+endif()
 set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build/bin"   CACHE PATH "llama.cpp built libraries")
+
 # QWFN_PORTABLE builds the release bundle (scripts/package.sh): baseline x86-64-v3 code
 # instead of this machine's -march=native, a glibc 2.34 floor (cmake/glibc_compat.h keeps
 # the pre-C23 strtol/sscanf symbols, -fno-math-errno the pre-2.43 sqrtf), and the ggml/CUDA
@@ -35,42 +41,129 @@ set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build/bin"   CACHE PATH "llama.cpp built 
 # and the ggml libraries link libstdc++ dynamically, so the bundle needs the user's copy
 # either way -- and the C++ runtime is one thing every distribution has.
 option(QWFN_PORTABLE "Relocatable release build" OFF)
-if(QWFN_PORTABLE)
-  set(QWFN_ARCH_FLAGS -march=x86-64-v3 -mtune=generic)
-  add_compile_options(-include "${CMAKE_SOURCE_DIR}/cmake/glibc_compat.h" -fno-math-errno)
-  set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
-  set(CMAKE_INSTALL_RPATH "$ORIGIN")
+
+# ---------------------------------------------------------------- toolchain --
+#
+# Two flag dialects, not two compilers: MSVC and clang-cl share an ABI, a
+# runtime and a command line, and CMake's MSVC variable is true for both. That
+# is the ABI the engine has to speak on Windows whichever one is chosen, because
+# nvcc accepts only cl.exe as a host compiler, so the CUDA half of ggml is built
+# with it and everything that links against ggml has to match.
+#
+# The choice barely shows up in throughput -- the arithmetic is all inside ggml,
+# built by its own CMake, and what this project compiles is orchestration. It
+# shows up in whether the link works at all.
+if(MSVC)
+  # MSVC has no -march=native: AVX2 is the x86-64-v3 baseline the Linux bundle
+  # also targets. clang-cl additionally understands /clang:-march=native, which
+  # is worth trying on a machine that will only ever run its own build.
+  set(QWFN_ARCH_FLAGS /arch:AVX2 CACHE STRING "ISA flags for MSVC-dialect compilers")
+  set(QWFN_OPT_FLAGS  /O2)
+  set(QWFN_WARN_FLAGS /W3 /wd4244 /wd4267 /wd4305)   # narrowing conversions, by the thousand, all deliberate
+  add_compile_options(
+    /utf-8              # the sources are UTF-8 and say so, rather than hoping for the active code page
+    /EHsc
+    /Zc:preprocessor    # the conforming preprocessor; the legacy one mangles __VA_ARGS__
+    /bigobj             # qwfn_engine.cpp is 3,300 lines of lambdas and passes the 65,536-section limit
+  )
+  add_compile_definitions(
+    NOMINMAX                  # windows.h defines min/max as macros and breaks <algorithm>
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+    _WINSOCK_DEPRECATED_NO_WARNINGS
+    # GetQueuedCompletionStatusEx and SetFileCompletionNotificationModes are
+    # Vista and later. The SDK's default is high enough today but is not a
+    # contract, so say it.
+    _WIN32_WINNT=0x0A00       # Windows 10
+    WINVER=0x0A00
+  )
 else()
-  set(QWFN_ARCH_FLAGS -march=native)
+  if(QWFN_PORTABLE)
+    set(QWFN_ARCH_FLAGS -march=x86-64-v3 -mtune=generic)
+    add_compile_options(-include "${CMAKE_SOURCE_DIR}/cmake/glibc_compat.h" -fno-math-errno)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
+  else()
+    set(QWFN_ARCH_FLAGS -march=native)
+  endif()
+  set(QWFN_OPT_FLAGS  -O3)
+  set(QWFN_WARN_FLAGS -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(NOT EXISTS "${LLAMA_CPP_ROOT}/ggml/include/ggml.h")
   message(FATAL_ERROR "ggml headers not found under ${LLAMA_CPP_ROOT}. Pass -DLLAMA_CPP_ROOT=<path>.")
 endif()
 
-add_library(ggml_base SHARED IMPORTED)
-set_target_properties(ggml_base PROPERTIES IMPORTED_LOCATION "${LLAMA_CPP_BUILD}/libggml-base.so.0")
-add_library(ggml_all SHARED IMPORTED)
-set_target_properties(ggml_all PROPERTIES IMPORTED_LOCATION "${LLAMA_CPP_BUILD}/libggml.so.0")
+# ------------------------------------------------------------- ggml imports --
+#
+# One shared library per name, found where each platform's build actually leaves
+# it. On Linux that is a versioned .so next to the built binaries. On Windows a
+# shared library is two files -- the .dll to load and the .lib to link against --
+# and which directory holds which depends on the generator, so look in the ones
+# Visual Studio and Ninja use rather than assuming.
+function(qwfn_import_shared target basename)
+  add_library(${target} SHARED IMPORTED)
+  if(WIN32)
+    find_library(${target}_IMPLIB
+      NAMES ${basename}
+      PATHS "${LLAMA_CPP_BUILD}" "${LLAMA_CPP_BUILD}/Release"
+            "${LLAMA_CPP_ROOT}/build/lib" "${LLAMA_CPP_ROOT}/build/lib/Release"
+            "${LLAMA_CPP_ROOT}/build/${basename}" "${LLAMA_CPP_ROOT}/build"
+      NO_DEFAULT_PATH)
+    find_file(${target}_DLL
+      NAMES ${basename}.dll
+      PATHS "${LLAMA_CPP_BUILD}" "${LLAMA_CPP_BUILD}/Release" "${LLAMA_CPP_ROOT}/build/bin"
+      NO_DEFAULT_PATH)
+    if(NOT ${target}_IMPLIB)
+      message(FATAL_ERROR
+        "${basename}.lib not found under ${LLAMA_CPP_BUILD}. Build llama.cpp first "
+        "(cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release), "
+        "then pass -DLLAMA_CPP_BUILD=<the directory holding the .lib files>.")
+    endif()
+    set_target_properties(${target} PROPERTIES
+      IMPORTED_IMPLIB   "${${target}_IMPLIB}"
+      IMPORTED_LOCATION "${${target}_DLL}")
+  else()
+    set_target_properties(${target} PROPERTIES
+      IMPORTED_LOCATION "${LLAMA_CPP_BUILD}/lib${basename}.so.0")
+  endif()
+endfunction()
+
+qwfn_import_shared(ggml_base ggml-base)
+qwfn_import_shared(ggml_all  ggml)
 
 # Two things need libllama: qwfn-refdump drives llama.cpp's own graph to produce
 # the reference intermediates our graph is bisected against, and qwfn-chat
 # borrows its tokenizer (opened vocab_only, so no weights are loaded).
-add_library(llama_ref SHARED IMPORTED)
-set_target_properties(llama_ref PROPERTIES IMPORTED_LOCATION "${LLAMA_CPP_BUILD}/libllama.so.0")
+qwfn_import_shared(llama_ref llama)
 
 find_package(Threads REQUIRED)
 
-# liburing is mandatory: it is the whole point of the engine.
-find_path(URING_INCLUDE_DIR liburing.h)
-find_library(URING_LIBRARY NAMES uring liburing)
-if(NOT URING_INCLUDE_DIR OR NOT URING_LIBRARY)
-  message(FATAL_ERROR "liburing not found. Install liburing (Arch: pacman -S liburing).")
+# ----------------------------------------------------------------- read I/O --
+#
+# The asynchronous read engine, which is the whole point of qwfn_io.cpp. Linux
+# reads through io_uring, so liburing is mandatory there. Windows reads through
+# an I/O completion port, which is in the OS.
+if(WIN32)
+  set(QWFN_IO_LIBS "")
+  message(STATUS "async read engine: Win32 I/O completion port")
+else()
+  find_path(URING_INCLUDE_DIR liburing.h)
+  find_library(URING_LIBRARY NAMES uring liburing)
+  if(NOT URING_INCLUDE_DIR OR NOT URING_LIBRARY)
+    message(FATAL_ERROR "liburing not found. Install liburing (Arch: pacman -S liburing).")
+  endif()
+  set(QWFN_IO_LIBS "${URING_LIBRARY}")
+  message(STATUS "async read engine: io_uring (${URING_LIBRARY})")
 endif()
-message(STATUS "liburing: ${URING_LIBRARY}")
 
+# Both platform halves are always listed: each is an empty translation unit on
+# the other platform, which keeps the file list identical everywhere and stops a
+# new source from being added to one build and forgotten in the other.
 add_library(qwfn_core STATIC
   src/qwfn_model.cpp
+  src/qwfn_plat_posix.cpp
+  src/qwfn_plat_win32.cpp
   src/qwfn_io.cpp
   src/qwfn_expert_cache.cpp
   src/qwfn_ple.cpp
@@ -86,67 +179,103 @@ target_include_directories(qwfn_core PUBLIC
   src
   "${LLAMA_CPP_ROOT}/ggml/include"
   "${LLAMA_CPP_ROOT}/ggml/src"       # ggml-impl.h: the graph struct, for the per-node profiler only
-  "${URING_INCLUDE_DIR}"
 )
-target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads "${URING_LIBRARY}")
-target_compile_options(qwfn_core PRIVATE -O3 ${QWFN_ARCH_FLAGS} -Wall -Wextra -Wno-unused-parameter)
+if(NOT WIN32)
+  target_include_directories(qwfn_core PUBLIC "${URING_INCLUDE_DIR}")
+endif()
+target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads ${QWFN_IO_LIBS})
+target_compile_options(qwfn_core PRIVATE ${QWFN_OPT_FLAGS} ${QWFN_ARCH_FLAGS} ${QWFN_WARN_FLAGS})
 
-add_executable(qwfn-iobench tools/qwfn_iobench.cpp)
-target_link_libraries(qwfn-iobench PRIVATE qwfn_core)
-target_compile_options(qwfn-iobench PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+# Collected once at configure time, so build llama.cpp before configuring this.
+# If the list comes up empty the copy is skipped and the DLLs have to be on PATH
+# instead, which is why it says so.
+if(WIN32)
+  file(GLOB QWFN_RUNTIME_DLLS "${LLAMA_CPP_BUILD}/*.dll" "${LLAMA_CPP_BUILD}/Release/*.dll")
+  list(LENGTH QWFN_RUNTIME_DLLS _n_dlls)
+  if(_n_dlls EQUAL 0)
+    message(WARNING
+      "no .dll found under ${LLAMA_CPP_BUILD}: the tools will need llama.cpp's DLLs on PATH. "
+      "Build llama.cpp with -DBUILD_SHARED_LIBS=ON before configuring this project.")
+  else()
+    message(STATUS "runtime DLLs to stage next to each tool: ${_n_dlls}")
+  endif()
+endif()
 
-add_executable(qwfn-inspect tools/qwfn_inspect.cpp)
-target_link_libraries(qwfn-inspect PRIVATE qwfn_core)
-target_compile_options(qwfn-inspect PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+# A helper so every executable gets the same treatment and a new one cannot
+# quietly be built at the compiler's default -march.
+function(qwfn_tool name)
+  cmake_parse_arguments(T "" "" "SOURCES;LIBS;INCLUDES;OPT" ${ARGN})
+  add_executable(${name} ${T_SOURCES})
+  if(T_INCLUDES)
+    target_include_directories(${name} PRIVATE ${T_INCLUDES})
+  endif()
+  target_link_libraries(${name} PRIVATE ${T_LIBS})
+  if(T_OPT)
+    target_compile_options(${name} PRIVATE ${T_OPT} ${QWFN_ARCH_FLAGS})
+  else()
+    target_compile_options(${name} PRIVATE ${QWFN_OPT_FLAGS} ${QWFN_ARCH_FLAGS})
+  endif()
+  # Windows resolves a DLL from the executable's own directory first, so put
+  # llama.cpp's there after every build and a tool runs straight out of the
+  # tree. All of them, not just the two linked against: ggml.dll loads
+  # ggml-cpu.dll and ggml-cuda.dll by name at run time, and those would
+  # otherwise have to be on PATH.
+  if(WIN32 AND QWFN_RUNTIME_DLLS)
+    add_custom_command(TARGET ${name} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${QWFN_RUNTIME_DLLS} "$<TARGET_FILE_DIR:${name}>")
+  endif()
+endfunction()
 
-add_executable(qwfn-test-hc tools/qwfn_test_hc.cpp)
-target_link_libraries(qwfn-test-hc PRIVATE qwfn_core)
-target_compile_options(qwfn-test-hc PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+qwfn_tool(qwfn-iobench  SOURCES tools/qwfn_iobench.cpp        LIBS qwfn_core)
+qwfn_tool(qwfn-inspect  SOURCES tools/qwfn_inspect.cpp        LIBS qwfn_core)
+qwfn_tool(qwfn-test-hc  SOURCES tools/qwfn_test_hc.cpp        LIBS qwfn_core)
+qwfn_tool(qwfn-logits   SOURCES tools/qwfn_logits.cpp         LIBS qwfn_core)
+qwfn_tool(qwfn-run      SOURCES tools/qwfn_run.cpp            LIBS qwfn_core)
+qwfn_tool(qwfn-gen      SOURCES tools/qwfn_gen.cpp            LIBS qwfn_core)
+# qwfn_vocab.cpp is deliberately NOT in qwfn_core: only the binaries that need a
+# tokenizer should carry a libllama dependency.
+qwfn_tool(qwfn-vtest    SOURCES tools/qwfn_vtest.cpp          LIBS qwfn_core)
 
-add_executable(qwfn-logits tools/qwfn_logits.cpp)
-target_link_libraries(qwfn-logits PRIVATE qwfn_core)
-target_compile_options(qwfn-logits PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+qwfn_tool(qwfn-refdump
+  SOURCES  tools/qwfn_refdump.cpp
+  INCLUDES "${LLAMA_CPP_ROOT}/include" "${LLAMA_CPP_ROOT}/ggml/include"
+  LIBS     llama_ref ggml_base ggml_all
+  OPT      ${QWFN_OPT_FLAGS})
 
-add_executable(qwfn-refdump tools/qwfn_refdump.cpp)
-target_include_directories(qwfn-refdump PRIVATE "${LLAMA_CPP_ROOT}/include" "${LLAMA_CPP_ROOT}/ggml/include")
-target_link_libraries(qwfn-refdump PRIVATE llama_ref ggml_base ggml_all)
-target_compile_options(qwfn-refdump PRIVATE -O2)
+qwfn_tool(qwfn-chat
+  SOURCES  tools/qwfn_chat.cpp src/qwfn_vocab.cpp
+  INCLUDES "${LLAMA_CPP_ROOT}/include"
+  LIBS     qwfn_core llama_ref)
 
-add_executable(qwfn-run tools/qwfn_run.cpp)
-target_link_libraries(qwfn-run PRIVATE qwfn_core)
-target_compile_options(qwfn-run PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+qwfn_tool(qwfn-tok
+  SOURCES  tools/qwfn_tok.cpp src/qwfn_vocab.cpp
+  INCLUDES "${LLAMA_CPP_ROOT}/include"
+  LIBS     qwfn_core llama_ref)
 
-# qwfn_vocab.cpp is deliberately NOT in qwfn_core: only this binary should
-# carry a libllama dependency.
-add_executable(qwfn-vtest tools/qwfn_vtest.cpp)
-target_link_libraries(qwfn-vtest PRIVATE qwfn_core)
-target_compile_options(qwfn-vtest PRIVATE -O3 ${QWFN_ARCH_FLAGS})
-
-# cpp-httplib 0.54 is split header/source, so its .cpp joins the target.
-add_executable(qwfn-server tools/qwfn_server.cpp src/qwfn_vocab.cpp
-               "${LLAMA_CPP_ROOT}/vendor/cpp-httplib/httplib.cpp")
-target_include_directories(qwfn-server PRIVATE
-  "${LLAMA_CPP_ROOT}/include"
-  "${LLAMA_CPP_ROOT}/vendor"
-  "${LLAMA_CPP_ROOT}/vendor/cpp-httplib")
-target_link_libraries(qwfn-server PRIVATE qwfn_core llama_ref)
-target_compile_options(qwfn-server PRIVATE -O2 ${QWFN_ARCH_FLAGS})
-
-add_executable(qwfn-chat tools/qwfn_chat.cpp src/qwfn_vocab.cpp)
-target_include_directories(qwfn-chat PRIVATE "${LLAMA_CPP_ROOT}/include")
-target_link_libraries(qwfn-chat PRIVATE qwfn_core llama_ref)
-target_compile_options(qwfn-chat PRIVATE -O3 ${QWFN_ARCH_FLAGS})
-
-add_executable(qwfn-tok tools/qwfn_tok.cpp src/qwfn_vocab.cpp)
-target_include_directories(qwfn-tok PRIVATE "${LLAMA_CPP_ROOT}/include")
-target_link_libraries(qwfn-tok PRIVATE qwfn_core llama_ref)
-target_compile_options(qwfn-tok PRIVATE -O2 ${QWFN_ARCH_FLAGS})
-
-add_executable(qwfn-gen tools/qwfn_gen.cpp)
-target_link_libraries(qwfn-gen PRIVATE qwfn_core)
-target_compile_options(qwfn-gen PRIVATE -O3 ${QWFN_ARCH_FLAGS})
-
-add_executable(qwfn-train-predictor tools/qwfn_train_predictor.cpp)
-target_link_libraries(qwfn-train-predictor PRIVATE qwfn_core)
-target_compile_options(qwfn-train-predictor PRIVATE -O3 ${QWFN_ARCH_FLAGS})
+qwfn_tool(qwfn-train-predictor SOURCES tools/qwfn_train_predictor.cpp LIBS qwfn_core)
 target_compile_definitions(qwfn-train-predictor PRIVATE LLAMA_CPP_BUILD_DIR="${LLAMA_CPP_BUILD}")
+
+# ------------------------------------------------------------------ server --
+#
+# The HTTP front end is not on the Windows build yet: its stall watchdog prints
+# the generating thread's stack through backtrace() and pthread_kill(SIGUSR2),
+# and the Win32 equivalent (SuspendThread + StackWalk64) has still to be
+# written. Everything the server links against is already portable, so this is
+# the only thing standing between it and a Windows build.
+option(QWFN_BUILD_SERVER "Build qwfn-server" ${UNIX})
+if(QWFN_BUILD_SERVER)
+  # cpp-httplib 0.54 is split header/source, so its .cpp joins the target.
+  qwfn_tool(qwfn-server
+    SOURCES  tools/qwfn_server.cpp src/qwfn_vocab.cpp
+             "${LLAMA_CPP_ROOT}/vendor/cpp-httplib/httplib.cpp"
+    INCLUDES "${LLAMA_CPP_ROOT}/include"
+             "${LLAMA_CPP_ROOT}/vendor"
+             "${LLAMA_CPP_ROOT}/vendor/cpp-httplib"
+    LIBS     qwfn_core llama_ref
+    OPT      ${QWFN_OPT_FLAGS})
+  if(WIN32)
+    target_link_libraries(qwfn-server PRIVATE ws2_32)   # cpp-httplib's sockets
+  endif()
+elseif(WIN32)
+  message(STATUS "qwfn-server: skipped (the stall watchdog has no Win32 implementation yet; -DQWFN_BUILD_SERVER=ON to try anyway)")
+endif()

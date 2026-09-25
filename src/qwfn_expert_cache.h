@@ -130,7 +130,7 @@ public:
         size_t vram_reserve = 768ull << 20;
         bool   use_cold_tier  = true;         // serve misses from the IQ1_S checkpoint
         unsigned queue_depth  = 256;
-        io_engine::backend io_backend = io_engine::backend::uring;
+        io_engine::backend io_backend = io_engine::backend::async;
         // Bound the H2D traffic spent warming T0: one block is ~2.18 MB, so
         // unbounded promotion would cost more than it saves on the first tokens.
         uint32_t max_promotions_per_layer = 2;

@@ -70,8 +70,22 @@ bool prefill_streamer::init(const model_index * mi, unsigned io_workers, bool io
     mi_ = mi;
     overlap_ = overlap;
     dev_backend_ = dev_buft ? dev_backend : nullptr;
-    if (!io_.init(mi->shard_paths(), io_workers ? io_workers : 8, /*direct_io=*/true, err,
-                  io_threads ? io_engine::backend::threads : io_engine::backend::uring)) {
+    // The worker count and the queue depth are not the same number, and passing
+    // one as the other capped this streamer at 16 reads in flight while
+    // read_into() below asks for 32: the thread backend runs one read per
+    // worker, and the async backend's ring is exactly queue_depth deep, so a
+    // 16-entry ring answered a 32-deep window with short submits and the sweep
+    // ran at half the concurrency it had asked for. A prefill is bound by this
+    // read, so the depth is now sized from the window instead.
+    //
+    // The thread backend still needs one worker per concurrent read and is left
+    // at io_workers: raising it changes a path that was measured on Linux, and
+    // that deserves a measurement of its own rather than a guess here.
+    const unsigned workers = io_workers ? io_workers : 8;
+    const unsigned depth   = io_threads ? workers
+                                        : (unsigned) std::max<size_t>(2 * PREFILL_READ_WINDOW, workers);
+    if (!io_.init(mi->shard_paths(), depth, /*direct_io=*/true, err,
+                  io_threads ? io_engine::backend::threads : io_engine::backend::async)) {
         return false;
     }
 
@@ -234,7 +248,7 @@ bool prefill_streamer::read_into(hbuf & b, uint32_t layer, std::string & err) {
     }
 
     // Keep the device busy: submit a window, drain, refill.
-    const size_t WINDOW = 32;
+    const size_t WINDOW = PREFILL_READ_WINDOW;
     uint64_t tags[256];
     size_t i = 0, done = 0;
     // `done` counts completions, not bytes: both backends report a short read
