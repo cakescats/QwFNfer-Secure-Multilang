@@ -1,5 +1,7 @@
+> **Original upstream README** of [Apolog1ze-Dev/QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) at `v0.2.3` (`f955dbf`), kept for reference. This fork's README: [English](../README.md) · [Русский](../README.ru.md).
+
 <div align="center">
-  <img alt="QwFNfer: Qwen Four Inference Engine, big models running on small hardware" src="docs/img/header.jpg" width="100%">
+  <img alt="QwFNfer: Qwen Four Inference Engine, big models running on small hardware" src="img/header.jpg" width="100%">
   <p><b>Qwen3.8-Flash-Next, a 125B mixture-of-experts model with 512 experts, 111 GB on disk, at 160K context on one 16 GB GPU, 30 GB of RAM and an NVMe.</b></p>
 </div>
 
@@ -30,7 +32,7 @@ qwfnfer is a purpose-built inference engine for Qwen3.8-Flash-Next (GGUF archite
 ## Results
 
 <div align="center">
-  <img alt="measured results" src="docs/img/results.png" width=100%>
+  <img alt="measured results" src="img/results.png" width=100%>
 </div>
 
 Reference machine: RTX 4080 SUPER 16 GB, 30 GB RAM, one NVMe. 163,840-token context and the console's plan for it (KV q8_0, batch 8192, indexer and KV cache in pinned RAM, speculative block, draft head and vision on), with a 15 GB RAM tier asked, 8 CPU threads and 768 MB of VRAM reserve; one run each through the server, measured 2026-09-11. The engine clamps the RAM tier to the memory the machine has: with the draft head's 2.7 GB of pinned experts it built 13.0 GB on Q4 (VRAM expert tier 8.1 GB, 2,591 experts) and 14.1 GB on Q3 (8.7 GB, 3,859 experts), and free memory went down to 1.0 and 0.4 GB at the worst point of the 155K-token prefill. The console's own sizing keeps 3 GB of headroom instead, a tier about 2 GB smaller (a GB of RAM tier is worth about 3% of decode).
@@ -102,7 +104,7 @@ qwfnfer
 It opens http://127.0.0.1:8090. Pick a downloaded quant and a tier: **Chat** (32K context), **Agentic coding** (128K), **Agentic coding+** (256K, the model's full trained context) or **Custom** (anything you set under *Advanced settings* and save). Press **Auto-tune & start**: the console measures the drive under the model (random 2 MiB reads, the pattern of an expert miss), plans every flag for your GPU and RAM with that rate (context; the KV cache at q8_0 whenever the plan can afford it, q4_0 only where it would not fit; the expert tiers, the prefill batch the tier can lend, the reserve, where the attention caches live; vision on when the `mmproj` file is next to the model, the draft head on when its file is there), starts the server, verifies it on a short chat and a 16K–32K-token document with a passphrase planted in it (prefill and decode tokens/s, and whether the answer found the passphrase), sweeps the CPU thread count live on that document's context (the physical cores unless another count measures over 3% faster), and measures the memory the server needs besides its RAM tier through the run, then re-sizes the tier to leave exactly the headroom you set (3 GB by default; a GB of tier is about 3% of decode) and restarts with it. About five minutes; the result is saved per model, the tier card then shows the measured speed instead of the prediction, and every tier for that model uses the measured thread count and drive rate from then on. **Start server** starts with the plan alone; **Self-test** measures a running server. The banner names the model, the tier and every flag it is running with; the Chat, Stats and Log tabs talk to it. Stats is live at one second: the prefill's progress inside a batch with the time left, input / cached / output tokens for the running request, the last request in full (how much of its prompt was reused, prefill and decode speed, why it finished), the session's totals, the cache hit rate and the endpoint. *Model locations* under the model list adds any folder that holds the shards. `qwfnfer --start` starts the last served model and tier as the console comes up. Stop it from the same page.
 
 <div align="center">
-  <img alt="qwfn console" src="docs/img/console-serve.png" width=92%>
+  <img alt="qwfn console" src="img/console-serve.png" width=92%>
 </div>
 
 **4. Point your tools at it.** The console shows the endpoint, `http://127.0.0.1:8080/v1` by default; any OpenAI-compatible client works with any API key (Unsloth Studio as a custom provider, Open WebUI, your own scripts). What the server accepts:
@@ -212,4 +214,4 @@ Built on [ggml](https://github.com/ggml-org/ggml) (quantized kernels, CUDA backe
 
 ## License
 
-[Apache License 2.0](LICENSE).
+[Apache License 2.0](../LICENSE).

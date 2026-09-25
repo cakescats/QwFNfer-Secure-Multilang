@@ -1,147 +1,148 @@
 <div align="center">
   <img src="docs/img/cakescats-logo.png" width="112" height="112" alt="cakescats">
   <h1>qwfnfer · cakescats</h1>
-  <p><b>Qwen3.8-Flash-Next (MoE 125B, 111 ГБ) на одной видеокарте 16 ГБ, 30 ГБ RAM и NVMe.</b><br>
-  Сборка движка <a href="https://github.com/Apolog1ze-Dev/QwFNfer">QwFNfer</a> от cakescats: исправления движка, замеры, консоль с входом по паролю, API-ключом и переключением языков (RU / EN).</p>
+  <p><b>Qwen3.8-Flash-Next (125B MoE, 111 GB) on one 16 GB GPU, 30 GB of RAM and an NVMe.</b><br>
+  A fork of <a href="https://github.com/Apolog1ze-Dev/QwFNfer">QwFNfer</a> by cakescats: engine fixes with measurements, and a console with password sign-in, an API key for the model server, HTTPS on the local network and an English / Russian UI.</p>
+  <p><b>🇬🇧 English</b> · <a href="README.ru.md">🇷🇺 Русский</a></p>
   <p>
-    <a href="#быстрый-старт">Быстрый старт</a> ·
-    <a href="#что-изменено">Что изменено</a> ·
-    <a href="#замеры">Замеры</a> ·
-    <a href="#вход-доступ-и-языки">Вход и доступ</a> ·
-    <a href="#подключение-клиентов">Клиенты</a> ·
-    <a href="#если-что-то-не-так">Проблемы</a> ·
-    <a href="CHANGELOG.md">История изменений</a> ·
-    <a href="README.en.md">English (upstream)</a>
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#what-this-fork-changes">What changes</a> ·
+    <a href="#measurements">Measurements</a> ·
+    <a href="#sign-in-access-and-languages">Sign-in &amp; access</a> ·
+    <a href="#clients">Clients</a> ·
+    <a href="#troubleshooting">Troubleshooting</a> ·
+    <a href="CHANGELOG.md">Changelog (RU)</a> ·
+    <a href="docs/README.upstream.md">Upstream README</a>
   </p>
 </div>
 
-<p align="center"><img src="docs/img/console-serve-ru.png" width="100%" alt="Консоль qwfn: вкладка «Сервер»"></p>
+<p align="center"><img src="docs/img/console-serve-en.png" width="100%" alt="qwfn console: the Serve tab"></p>
 
-## Что это
+## What it is
 
-qwfnfer — движок инференса, написанный под одну модель: **Qwen3.8-Flash-Next** (GGUF-архитектура `qwen4exp`, 48 слоёв, 512 экспертов, top-10). Плотное ядро модели (~5 ГБ) живёт в VRAM, а эксперты — в трёх ярусах: горячие в VRAM, тёплые в закреплённой RAM, остальные читаются с NVMe срезами по 0.6–0.9 МБ через асинхронный ввод-вывод. Кванты берутся из ggml (CUDA), токенизатор — из llama.cpp; граф модели, иерархия памяти, кэш экспертов, prefill, сервер и консоль — свои.
+qwfnfer is an inference engine built for one model: **Qwen3.8-Flash-Next** (GGUF architecture `qwen4exp`, 48 layers, 512 experts, top-10). The dense core (~5 GB) lives in VRAM; the experts live in three tiers: hot ones in VRAM, warm ones in pinned RAM, the rest read from the NVMe as 0.6–0.9 MB slices over asynchronous I/O. ggml supplies the quantized CUDA kernels and llama.cpp the tokenizer; the model graph, the memory hierarchy, the expert cache, the prefill, the server and the console are its own.
 
-Сервер отдаёт OpenAI-совместимый API и Anthropic Messages API, так что к нему подключаются OpenCode, Claude Code и любой OpenAI-клиент. Веб-консоль подбирает флаги под машину, запускает сервер и показывает живую статистику.
+The server speaks the OpenAI API and the Anthropic Messages API, so OpenCode, Claude Code and any OpenAI client connect to it. The web console sizes the flags for the machine, starts the server and shows live statistics.
 
-Эта ветка — upstream `v0.2.3` (`f955dbf`) плюс изменения ниже. Всё, что сказано о производительности, измерено; методика и сырые цифры — в [docs/TESTING.md](docs/TESTING.md).
+This fork is upstream `v0.2.3` (`f955dbf`) plus the changes below. Every performance claim here was measured; the method and the raw numbers are in [docs/TESTING.md](docs/TESTING.md) (in Russian, the tables read on their own).
 
-## Что изменено
+## What this fork changes
 
-**Движок**
-- **Зависание в io_uring** при коротком `io_uring_submit()` — исправлено: кольцо дочищается перед ожиданием, при отказе возвращается короткое чтение.
-- **Рассинхрон счёта заявок** (пропущенная «плохая» заявка вешала `fetch_end()` или зацикливала повторы) — такие заявки теперь завершаются ошибкой.
-- **`abort()` на путях HTTP-запроса** → запись ошибки, раскрутка, `needs_reset()` и сброс сессии сервером. *Но см. ограничения: реальная нехватка VRAM убивает процесс внутри ggml-cuda.*
-- **Глубина кольца prefill** под `--io-uring` считается от окна чтения — раньше развёртка шла на половине конкурентности.
-- **Платформенный слой** (`qwfn_plat.h`, POSIX + Win32, IOCP-бэкенд) — задел под Windows-порт; Win32 пока не собирался.
-- **`qwfn-iobench`** меряет оба движка чтения.
+**Engine**
+- **io_uring hang** after a short `io_uring_submit()`: the ring is flushed before waiting, and a ring that does not drain returns a short read instead of blocking.
+- **Completion count** broken by a rejected request (it left `fetch_end()` waiting, or made the caller resubmit it for ever): such requests now complete as errors.
+- **`abort()` on HTTP request paths** → the failure is recorded and unwound, the engine marks itself `needs_reset()` and the server resets the session. *See the limits below: running out of VRAM still ends the process inside ggml-cuda.*
+- **Prefill ring depth** under `--io-uring` is sized from the read window; the sweep used to run at half its concurrency.
+- **Platform layer** (`qwfn_plat.h`, POSIX + Win32, an IOCP backend) as groundwork for Windows; the Win32 half has not been built yet.
+- **`qwfn-iobench`** measures both read engines.
 
-**Консоль**
-- **Вход по логину и паролю** (PBKDF2-SHA256, сессии, замедление перебора), несколько учётных записей, смена пароля.
-- **API-ключ сервера модели**: консоль генерирует его и передаёт серверу; чат консоли ходит через неё, ключ в браузер не попадает.
-- **Локальная сеть и HTTPS**: `--host 0.0.0.0`, `--tls-cert/--tls-key`, самоподписанный сертификат одной командой.
-- **Языки**: русский и английский с переключением флажками; перевод — каталоги JSON, новый язык = новый файл.
-- **Тема cakescats**: ночной синий, орхидея, неоновый циан, пиксельные заголовки и пиксельный кот-логотип.
+**Console**
+- **Password sign-in** (PBKDF2-SHA256, sessions, per-address backoff), several accounts, password change.
+- **API key for the model server**: the console generates it and hands it to the server; the console's Chat tab goes through the console, so the key never reaches the browser.
+- **Local network and HTTPS**: `--host 0.0.0.0`, `--tls-cert/--tls-key`, a self-signed certificate in one command.
+- **Languages**: English and Russian, switched with flags; translations are JSON catalogs, a new language is a new file.
+- **cakescats theme**: night navy, orchid, neon cyan, pixel headings, the brand logo.
 
-**Сервер модели** — `--api-key` / `--api-key-file` / `QWFN_API_KEY`: ключ проверяется на всех эндпоинтах, кроме `/health` (`Authorization: Bearer …` или `x-api-key: …`).
+**Model server**: `--api-key` / `--api-key-file` / `QWFN_API_KEY`; the key is checked on every endpoint but `/health` (`Authorization: Bearer …` or `x-api-key: …`).
 
-**Документация и тесты** — рабочая ревизия llama.cpp вместо переписанного upstream-тега, `docs/TESTING.md`, скрипты `scripts/ab_decode.sh` и `scripts/oom_survival.sh`.
+**Docs and tests**: a working llama.cpp revision instead of the moved upstream tag, `docs/TESTING.md`, `scripts/ab_decode.sh` and `scripts/oom_survival.sh`.
 
-Подробно — в [CHANGELOG.md](CHANGELOG.md).
+**Proposed upstream:** [#13](https://github.com/Apolog1ze-Dev/QwFNfer/pull/13) pins llama.cpp by commit, [#14](https://github.com/Apolog1ze-Dev/QwFNfer/pull/14) carries the I/O fixes.
 
-## Замеры
+## Measurements
 
-i9-12900H · RTX 3080 Ti Laptop 16 ГБ · 30.5 ГБ RAM · NVMe 6.2 ГБ/с · UD-Q4_K_XL. Оригинал против этой ветки, 128 токенов жадного декода, по 3 чередующихся прогона:
+i9-12900H · RTX 3080 Ti Laptop 16 GB · 30.5 GB RAM · NVMe at 6.2 GB/s · UD-Q4_K_XL. Upstream against this fork, 128 greedy tokens, 3 interleaved runs each:
 
-| Режим `qwfn-gen` | Оригинал | Эта ветка | Вывод |
+| `qwfn-gen` mode | Upstream | This fork | Output |
 |---|---|---|---|
-| потоки (по умолчанию) | 7.92 ток/с | **7.95** ток/с | побитово одинаковый |
-| `--io-uring` | 8.47 | **8.50** | побитово одинаковый |
-| `--vram 9` | 10.04 | **10.00** | как в оригинале |
+| threads (default) | 7.92 tok/s | **7.95** tok/s | bit-identical |
+| `--io-uring` | 8.47 | **8.50** | bit-identical |
+| `--vram 9` | 10.04 | **10.00** | as upstream |
 
-Сервер, ярус «Агентный кодинг» (128K, KV q8_0, черновая голова MTP): **12.0–12.6 ток/с**, принято 93–95% черновиков; без MTP на том же ярусе — 10.9 ток/с.
+Server, Agentic coding tier (128K, KV q8_0, MTP draft head): **12.0–12.6 tok/s** with 93–95% of drafts accepted; 10.9 tok/s on the same tier without MTP.
 
-Итог честный: правки движка — про надёжность, а не про скорость; скорость на уровне оригинала. Одна «оптимизация» из первоначального набора замедляла декод на 2% — найдена этими же замерами и откачена.
+To be plain about it: the engine changes are about reliability, not speed, and speed is at parity with upstream. One "optimization" from the first round of changes slowed decode by 2%; these measurements caught it and it was reverted.
 
-## Требования
+## Requirements
 
-- **Linux**, Ubuntu 22.04+ (для готового бандла нужен glibc ≥ 2.34).
-- **NVIDIA** с драйвером ≥ 580 и **от 8 ГБ VRAM**; AMD и Intel не поддерживаются (CUDA-бэкенд ggml).
-- **NVMe** с 112+ ГБ свободного места на ext4 / xfs / btrfs (нужен `O_DIRECT`). На HDD не работает.
-- **RAM** от 16 ГБ, комфортно — 32 ГБ.
+- **Linux**, Ubuntu 22.04 or newer (the release bundle needs glibc ≥ 2.34).
+- **NVIDIA** with driver ≥ 580 and **at least 8 GB of VRAM**; AMD and Intel are not supported (ggml's CUDA backend).
+- **NVMe** with 112+ GB free on ext4 / xfs / btrfs (`O_DIRECT` is required). A spinning disk will not work.
+- **RAM**: 16 GB minimum, 32 GB is comfortable.
 
-Проверка одной командой:
+Check in one command:
 
 ```bash
 lsb_release -ds && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader && lsblk -d -o NAME,ROTA,MODEL && df -hT ~ | tail -1
 ```
 
-## Быстрый старт
+## Quick start
 
-### 1. Зависимости
+### 1. Dependencies
 
 ```bash
 sudo apt install -y git build-essential g++-13 cmake ninja-build liburing-dev nvidia-cuda-toolkit python3-pip
 ```
 
-### 2. llama.cpp с `qwen4exp`
+### 2. llama.cpp with `qwen4exp`
 
-> **Не используйте тег `b10798-mix-659e406` из upstream README** — его переписали, под ним теперь коммит без `qwen4exp`: движок соберётся, но токенизатор откажется грузить модель (`unknown model architecture: 'qwen4exp'`). Рабочая ревизия на 2026-09-25 — ветка `mtp/qwen4exp-nextn` (`ca14269`).
+> **Do not use the `b10798-mix-659e406` tag from the upstream README.** It has been moved to a commit without `qwen4exp`: the engine builds, but the tokenizer refuses the model (`unknown model architecture: 'qwen4exp'`). The working revision is commit `ca14269` (branch `mtp/qwen4exp-nextn`, 2026-09-18), pinned by SHA so it cannot move again.
 
-`nvcc` 12.4 из Ubuntu не поддерживает gcc новее 13, поэтому CUDA-часть собирается с g++-13:
+Ubuntu's `nvcc` 12.4 does not accept gcc newer than 13, so the CUDA half is built with g++-13:
 
 ```bash
-git clone --depth 1 --branch mtp/qwen4exp-nextn https://github.com/unslothai/llama.cpp ~/.unsloth/llama.cpp && cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13 -DLLAMA_CURL=OFF && cmake --build ~/.unsloth/llama.cpp/build -j
+git init ~/.unsloth/llama.cpp && git -C ~/.unsloth/llama.cpp fetch --depth 1 https://github.com/unslothai/llama.cpp ca1426903fabe9af26cd10c42034cb4bbd2e0e11 && git -C ~/.unsloth/llama.cpp checkout FETCH_HEAD && cmake -S ~/.unsloth/llama.cpp -B ~/.unsloth/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13 -DLLAMA_CURL=OFF && cmake --build ~/.unsloth/llama.cpp/build -j
 ```
 
-### 3. Движок
+### 3. The engine
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-### 4. Модель
+### 4. The model
 
 ```bash
 pip install -U huggingface_hub
 ```
 
-Q4 — по качеству, 111.3 ГБ:
+Q4, for quality, 111.3 GB:
 
 ```bash
 hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16.gguf"
 ```
 
-Q3 — по скорости, 90.0 ГБ (при VRAM ≤ 12 ГБ берите его):
+Q3, for speed, 90.0 GB (take this one with 12 GB of VRAM or less):
 
 ```bash
 hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q3_K_XL/*" "mmproj-F16.gguf"
 ```
 
-Черновая голова — +12–13% в агентной работе, ровно один файл на 2.79 ГБ (не пишите `MTP/*`, это 24.6 ГБ всех вариантов):
+The draft head, +12–13% for agentic work, exactly one 2.79 GB file (do not use `MTP/*`, that is 24.6 GB of every variant):
 
 ```bash
 hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf"
 ```
 
-### 5. Запуск
+### 5. Run
 
 ```bash
 scripts/console.sh
 ```
 
-Откройте http://127.0.0.1:8090, выберите модель и ярус — **Чат** (32K), **Агентный кодинг** (128K) или **Агентный кодинг+** (256K) — и нажмите **«Автонастройка и запуск»**. Около четырёх минут консоль меряет диск, рассчитывает план под вашу VRAM и RAM, поднимает сервер, проверяет его на коротком чате и на документе с подсаженной фразой и подбирает число потоков. Результат сохраняется; дальше хватает кнопки **«Запустить»**.
+Open http://127.0.0.1:8090, pick the model and a tier (**Chat** 32K, **Agentic coding** 128K or **Agentic coding+** 256K) and press **Auto-tune & start**. For about four minutes the console measures the drive, plans for your VRAM and RAM, starts the server, checks it on a short chat and on a document with a planted passphrase, and sweeps the CPU thread count. The result is saved; after that **Start server** is enough.
 
-Сервер слушает `http://127.0.0.1:8080`; API-ключ для клиентов — на вкладке «Доступ» (при первом открытии консоль попросит создать учётную запись, см. ниже).
+The server listens on `http://127.0.0.1:8080`; the API key for clients is on the Access tab (the first visit asks you to create an account, see below).
 
-## Вход, доступ и языки
+## Sign-in, access and languages
 
-<p align="center"><img src="docs/img/console-login-ru.png" width="45%" alt="Вход в консоль"> <img src="docs/img/console-access-ru.png" width="53%" alt="Вкладка «Доступ»"></p>
+<p align="center"><img src="docs/img/console-login-en.png" width="45%" alt="Signing in to the console"> <img src="docs/img/console-access-en.png" width="53%" alt="The Access tab"></p>
 
-**Первый запуск.** Откройте консоль с этой же машины — она предложит создать учётную запись (логин и пароль от 8 символов). С другой машины первую запись можно создать только с кодом настройки, который консоль печатает в терминале при старте. Браузер предложит запомнить логин и пароль; галочка «Запомнить меня» держит сессию 30 дней вместо 12 часов.
+**First run.** Open the console from the same machine and it offers to create an account (a login and a password of 8 characters or more). From another machine the first account can only be created with the setup code the console prints in its terminal at start. The browser can remember the login and password; "Remember me" keeps the session for 30 days instead of 12 hours.
 
-**Вкладка «Доступ».** API-ключ сервера модели (показать, скопировать, выпустить новый), требовать ли его и на каком адресе слушать сервер (только эта машина или локальная сеть); учётные записи и смена пароля. Изменения ключа и адреса вступают в силу при следующем запуске сервера.
+**The Access tab.** The model server's API key (show, copy, issue a new one), whether it is required, and which address the server listens on (this machine only, or the local network); accounts and password change. A new key and a new address take effect when the server is next started.
 
-**Консоль в локальной сети, по HTTPS:**
+**The console on the local network, over HTTPS:**
 
 ```bash
 scripts/gen-cert.sh
@@ -151,21 +152,21 @@ scripts/gen-cert.sh
 scripts/console.sh --host 0.0.0.0 --tls-cert ~/.cache/qwfn-console/tls/cert.pem --tls-key ~/.cache/qwfn-console/tls/key.pem
 ```
 
-Сертификат самоподписанный: при первом заходе браузер предупредит — сверьте отпечаток SHA-256, который напечатал `gen-cert.sh`. Без `--tls-cert` консоль в сети тоже работает, но пароль тогда идёт открытым текстом (консоль об этом предупреждает).
+The certificate is self-signed: on the first visit the browser warns; compare the SHA-256 fingerprint `gen-cert.sh` printed. Without `--tls-cert` the console works on the network too, but the password then crosses it in clear text (the console warns about it).
 
-**Языки.** Флажки в шапке и на странице входа; выбор запоминается в браузере. Каталоги — `tools/console/i18n/*.json`: `html` — фрагменты страницы, `messages` — шаблоны сообщений в стиле printf (`%d ГБ …`), которые переводятся уже после форматирования. Проверка каталога:
+**Languages.** Flags in the header and on the sign-in page; the choice is remembered by the browser. Catalogs live in `tools/console/i18n/*.json`: `html` holds page fragments, `messages` printf-style message patterns (`%d GB …`) that are translated after formatting. Check a catalog:
 
 ```bash
 python3 -c "import sys; sys.path.insert(0,'tools'); import qwfn_i18n; print(qwfn_i18n.Catalogs('tools/console/i18n').check('ru') or 'ok')"
 ```
 
-**Скрипты** (`scripts/claude-desktop.sh`) входят без браузера: консоль при каждом старте пишет токен в `~/.cache/qwfn-console/console_token` (0600) и принимает его только с этой машины.
+**Scripts** (`scripts/claude-desktop.sh`) get in without a browser: on every start the console writes a token to `~/.cache/qwfn-console/console_token` (mode 0600) and accepts it from this machine only.
 
-## Подключение клиентов
+## Clients
 
-Ключ — на вкладке «Доступ» (кнопка «Копировать»). Ниже `КЛЮЧ` — это он.
+The key is on the Access tab (the Copy button); `KEY` below stands for it.
 
-**OpenCode** — `~/.config/opencode/opencode.jsonc`. Лимит контекста стоит указать под выбранный ярус, чтобы OpenCode сжимал историю вовремя:
+**OpenCode**, `~/.config/opencode/opencode.jsonc`. Set the context limit to the tier you run, so OpenCode compacts the history in time:
 
 ```json
 {
@@ -174,7 +175,7 @@ python3 -c "import sys; sys.path.insert(0,'tools'); import qwfn_i18n; print(qwfn
     "qwfn": {
       "name": "qwfn",
       "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "КЛЮЧ" },
+      "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "KEY" },
       "models": {
         "qwen3.8-flash-next": { "name": "qwen3.8-flash-next", "limit": { "context": 131072, "output": 32768 } }
       }
@@ -183,44 +184,42 @@ python3 -c "import sys; sys.path.insert(0,'tools'); import qwfn_i18n; print(qwfn
 }
 ```
 
-**Claude Code** — сервер отдаёт Anthropic Messages API, подключение к корню, не к `/v1`. Лимит контекста — тоже под ярус:
+**Claude Code**: the server speaks the Anthropic Messages API; point it at the root, not at `/v1`. Match the context limit to the tier too:
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=КЛЮЧ ANTHROPIC_MODEL=qwen3.8-flash-next CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072 claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=KEY ANTHROPIC_MODEL=qwen3.8-flash-next CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072 claude
 ```
 
-**Любой OpenAI-клиент** — базовый URL `http://127.0.0.1:8080/v1`, модель `qwen3.8-flash-next`, ключ в `Authorization: Bearer КЛЮЧ`. Размышления — через `reasoning_effort` (`xhigh` · `medium` · `low` · `off`) или `/think` / `/no_think` в конце сообщения.
+**Any OpenAI client**: base URL `http://127.0.0.1:8080/v1`, model `qwen3.8-flash-next`, key in `Authorization: Bearer KEY`. Thinking is set per request with `reasoning_effort` (`xhigh` · `medium` · `low` · `off`) or by ending a message with `/think` / `/no_think`.
 
-**Служебные эндпоинты** (с ключом, кроме `/health`): `/stats` (скорость, контекст, кэш экспертов, черновики), `/metrics` (Prometheus), `/slots`, `/props`, `/health`.
+**Service endpoints** (key required except `/health`): `/stats` (speed, context, expert cache, drafts), `/metrics` (Prometheus), `/slots`, `/props`, `/health`.
 
-## Если что-то не так
+## Troubleshooting
 
-**Сервер упал с кодом 134 и `CUDA error: out of memory` в логе.** Во время декода кончилась VRAM: ggml-cuda завершает процесс, и перехватить это из движка нельзя (ни здесь, ни в оригинале). Уберите с GPU другие процессы, не запускайте второй сервер, увеличьте «Резерв VRAM» в расширенных настройках. Крайняя мера — `GGML_CUDA_DISABLE_GRAPHS=1`: сервер переживает нехватку, но теряет около 15% скорости.
+**The server exited with code 134 and `CUDA error: out of memory` in the log.** VRAM ran out during decode: ggml-cuda ends the process, and the engine cannot catch it (neither here nor upstream). Free the GPU of other processes, do not start a second server, raise "VRAM reserve" under Advanced settings. As a last resort, `GGML_CUDA_DISABLE_GRAPHS=1` lets the server survive the shortage at about 15% of its speed.
 
-**Клиент получает `401 invalid or missing API key`.** В клиенте нет ключа или он старый: скопируйте ключ на вкладке «Доступ». После «Нового ключа» старый перестаёт работать при следующем запуске сервера. Отключить требование — там же, «Требовать ключ: выкл».
+**A client gets `401 invalid or missing API key`.** The client has no key or an old one: copy it from the Access tab. After "New key" the old one stops working at the next server start. The requirement can be switched off there too ("Require the key: off").
 
-**Забыли пароль.** Остановите консоль и удалите блок `"users"` из `~/.cache/qwfn-console/config.json` (или весь `"auth"`, тогда сменится и API-ключ) — при следующем запуске консоль снова предложит создать учётную запись.
+**Forgotten password.** Stop the console and delete the `"users"` block from `~/.cache/qwfn-console/config.json` (or all of `"auth"`, which also replaces the API key); on its next start the console offers to create an account again.
 
-**Второй сервер не стартует: `engine init: failed to allocate … on CUDA0`.** Первый уже держит VRAM. Одновременно работает только один.
+**A second server does not start: `engine init: failed to allocate … on CUDA0`.** The first one holds the VRAM. Only one runs at a time.
 
-**Консоль не видит модель.** Вкладка «Сервер» → «Где искать модели»: там список папок и причина отказа по каждому найденному GGUF. Загрузка с `--local-dir` лежит вне кэша — добавьте папку. Оборванная загрузка выглядит так же: повторите ту же команду `hf download`.
+**The console does not see the model.** Serve tab → Model locations lists the folders scanned and the reason each GGUF it found was rejected. A download made with `--local-dir` sits outside the cache: add its folder. An interrupted download looks the same: run the same `hf download` again.
 
-**Декод медленнее ожидаемого.** Вкладка «Лог» показывает, что движок реально построил: ярусы в VRAM и RAM. Частые причины — мало свободной RAM, другой процесс на GPU, холодный кэш (первый запрос всегда медленнее).
+**Decode is slower than expected.** The Log tab shows what the engine really built: the VRAM and RAM tiers. The usual causes are little free RAM, another process on the GPU, or a cold cache (the first request is always slower).
 
-**`claude: команда не найдена`.** Claude Code CLI не установлен отдельно (у Claude Desktop он свой, внутри приложения). Установите CLI или запустите бинарник из `~/.config/Claude/claude-code/<версия>/claude`.
-
-## Тесты
+## Tests
 
 ```bash
-MODEL=/путь/к/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf scripts/ab_decode.sh /путь/к/другой/build/qwfn-gen build/qwfn-gen --io-uring
+MODEL=/path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf scripts/ab_decode.sh /path/to/other/build/qwfn-gen build/qwfn-gen --io-uring
 ```
 
 ```bash
-nvcc -ccbin g++-13 -O2 -o build/qwfn-vram-hog tools/qwfn_vram_hog.cu && MODEL=/путь/к/...-00001-of-00004.gguf scripts/oom_survival.sh build/qwfn-server
+nvcc -ccbin g++-13 -O2 -o build/qwfn-vram-hog tools/qwfn_vram_hog.cu && MODEL=/path/to/...-00001-of-00004.gguf scripts/oom_survival.sh build/qwfn-server
 ```
 
-Оба теста занимают GPU целиком — остановите сервер перед запуском.
+Both take the whole GPU: stop the server first.
 
-## Благодарности и лицензия
+## Credits and license
 
-Движок, консоль и исходная документация — [Apolog1ze-Dev/QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) (Karim Dagher), Apache 2.0. Изменения этой ветки распространяются на тех же условиях, см. [LICENSE](LICENSE). Модель — [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF); ggml и токенизатор — [llama.cpp](https://github.com/ggml-org/llama.cpp).
+The engine, the console and the original documentation: [Apolog1ze-Dev/QwFNfer](https://github.com/Apolog1ze-Dev/QwFNfer) (Karim Dagher), Apache 2.0. This fork's changes are under the same terms, see [LICENSE](LICENSE). The model: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF); ggml and the tokenizer: [llama.cpp](https://github.com/ggml-org/llama.cpp).
