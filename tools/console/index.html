@@ -1,175 +1,203 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>qwfn console</title>
+<title>qwfn · консоль</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2016%2016%22%20shape-rendering%3D%22crispEdges%22%3E%3Crect%20x%3D%221%22%20y%3D%220%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2214%22%20y%3D%220%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%221%22%20y%3D%221%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2213%22%20y%3D%221%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%221%22%20y%3D%222%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%222%22%20y%3D%222%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ff6bd9%22/%3E%3Crect%20x%3D%223%22%20y%3D%222%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2212%22%20y%3D%222%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2213%22%20y%3D%222%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ff6bd9%22/%3E%3Crect%20x%3D%2214%22%20y%3D%222%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%221%22%20y%3D%223%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%222%22%20y%3D%223%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ff6bd9%22/%3E%3Crect%20x%3D%223%22%20y%3D%223%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2211%22%20y%3D%223%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2213%22%20y%3D%223%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ff6bd9%22/%3E%3Crect%20x%3D%2214%22%20y%3D%223%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%221%22%20y%3D%224%22%20width%3D%2214%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%220%22%20y%3D%225%22%20width%3D%2216%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%220%22%20y%3D%226%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%222%22%20y%3D%226%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23d9b3ff%22/%3E%3Crect%20x%3D%223%22%20y%3D%226%22%20width%3D%2210%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2213%22%20y%3D%226%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23d9b3ff%22/%3E%3Crect%20x%3D%2214%22%20y%3D%226%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%220%22%20y%3D%227%22%20width%3D%223%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%223%22%20y%3D%227%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ffffff%22/%3E%3Crect%20x%3D%224%22%20y%3D%227%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%2308060d%22/%3E%3Crect%20x%3D%225%22%20y%3D%227%22%20width%3D%226%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2211%22%20y%3D%227%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ffffff%22/%3E%3Crect%20x%3D%2212%22%20y%3D%227%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%2308060d%22/%3E%3Crect%20x%3D%2213%22%20y%3D%227%22%20width%3D%223%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%220%22%20y%3D%228%22%20width%3D%223%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%223%22%20y%3D%228%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%2308060d%22/%3E%3Crect%20x%3D%225%22%20y%3D%228%22%20width%3D%226%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2211%22%20y%3D%228%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%2308060d%22/%3E%3Crect%20x%3D%2213%22%20y%3D%228%22%20width%3D%223%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%220%22%20y%3D%229%22%20width%3D%2216%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%220%22%20y%3D%2210%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23ffffff%22/%3E%3Crect%20x%3D%222%22%20y%3D%2210%22%20width%3D%225%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%227%22%20y%3D%2210%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23ff6bd9%22/%3E%3Crect%20x%3D%229%22%20y%3D%2210%22%20width%3D%225%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2214%22%20y%3D%2210%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23ffffff%22/%3E%3Crect%20x%3D%220%22%20y%3D%2211%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%222%22%20y%3D%2211%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ffffff%22/%3E%3Crect%20x%3D%223%22%20y%3D%2211%22%20width%3D%224%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%227%22%20y%3D%2211%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%237c3aed%22/%3E%3Crect%20x%3D%229%22%20y%3D%2211%22%20width%3D%224%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2213%22%20y%3D%2211%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%23ffffff%22/%3E%3Crect%20x%3D%2214%22%20y%3D%2211%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%220%22%20y%3D%2212%22%20width%3D%226%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%226%22%20y%3D%2212%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%237c3aed%22/%3E%3Crect%20x%3D%227%22%20y%3D%2212%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%229%22%20y%3D%2212%22%20width%3D%221%22%20height%3D%221%22%20fill%3D%22%237c3aed%22/%3E%3Crect%20x%3D%2210%22%20y%3D%2212%22%20width%3D%226%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%221%22%20y%3D%2213%22%20width%3D%2214%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%222%22%20y%3D%2214%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%237c3aed%22/%3E%3Crect%20x%3D%224%22%20y%3D%2214%22%20width%3D%228%22%20height%3D%221%22%20fill%3D%22%23b36bff%22/%3E%3Crect%20x%3D%2212%22%20y%3D%2214%22%20width%3D%222%22%20height%3D%221%22%20fill%3D%22%237c3aed%22/%3E%3Crect%20x%3D%224%22%20y%3D%2215%22%20width%3D%228%22%20height%3D%221%22%20fill%3D%22%237c3aed%22/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Silkscreen&family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#0f1216; --panel:#171b21; --line:#262c35; --fg:#e6e9ee; --dim:#8b95a3; --acc:#6ee7b7; --warn:#f6c453; --bad:#f87171; --ok:#6ee7b7; --blue:#7cb8ff; --mono: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  /* cakescats: pixel art, black and purple. Square corners, 2px borders, hard offset shadows. */
+  :root { --bg:#08060d; --panel:#120c1c; --panel2:#1a1128; --line:#33224d; --line2:#4b3270; --fg:#efe8ff; --dim:#9c8cbd;
+          --acc:#b36bff; --acc2:#7c3aed; --acc-soft:rgba(179,107,255,.10); --warn:#ffcf4a; --bad:#ff4f7b; --ok:#8dffb5; --blue:#ff6bd9;
+          --shadow:4px 4px 0 #000; --pixel:"Silkscreen", "Press Start 2P", ui-monospace, monospace;
+          --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
   * { box-sizing:border-box }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  header { display:flex; align-items:center; gap:14px; padding:12px 22px; border-bottom:1px solid var(--line); flex-wrap:wrap }
-  header h1 { font-size:17px; margin:0 12px 0 0; font-weight:600 }
-  .pill { display:inline-flex; align-items:center; gap:8px; padding:5px 10px; border:1px solid var(--line); border-radius:999px; color:var(--dim); font-size:12.5px }
-  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim) }
-  .dot.ready { background:var(--ok) } .dot.busy { background:var(--warn); box-shadow:0 0 0 3px rgba(246,196,83,.18) } .dot.loading { background:var(--warn) } .dot.exited { background:var(--bad) }
-  nav { display:flex; gap:4px; margin-left:auto }
-  nav button { background:transparent; color:var(--dim); border:1px solid transparent; border-radius:9px; padding:7px 14px; font:inherit; font-weight:600; cursor:pointer }
-  nav button.on { color:var(--fg); border-color:var(--line); background:var(--panel) }
-  main { max-width:1400px; margin:0 auto; padding:18px 22px }
+  html { background:var(--bg) }
+  body { margin:0; color:var(--fg); font:14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background:
+           linear-gradient(transparent 31px, rgba(179,107,255,.045) 32px) 0 0/32px 32px,
+           linear-gradient(90deg, transparent 31px, rgba(179,107,255,.045) 32px) 0 0/32px 32px,
+           var(--bg); }
+  ::selection { background:var(--acc2); color:#fff }
+  header { display:flex; align-items:center; gap:14px; padding:12px 22px; border-bottom:2px solid var(--line2); flex-wrap:wrap; background:#0d0914; position:sticky; top:0; z-index:10 }
+  header h1 { display:flex; align-items:center; gap:10px; font:400 15px/1 var(--pixel); letter-spacing:1px; margin:0 12px 0 0; text-transform:uppercase; color:var(--fg) }
+  header h1 .logo { width:34px; height:34px; image-rendering:pixelated; filter:drop-shadow(2px 2px 0 #000) }
+  header h1 small { font:400 10px/1 var(--pixel); color:var(--acc); letter-spacing:1px; display:block; margin-top:4px }
+  .pill { display:inline-flex; align-items:center; gap:8px; padding:4px 10px; border:2px solid var(--line); background:var(--panel); color:var(--dim); font-size:12.5px }
+  .dot { width:10px; height:10px; background:var(--dim) }
+  .dot.ready { background:var(--ok) } .dot.busy { background:var(--warn); animation:blink 1s steps(2) infinite } .dot.loading { background:var(--warn); animation:blink .6s steps(2) infinite } .dot.exited { background:var(--bad) }
+  @keyframes blink { 50% { opacity:.25 } }
+  nav { display:flex; gap:6px; margin-left:auto }
+  nav button { background:transparent; color:var(--dim); border:2px solid transparent; border-radius:0; padding:7px 14px; font:400 11px/1 var(--pixel); letter-spacing:1px; text-transform:uppercase; cursor:pointer; box-shadow:none }
+  nav button:hover { color:var(--fg); border-color:var(--line) }
+  nav button.on { color:#fff; border-color:var(--acc); background:var(--acc2); box-shadow:var(--shadow) }
+  main { max-width:1400px; margin:0 auto; padding:20px 22px }
   .tab { display:none } .tab.on { display:block }
-  .grid2 { display:grid; grid-template-columns: 1fr 1.35fr; gap:18px }
-  section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:18px }
-  h2 { font-size:12.5px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); margin:0 0 12px }
-  h2 .sub { text-transform:none; letter-spacing:0; font-weight:400 }
-  .banner { border:1px solid rgba(110,231,183,.35); background:rgba(110,231,183,.06); border-radius:12px; padding:12px 16px; margin-bottom:18px; display:flex; gap:18px; align-items:center; flex-wrap:wrap }
-  .banner.off { border-color:var(--line); background:transparent; color:var(--dim) }
-  .banner b { font-size:15px } .banner .flags { font-family:var(--mono); font-size:12.5px; color:var(--dim) } .banner .flags span { display:inline-block; margin-right:10px; color:var(--fg) }
+  .grid2 { display:grid; grid-template-columns: 1fr 1.35fr; gap:20px }
+  section { background:var(--panel); border:2px solid var(--line2); border-radius:0; padding:16px 18px; margin-bottom:20px; box-shadow:var(--shadow) }
+  h2 { font:400 11px/1.4 var(--pixel); text-transform:uppercase; letter-spacing:1px; color:var(--acc); margin:0 0 12px }
+  h2 .sub { font:12px/1.4 "Inter", system-ui, sans-serif; text-transform:none; letter-spacing:0; color:var(--dim) }
+  code { font-family:var(--mono) }
+  .banner { border:2px solid var(--acc); background:var(--acc-soft); border-radius:0; padding:12px 16px; margin-bottom:20px; display:flex; gap:18px; align-items:center; flex-wrap:wrap; box-shadow:var(--shadow) }
+  .banner.off { border-color:var(--line); background:var(--panel); color:var(--dim) }
+  .banner b { font-size:15px } .banner .flags { font-family:var(--mono); font-size:12px; color:var(--dim) } .banner .flags span { display:inline-block; margin:2px 8px 2px 0; padding:1px 6px; border:1px solid var(--line2); color:var(--fg); background:#0d0914 }
   .loc { color:var(--dim); font-size:11.5px; margin:10px 0 6px; font-family:var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-  .model { display:grid; grid-template-columns: 22px 1fr; gap:10px; align-items:center; padding:10px 12px; border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer }
-  .model.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
-  .model .name { font-weight:600 } .model .sub { color:var(--dim); font-size:12px } .badge { display:inline-block; font-size:10.5px; padding:1px 6px; border:1px solid var(--line); border-radius:6px; color:var(--dim); margin-left:6px; vertical-align:1px } .badge.ok { color:var(--ok); border-color:rgba(110,231,183,.4) }
+  .model { display:grid; grid-template-columns: 22px 1fr; gap:10px; align-items:center; padding:10px 12px; border:2px solid var(--line); background:var(--panel2); margin-bottom:8px; cursor:pointer }
+  .model:hover { border-color:var(--line2) }
+  .model.sel { border-color:var(--acc); background:var(--acc-soft); box-shadow:inset 4px 0 0 var(--acc) }
+  .model input { accent-color:var(--acc) }
+  .model .name { font-weight:600 } .model .sub { color:var(--dim); font-size:12px } .badge { display:inline-block; font:400 9px/1.6 var(--pixel); letter-spacing:.5px; text-transform:uppercase; padding:0 5px; border:1px solid var(--line2); color:var(--dim); margin-left:6px; vertical-align:2px } .badge.ok { color:var(--ok); border-color:var(--ok) }
   .skipped { margin-top:10px; font-size:12px; color:var(--dim); display:flex; flex-direction:column; gap:4px }
-  .skipped > div { border-left:2px solid var(--line); padding-left:8px } .skipped code { font-family:var(--mono); font-size:11.5px; color:var(--fg); display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap } .skipped span { display:block; margin-top:1px }
-  .locs { display:flex; flex-direction:column; gap:6px; margin-top:8px } .locrow { display:flex; gap:8px; align-items:center; font-size:12.5px } .locrow code { font-family:var(--mono); font-size:12px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 } .locrow .x { background:transparent; color:var(--dim); border:1px solid var(--line); padding:2px 8px; font-size:12px }
+  .skipped > div { border-left:2px solid var(--line2); padding-left:8px } .skipped code { font-family:var(--mono); font-size:11.5px; color:var(--fg); display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap } .skipped span { display:block; margin-top:1px }
+  .locs { display:flex; flex-direction:column; gap:6px; margin-top:8px } .locrow { display:flex; gap:8px; align-items:center; font-size:12.5px } .locrow code { font-family:var(--mono); font-size:12px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 } .locrow .x { background:transparent; color:var(--dim); border:1px solid var(--line2); padding:2px 8px; font-size:12px; box-shadow:none }
   .addloc { display:flex; gap:8px; margin-top:8px } .addloc input { flex:1 }
   .kv { display:grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap:10px }
-  .kv div { border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width:0 } .kv b { display:block; font-size:19px; font-weight:600; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis } .kv span { color:var(--dim); font-size:12px } .kv small { display:block; color:var(--dim); font-size:11.5px; margin-top:3px }
+  .kv div { border:2px solid var(--line); background:var(--panel2); padding:10px 12px; min-width:0 } .kv b { display:block; font-size:19px; font-weight:700; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#fff } .kv span { color:var(--dim); font-size:12px } .kv small { display:block; color:var(--dim); font-size:11.5px; margin-top:3px }
   .kv div.wide { grid-column: span 2 }
   .presets { display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:12px }
-  .preset { border:1px solid var(--line); border-radius:10px; padding:10px 12px; cursor:pointer; min-width:0 }
-  .preset.sel { border-color:var(--acc); background:rgba(110,231,183,.06) }
-  .preset .pname { font-weight:600 } .preset .pctx { color:var(--dim); font-size:12px }
+  .preset { border:2px solid var(--line); background:var(--panel2); padding:10px 12px; cursor:pointer; min-width:0; transition:transform .08s steps(2) }
+  .preset:hover { border-color:var(--line2); transform:translate(-1px,-1px) }
+  .preset.sel { border-color:var(--acc); background:var(--acc-soft); box-shadow:var(--shadow) }
+  .preset .pname { font:400 11px/1.4 var(--pixel); text-transform:uppercase; letter-spacing:.5px; color:#fff } .preset .pctx { color:var(--dim); font-size:12px; margin-top:4px }
   .preset .pnum { font-size:12.5px; margin-top:8px; color:var(--dim) } .preset .pnum b { color:var(--fg) }
   .preset .pfit { color:var(--warn); font-size:12px; margin-top:4px } .preset .pmeas { color:var(--ok); font-size:11.5px; margin-top:4px }
   .plan { color:var(--dim); font-size:12.5px; line-height:1.7; margin-bottom:6px } .plan b { color:var(--fg) }
-  details.adv { margin:0 0 6px; border-top:1px solid var(--line); padding-top:8px } details.adv > summary { cursor:pointer; font-size:12.5px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.8px; padding:4px 0; list-style:none } details.adv > summary::before { content:'▸ '; } details.adv[open] > summary::before { content:'▾ '; } details.adv[open] > summary { margin-bottom:10px }
+  details.adv { margin:0 0 6px; border-top:2px dashed var(--line); padding-top:8px } details.adv > summary { cursor:pointer; font:400 10.5px/1.4 var(--pixel); color:var(--dim); text-transform:uppercase; letter-spacing:1px; padding:4px 0; list-style:none } details.adv > summary:hover { color:var(--acc) } details.adv > summary::before { content:'▸ '; } details.adv[open] > summary::before { content:'▾ '; } details.adv[open] > summary { margin-bottom:10px; color:var(--acc) }
   form { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px 14px }
   label { display:flex; flex-direction:column; gap:4px; color:var(--dim); font-size:12px }
   .lbl { display:flex; align-items:center; gap:6px }
-  .tip { position:relative; display:inline-flex; width:15px; height:15px; border-radius:50%; border:1px solid var(--line); color:var(--dim); font-size:10px; align-items:center; justify-content:center; cursor:help; font-weight:600 }
-  .tip::after { content:attr(data-tip); position:absolute; left:0; top:20px; z-index:5; width:290px; background:#0b0e12; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:12px; line-height:1.45; font-weight:400; white-space:normal; display:none; box-shadow:0 8px 24px rgba(0,0,0,.5) }
+  .tip { position:relative; display:inline-flex; width:16px; height:16px; border:1px solid var(--line2); background:var(--panel2); color:var(--acc); font:400 9px/1 var(--pixel); align-items:center; justify-content:center; cursor:help }
+  .tip::after { content:attr(data-tip); position:absolute; left:0; top:22px; z-index:20; width:300px; background:#0d0914; color:var(--fg); border:2px solid var(--acc2); padding:8px 10px; font:12px/1.5 "Inter", system-ui, sans-serif; white-space:normal; display:none; box-shadow:var(--shadow) }
   .tip:hover::after { display:block }
   form label:nth-child(3n) .tip::after { left:auto; right:0 }
-  input, select, textarea { background:#0f1216; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:7px 9px; font:inherit }
-  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc) }
+  input, select, textarea { background:#0b0812; color:var(--fg); border:2px solid var(--line); border-radius:0; padding:7px 9px; font:inherit }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--acc); box-shadow:0 0 0 2px var(--acc-soft) }
   .locked { opacity:.45; pointer-events:none }
   .hint { color:var(--warn); font-size:12.5px; margin:6px 0 0 }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px }
-  button { background:var(--acc); color:#0b0f12; border:0; border-radius:9px; padding:9px 14px; font:inherit; font-weight:600; cursor:pointer }
-  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line) } button.danger { background:var(--bad); color:#fff } button:disabled { opacity:.45; cursor:default }
-  button.primary { background:var(--blue) }
+  button { background:var(--acc); color:#12081f; border:2px solid #000; border-radius:0; padding:9px 14px; font:400 11px/1.2 var(--pixel); letter-spacing:.5px; text-transform:uppercase; cursor:pointer; box-shadow:var(--shadow); transition:transform .05s, box-shadow .05s }
+  button:hover:not(:disabled) { filter:brightness(1.12) }
+  button:active:not(:disabled) { transform:translate(4px,4px); box-shadow:0 0 0 #000 }
+  button.secondary { background:var(--panel2); color:var(--fg); border-color:var(--line2) } button.danger { background:var(--bad); color:#fff } button:disabled { opacity:.4; cursor:default; box-shadow:none }
+  button.primary { background:var(--blue); color:#1a0616 }
   .est { display:flex; gap:14px; flex-wrap:wrap; color:var(--dim); font-size:12.5px; margin-top:10px } .est b { color:var(--fg) }
-  .reasons { color:var(--dim); font-size:12px; margin-top:8px; line-height:1.5 }
-  .panel { margin-top:14px; border-top:1px solid var(--line); padding-top:12px }
+  .reasons { color:var(--dim); font-size:12px; margin-top:8px; line-height:1.55 }
+  .panel { margin-top:14px; border-top:2px dashed var(--line); padding-top:12px }
   .steps { font-family:var(--mono); font-size:12px; color:var(--dim); white-space:pre-wrap; margin:0 0 10px; max-height:160px; overflow:auto }
   .verdict { margin:10px 0 0; font-size:13px } .verdict.ok { color:var(--ok) } .verdict.warn { color:var(--warn) } .verdict.bad { color:var(--bad) }
-  .bar { height:8px; background:#0f1216; border:1px solid var(--line); border-radius:6px; overflow:hidden; margin:8px 0 } .bar i { display:block; height:100%; background:var(--acc); width:0; transition:width .4s }
-  .bar.p i { background:var(--warn) }
+  .bar { height:12px; background:#0b0812; border:2px solid var(--line2); overflow:hidden; margin:8px 0 } .bar i { display:block; height:100%; width:0; transition:width .4s steps(12);
+         background:repeating-linear-gradient(90deg, var(--acc) 0 8px, var(--acc2) 8px 10px) }
+  .bar.p i { background:repeating-linear-gradient(90deg, var(--warn) 0 8px, #c99a1a 8px 10px) }
   .notes { color:var(--warn); font-size:12.5px; margin-top:8px; line-height:1.5 }
   .sweep { font-size:12px; color:var(--dim); margin-top:6px } .sweep b { color:var(--fg) } .sweep span { display:inline-block; margin-right:10px }
-  .endpoint { font-family:var(--mono); font-size:13px; background:#0f1216; border:1px solid var(--line); border-radius:8px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap }
-  .connect { color:var(--dim); font-size:12px; margin-top:8px; line-height:1.6 } .connect code { font-family:var(--mono); color:var(--fg); background:#0f1216; padding:1px 5px; border-radius:4px }
-  canvas { width:100%; height:110px; display:block; margin-top:10px }
-  pre { background:#0b0e12; border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:12px; line-height:1.4; max-height:560px; overflow:auto; margin:0; white-space:pre-wrap; color:#b7c0cc }
+  .endpoint { font-family:var(--mono); font-size:13px; background:#0b0812; border:2px solid var(--line2); padding:8px 10px; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap }
+  .connect { color:var(--dim); font-size:12px; margin-top:8px; line-height:1.7 } .connect code { font-family:var(--mono); color:var(--fg); background:#0b0812; border:1px solid var(--line); padding:1px 5px }
+  canvas { width:100%; height:110px; display:block; margin-top:10px; image-rendering:pixelated; background:#0b0812; border:2px solid var(--line) }
+  pre { background:#0b0812; border:2px solid var(--line2); padding:10px 12px; font:12px/1.45 var(--mono); max-height:560px; overflow:auto; margin:0; white-space:pre-wrap; color:#cbbfe6 }
   .muted { color:var(--dim) } .err { color:var(--bad) } .okc { color:var(--ok) } .warnc { color:var(--warn) }
-  .chat { display:grid; grid-template-columns: 1fr 260px; gap:18px }
+  .chat { display:grid; grid-template-columns: 1fr 280px; gap:20px }
   .msgs { min-height:420px; max-height:62vh; overflow:auto; display:flex; flex-direction:column; gap:12px; padding:4px 2px }
-  .msg { border:1px solid var(--line); border-radius:12px; padding:10px 14px; max-width:92% } .msg.user { align-self:flex-end; background:rgba(110,231,183,.07); border-color:rgba(110,231,183,.3) } .msg.assistant { align-self:flex-start }
-  .msg .who { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.6px; margin-bottom:4px }
+  .msg { border:2px solid var(--line); background:var(--panel2); padding:10px 14px; max-width:92% } .msg.user { align-self:flex-end; background:var(--acc-soft); border-color:var(--acc2); box-shadow:4px 4px 0 #000 } .msg.assistant { align-self:flex-start; box-shadow:-4px 4px 0 #000 }
+  .msg .who { font:400 9.5px/1.4 var(--pixel); color:var(--acc); text-transform:uppercase; letter-spacing:1px; margin-bottom:6px }
   .msg .text { white-space:pre-wrap; word-break:break-word }
-  .msg details { margin:4px 0 8px } .msg summary { cursor:pointer; color:var(--dim); font-size:12.5px } .think { color:var(--dim); font-size:12.5px; white-space:pre-wrap; border-left:2px solid var(--line); padding-left:10px; margin-top:6px; max-height:260px; overflow:auto }
+  .msg details { margin:4px 0 8px } .msg summary { cursor:pointer; color:var(--dim); font-size:12.5px } .think { color:var(--dim); font-size:12.5px; white-space:pre-wrap; border-left:2px solid var(--line2); padding-left:10px; margin-top:6px; max-height:260px; overflow:auto }
   .meta { color:var(--dim); font-size:11.5px; margin-top:6px }
   .compose { display:flex; gap:10px; margin-top:12px } .compose textarea { flex:1; min-height:64px; resize:vertical }
-  .statehead { display:flex; align-items:baseline; gap:14px; margin:12px 0 10px } .statehead b { font-size:22px } .statehead .muted { font-size:12.5px }
+  .statehead { display:flex; align-items:baseline; gap:14px; margin:12px 0 10px } .statehead b { font:400 16px/1.2 var(--pixel); text-transform:uppercase; color:#fff } .statehead .muted { font-size:12.5px }
+  ::-webkit-scrollbar { width:10px; height:10px } ::-webkit-scrollbar-track { background:#0b0812 } ::-webkit-scrollbar-thumb { background:var(--line2); border:2px solid #0b0812 } ::-webkit-scrollbar-thumb:hover { background:var(--acc2) }
+  footer { text-align:center; color:var(--dim); font:400 9px/1 var(--pixel); letter-spacing:1px; text-transform:uppercase; padding:4px 0 26px }
+  footer a { color:var(--acc); text-decoration:none }
   @media (max-width: 1100px) { .presets { grid-template-columns: repeat(2, 1fr) } }
   @media (max-width: 980px) { .grid2, .chat { grid-template-columns: 1fr } form { grid-template-columns: repeat(2, 1fr) } .presets { grid-template-columns: 1fr } }
+  @media (max-width: 560px) { main { padding:14px 12px } header { padding:10px 12px } form { grid-template-columns: 1fr } .kv div.wide { grid-column:auto } nav { margin-left:0; width:100%; overflow-x:auto } }
 </style>
 </head>
 <body>
 <header>
-  <h1>qwfn console</h1>
-  <span class="pill"><span id="dot" class="dot"></span><span id="state">connecting…</span></span>
+  <h1><span class="logo" aria-hidden="true"><svg width="34" height="34" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges"><rect x="1" y="0" width="1" height="1" fill="#b36bff"/><rect x="14" y="0" width="1" height="1" fill="#b36bff"/><rect x="1" y="1" width="2" height="1" fill="#b36bff"/><rect x="13" y="1" width="2" height="1" fill="#b36bff"/><rect x="1" y="2" width="1" height="1" fill="#b36bff"/><rect x="2" y="2" width="1" height="1" fill="#ff6bd9"/><rect x="3" y="2" width="1" height="1" fill="#b36bff"/><rect x="12" y="2" width="1" height="1" fill="#b36bff"/><rect x="13" y="2" width="1" height="1" fill="#ff6bd9"/><rect x="14" y="2" width="1" height="1" fill="#b36bff"/><rect x="1" y="3" width="1" height="1" fill="#b36bff"/><rect x="2" y="3" width="1" height="1" fill="#ff6bd9"/><rect x="3" y="3" width="2" height="1" fill="#b36bff"/><rect x="11" y="3" width="2" height="1" fill="#b36bff"/><rect x="13" y="3" width="1" height="1" fill="#ff6bd9"/><rect x="14" y="3" width="1" height="1" fill="#b36bff"/><rect x="1" y="4" width="14" height="1" fill="#b36bff"/><rect x="0" y="5" width="16" height="1" fill="#b36bff"/><rect x="0" y="6" width="2" height="1" fill="#b36bff"/><rect x="2" y="6" width="1" height="1" fill="#d9b3ff"/><rect x="3" y="6" width="10" height="1" fill="#b36bff"/><rect x="13" y="6" width="1" height="1" fill="#d9b3ff"/><rect x="14" y="6" width="2" height="1" fill="#b36bff"/><rect x="0" y="7" width="3" height="1" fill="#b36bff"/><rect x="3" y="7" width="1" height="1" fill="#ffffff"/><rect x="4" y="7" width="1" height="1" fill="#08060d"/><rect x="5" y="7" width="6" height="1" fill="#b36bff"/><rect x="11" y="7" width="1" height="1" fill="#ffffff"/><rect x="12" y="7" width="1" height="1" fill="#08060d"/><rect x="13" y="7" width="3" height="1" fill="#b36bff"/><rect x="0" y="8" width="3" height="1" fill="#b36bff"/><rect x="3" y="8" width="2" height="1" fill="#08060d"/><rect x="5" y="8" width="6" height="1" fill="#b36bff"/><rect x="11" y="8" width="2" height="1" fill="#08060d"/><rect x="13" y="8" width="3" height="1" fill="#b36bff"/><rect x="0" y="9" width="16" height="1" fill="#b36bff"/><rect x="0" y="10" width="2" height="1" fill="#ffffff"/><rect x="2" y="10" width="5" height="1" fill="#b36bff"/><rect x="7" y="10" width="2" height="1" fill="#ff6bd9"/><rect x="9" y="10" width="5" height="1" fill="#b36bff"/><rect x="14" y="10" width="2" height="1" fill="#ffffff"/><rect x="0" y="11" width="2" height="1" fill="#b36bff"/><rect x="2" y="11" width="1" height="1" fill="#ffffff"/><rect x="3" y="11" width="4" height="1" fill="#b36bff"/><rect x="7" y="11" width="2" height="1" fill="#7c3aed"/><rect x="9" y="11" width="4" height="1" fill="#b36bff"/><rect x="13" y="11" width="1" height="1" fill="#ffffff"/><rect x="14" y="11" width="2" height="1" fill="#b36bff"/><rect x="0" y="12" width="6" height="1" fill="#b36bff"/><rect x="6" y="12" width="1" height="1" fill="#7c3aed"/><rect x="7" y="12" width="2" height="1" fill="#b36bff"/><rect x="9" y="12" width="1" height="1" fill="#7c3aed"/><rect x="10" y="12" width="6" height="1" fill="#b36bff"/><rect x="1" y="13" width="14" height="1" fill="#b36bff"/><rect x="2" y="14" width="2" height="1" fill="#7c3aed"/><rect x="4" y="14" width="8" height="1" fill="#b36bff"/><rect x="12" y="14" width="2" height="1" fill="#7c3aed"/><rect x="4" y="15" width="8" height="1" fill="#7c3aed"/></svg></span><span>qwfn console<small>by cakescats</small></span></h1>
+  <span class="pill"><span id="dot" class="dot"></span><span id="state">подключение…</span></span>
   <span class="pill" id="uptime"></span>
   <span class="pill" id="livepill" hidden></span>
   <nav>
-    <button data-tab="serve" class="on">Serve</button>
-    <button data-tab="chat">Chat</button>
-    <button data-tab="stats">Stats</button>
-    <button data-tab="log">Log</button>
+    <button data-tab="serve" class="on">Сервер</button>
+    <button data-tab="chat">Чат</button>
+    <button data-tab="stats">Статистика</button>
+    <button data-tab="log">Лог</button>
   </nav>
 </header>
 <main>
-  <div class="banner off" id="banner"><span>No model is being served.</span></div>
+  <div class="banner off" id="banner"><span>Модель не запущена.</span></div>
 
   <div class="tab on" id="tab-serve">
     <div class="grid2">
       <section>
-        <h2>Models</h2>
-        <div id="models" class="muted">scanning…</div>
+        <h2>Модели</h2>
+        <div id="models" class="muted">поиск…</div>
         <details class="adv" id="locbox" style="margin-top:12px">
-          <summary>Model locations</summary>
-          <div class="muted" style="font-size:12px">Folders the console scans for Qwen3.8-Flash-Next GGUFs (a Hugging Face cache, or any folder holding the shards; the <code>mmproj</code> and <code>MTP</code> files are picked up next to them). You can also give a <code>.gguf</code> file directly.</div>
+          <summary>Где искать модели</summary>
+          <div class="muted" style="font-size:12px">Папки, в которых консоль ищет GGUF Qwen3.8-Flash-Next (кэш Hugging Face или любая папка с шардами; файлы <code>mmproj</code> и <code>MTP</code> подхватываются рядом). Можно указать и сам файл <code>.gguf</code>.</div>
           <div class="locs" id="locs"></div>
-          <div class="addloc"><input id="locpath" placeholder="/path/to/models or /path/to/model-00001-of-00004.gguf"><button class="secondary" id="locadd">Add</button></div>
+          <div class="addloc"><input id="locpath" placeholder="/путь/к/моделям или /путь/к/model-00001-of-00004.gguf"><button class="secondary" id="locadd">Добавить</button></div>
           <div class="muted" id="locmsg" style="font-size:12px;margin-top:6px"></div>
         </details>
-        <h2 style="margin-top:18px">This machine</h2>
+        <h2 style="margin-top:18px">Эта машина</h2>
         <div class="kv" id="hw"></div>
       </section>
       <section>
-        <h2>Tier <span class="muted sub">— sized for the selected model on this machine</span></h2>
+        <h2>Ярус <span class="muted sub">— рассчитан для выбранной модели на этой машине</span></h2>
         <div id="settingsbox">
           <div class="presets" id="presets"></div>
           <div class="plan" id="plan"></div>
           <div class="reasons" id="reasons"></div>
         </div>
-        <p class="hint" id="lockhint" hidden>A server is running with the settings shown in the banner. Stop it to change the model or the settings.</p>
+        <p class="hint" id="lockhint" hidden>Сервер работает с настройками из баннера. Чтобы сменить модель или настройки, остановите его.</p>
         <div class="row">
-          <button id="tune" class="primary">Auto-tune &amp; start</button>
-          <button id="start">Start server</button>
-          <button id="stop" class="danger" disabled>Stop server</button>
-          <button id="selftest" class="secondary">Self-test</button>
-          <button id="reco" class="secondary">Reset</button>
+          <button id="tune" class="primary">Автонастройка и запуск</button>
+          <button id="start">Запустить</button>
+          <button id="stop" class="danger" disabled>Остановить</button>
+          <button id="selftest" class="secondary">Самопроверка</button>
+          <button id="reco" class="secondary">Сброс</button>
           <span id="msg" class="muted"></span>
         </div>
-        <div class="muted" style="font-size:12px;margin-top:8px" id="tunehelp">Auto-tune measures this machine and picks every flag from what it finds: the drive's read rate, then the plan (the KV precision the GPU has room for, the tiers, the batch, where the attention state lives, the RAM tier the memory allows), then the server is started with it and verified on a short chat and a long document, and the CPU thread count is swept live on that document's context. About four minutes; the result is saved for this model and the tier card shows the measured speed.</div>
+        <div class="muted" style="font-size:12px;margin-top:8px" id="tunehelp">Автонастройка измеряет машину и подбирает все флаги по результату: скорость чтения диска, затем план (какую точность KV вмещает GPU, ярусы, batch, где хранить состояние внимания, какой ярус RAM позволяет память), затем запускает сервер, проверяет его на коротком чате и длинном документе и подбирает число потоков CPU живым прогоном. Около четырёх минут; результат сохраняется для этой модели, а карточка яруса показывает измеренную скорость.</div>
         <div class="panel" id="tunebox" hidden>
-          <h2>Auto-tune <span class="muted sub" id="tune_sub"></span></h2>
+          <h2>Автонастройка <span class="muted sub" id="tune_sub"></span></h2>
           <div class="bar" id="tunebar"><i></i></div>
           <div class="steps" id="tune_steps"></div>
           <div class="kv" id="tune_result"></div>
           <div class="sweep" id="tune_sweep"></div>
           <div class="notes" id="tune_notes"></div>
           <p class="verdict" id="tune_verdict"></p>
-          <div class="row" style="margin-top:8px"><button class="secondary" id="tunecancel" hidden>Cancel tune</button></div>
+          <div class="row" style="margin-top:8px"><button class="secondary" id="tunecancel" hidden>Отменить</button></div>
         </div>
         <div id="settingsbox2" style="margin-top:12px">
           <details class="adv" id="advanced">
-            <summary>Advanced settings</summary>
+            <summary>Расширенные настройки</summary>
             <form id="form" onsubmit="return false">
-              <label><span class="lbl">Context (tokens) <span class="tip" data-tip="The most tokens one conversation can hold, prompt and answer together. The attention state for it is allocated up front and comes out of the expert tier, so a larger context leaves fewer experts on the GPU and decodes a little slower. The tiers set it; change it here and the plan is re-sized for it.">?</span></span><select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
-              <label><span class="lbl">KV cache <span class="tip" data-tip="Storage type of the attention cache. q8_0 is the default, the safer choice for long, exact work (tool arguments, code), taken whenever the plan can afford it: the VRAM expert tier survives and the predicted cost is under 10% of decode (its bytes come out of the expert tier, or, with the cache in RAM, out of the RAM tier and the PCIe gathers per token). f16 when it costs under 2%. q4_0 takes a quarter of f16 (the replays measured it no different) and is the fallback where q8_0 would not fit. The reasons line under the tier cards shows the cost.">?</span></span><select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
-              <label><span class="lbl">RAM tier (GB) <span class="tip" data-tip="Pinned host memory for the expert cache behind the VRAM tier: the memory available right now, minus what the server needs besides the tier (the draft head's 2.7 GB of pinned experts, the context state kept in RAM, staging buffers, the vision projector; estimated until Auto-tune has measured it on this machine), minus the headroom below. It is a real lever: measured at 131K, 10.5 to 16 GB was +16% decode in chat and +19% on a long document, about 3% per GB; 19 GB ran the machine out of memory. Auto-tune measures the server's real need through its run and re-sizes the tier to leave exactly the headroom.">?</span></span><input id="ram" type="number" min="2" max="64"></label>
-              <label><span class="lbl">Memory headroom (GB) <span class="tip" data-tip="RAM to leave free at the worst point of a run, for what starts after the server: a coding harness's language servers took 1.5 GB after the first tool call; with 1.9 GB free the server once stalled on its own /stats. 3 GB by default. Lower it for a bigger RAM tier (about 3% of decode per GB) when the machine runs nothing else; raise it if other apps get squeezed. A machine setting, saved for every tier and model.">?</span></span><input id="headroom" type="number" min="0.5" max="16" step="0.5"></label>
-              <label><span class="lbl">CPU threads <span class="tip" data-tip="Threads for the experts served from the RAM tier (the GPU runs the rest). Measured 2026-09-10 on an 8-core / 16-thread CPU at 131K: 4 threads 15.2 tok/s, 6 15.5, 8 15.6, 12 15.2, 16 11.5, since SMT threads starve the drive reader and the graph thread. The default is the physical core count; the auto-tune sweeps it on the running server and keeps the smallest count within 2% of the best.">?</span></span><input id="threads" type="number" min="1" max="128"></label>
-              <label><span class="lbl">Batch <span class="tip" data-tip="Tokens per prefill batch. The prefill streams every expert once per batch and computes per token, so a bigger batch is a faster prefill: on a 43K document 4096 gives ~300 tok/s, 8192 ~480, 16384 ~720. A batch borrows VRAM from the expert tier only while a prompt streams (about 0.6 GB per 4096 tokens on top of the staging), so the recommendation picks the largest that leaves the tier a gigabyte; decode speed is the same either way.">?</span></span><select id="batch"><option>2048</option><option>4096</option><option>8192</option><option>16384</option></select></label>
-              <label><span class="lbl">VRAM reserve (MB) <span class="tip" data-tip="VRAM kept free after the expert tier is sized, for what decode allocates later: its per-layer graphs, the attention graphs shaped by the context, the CUDA pool and graph instantiations. 768 MB up to 48K tokens of context, plus 8 MB per 1K tokens above that (1.4 GB at 131K): measured 2026-09-10, 805 MB ran out at the first token after a 101K prefill and 1024 held. Too small crashes the server on a long conversation; too large costs expert tier.">?</span></span><input id="reserve" type="number" min="256" max="4096" step="128"></label>
-              <label><span class="lbl">Port <span class="tip" data-tip="The server's port. Clients use http://127.0.0.1:PORT/v1 with any API key.">?</span></span><input id="port" type="number" min="1024" max="65535"></label>
-              <label><span class="lbl">Thinking <span class="tip" data-tip="Default reasoning effort. A client overrides it per request with reasoning_effort (xhigh, medium, low, off), or with /think and /no_think in a message; harnesses without a thinking toggle get this value.">?</span></span><select id="think"><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
-              <label><span class="lbl">Thinking budget (tokens, 0 = none) <span class="tip" data-tip="Cap on reasoning tokens per answer. 6000 keeps a hard think under about eight minutes at Q4 speed, inside the timeouts most harnesses have; the model is told time is up and answers from what it has. 0 lifts the cap.">?</span></span><input id="think_budget" type="number" min="0" step="500"></label>
-              <label><span class="lbl">Skip missed experts <span class="tip" data-tip="Compute a token without the experts that are still on the NVMe instead of waiting for them. Faster decode at a small, measured quality cost: the output is no longer exact. Cannot be combined with the draft head.">?</span></span><select id="skip_miss"><option value="false">off</option><option value="true">on</option></select></label>
-              <label><span class="lbl">Speculative block <span class="tip" data-tip="Predict the next layer's experts by running that layer's own block on the current residual, and fetch them while the current layer computes. The output is exact; on by default because it was never measured slower.">?</span></span><select id="spec_block"><option value="true">on</option><option value="false">off</option></select></label>
-              <label><span class="lbl">Draft head (MTP) <span class="tip" data-tip="The checkpoint's draft head (MTP/mtp-*.gguf): it proposes the token after next and the trunk verifies it as a two-token step, so the output stays the trunk's own; at temperature the draft is sampled from the head's distribution and accepted by the speculative-sampling rule, which keeps the trunk's exact distribution. It drafts after any prompt, streamed ones included. Measured on the reference machine (2026-09-10): +7-8% on the short and 43K-document replays at ~80% acceptance, and through OpenCode on a coding task +12% on Q4 and +19% on Q3 at 95-96% acceptance. It costs one tier step of VRAM and 2.7 GB of pinned RAM, both counted in the plan. On by default when the file is there.">?</span></span><select id="mtp"><option value="false">off</option><option value="true">on</option></select></label>
-              <label><span class="lbl">Vision (image input) <span class="tip" data-tip="Load the vision projector (mmproj-*.gguf) so images in requests are understood. It runs on the CPU: its 0.9 GB of weights stay in RAM and the encode uses the cores (about 15 s for a 1400x1000 screenshot, 0.3 s for a small image), so vision costs no VRAM at all and the expert tier keeps its size. On by default whenever the file is next to the model; off gives a text-only server.">?</span></span><select id="vision"><option value="true">on</option><option value="false">off</option></select></label>
-              <label><span class="lbl">Attention state in RAM <span class="tip" data-tip="Where the attention caches live. 'indexer cache' keeps the indexer keys (3 MB per 1K tokens of context) in pinned RAM, read over PCIe at about 0.35 ms per token; 'indexer + KV cache' also moves the KV cache (7 MB per 1K tokens at q4_0) at about 2 ms per token. The VRAM they free goes to the expert tier: about 4% of decode per GB at 128K, and the difference between an expert tier and none at 256K (measured 7.0 to 9.7 tok/s). The tiers pick it per context: indexer from 64K, both from 128K (measured +5% decode at 126K) or whenever the tier would not fit otherwise.">?</span></span><select id="state_host"><option value="none">off (all in VRAM)</option><option value="idx">indexer cache</option><option value="kv,idx">indexer + KV cache</option></select></label>
+              <label><span class="lbl">Контекст (токенов) <span class="tip" data-tip="Сколько токенов вмещает один диалог, промпт и ответ вместе. Состояние внимания под него выделяется заранее и отнимается у яруса экспертов, поэтому больший контекст оставляет на GPU меньше экспертов и декодирует чуть медленнее. Задаётся ярусом; если поменять здесь, план пересчитается.">?</span></span><select id="ctx"><option>8192</option><option>16384</option><option>32768</option><option>65536</option><option>131072</option><option>163840</option><option>262144</option></select></label>
+              <label><span class="lbl">KV-кэш <span class="tip" data-tip="Тип хранения кэша внимания. По умолчанию q8_0 — надёжнее для длинной точной работы (аргументы инструментов, код); берётся, когда план это позволяет: ярус экспертов в VRAM сохраняется, а прогнозная цена меньше 10% декода. f16 — если стоит меньше 2%. q4_0 занимает четверть от f16 (на повторах разницы не замерено) и используется, когда q8_0 не влезает. Цена показана в строке пояснений под карточками.">?</span></span><select id="kv"><option>q4_0</option><option>q8_0</option><option>f16</option></select></label>
+              <label><span class="lbl">Ярус RAM (ГБ) <span class="tip" data-tip="Закреплённая память хоста под кэш экспертов за ярусом VRAM: доступная сейчас память минус то, что серверу нужно помимо яруса (2.7 ГБ черновой головы, состояние контекста в RAM, буферы, проектор зрения; до автонастройки это оценка), минус запас ниже. Реально влияет на скорость: при 131K переход с 10.5 на 16 ГБ дал +16% декода в чате и +19% на длинном документе, около 3% на ГБ; 19 ГБ исчерпали память машины. Автонастройка измеряет реальную потребность сервера и подгоняет ярус под нужный запас.">?</span></span><input id="ram" type="number" min="2" max="64"></label>
+              <label><span class="lbl">Запас памяти (ГБ) <span class="tip" data-tip="Сколько RAM оставить свободной в худшей точке работы — для того, что запускается после сервера: языковые серверы агента заняли 1.5 ГБ после первого вызова инструмента; при 1.9 ГБ свободных сервер однажды завис на собственном /stats. По умолчанию 3 ГБ. Уменьшите ради большего яруса RAM (около 3% декода на ГБ), если на машине больше ничего не работает; увеличьте, если другим приложениям тесно. Настройка машины, общая для всех ярусов и моделей.">?</span></span><input id="headroom" type="number" min="0.5" max="16" step="0.5"></label>
+              <label><span class="lbl">Потоки CPU <span class="tip" data-tip="Потоки для экспертов из яруса RAM (остальное считает GPU). Замер 2026-09-10 на CPU 8 ядер / 16 потоков при 131K: 4 потока 15.2 ток/с, 6 — 15.5, 8 — 15.6, 12 — 15.2, 16 — 11.5: SMT-потоки отнимают время у чтения с диска и у потока графа. По умолчанию — число физических ядер; автонастройка перебирает значения на работающем сервере и берёт наименьшее в пределах 2% от лучшего.">?</span></span><input id="threads" type="number" min="1" max="128"></label>
+              <label><span class="lbl">Batch <span class="tip" data-tip="Токенов в пакете prefill. Prefill прогоняет всех экспертов один раз на пакет, поэтому больший пакет — быстрее prefill: на документе 43K 4096 даёт ~300 ток/с, 8192 — ~480, 16384 — ~720. Пакет занимает VRAM у яруса экспертов только пока читается промпт (около 0.6 ГБ на 4096 токенов сверх буфера), поэтому рекомендуется наибольший, при котором ярусу остаётся гигабайт; на скорость декода не влияет.">?</span></span><select id="batch"><option>2048</option><option>4096</option><option>8192</option><option>16384</option></select></label>
+              <label><span class="lbl">Резерв VRAM (МБ) <span class="tip" data-tip="VRAM, которая остаётся свободной после расчёта яруса экспертов, — под то, что декод выделяет позже: графы слоёв, графы внимания под контекст, пул CUDA и инстанцирование CUDA-графов. 768 МБ до 48K контекста плюс 8 МБ на каждые 1K сверх того (1.4 ГБ при 131K): по замеру 2026-09-10 805 МБ кончились на первом токене после prefill 101K, а 1024 хватило. Слишком мало — сервер упадёт на длинном диалоге (CUDA-графы при нехватке VRAM завершают процесс); слишком много — меньше яруса экспертов.">?</span></span><input id="reserve" type="number" min="256" max="4096" step="128"></label>
+              <label><span class="lbl">Порт <span class="tip" data-tip="Порт сервера. Клиенты подключаются к http://127.0.0.1:ПОРТ/v1 с любым API-ключом.">?</span></span><input id="port" type="number" min="1024" max="65535"></label>
+              <label><span class="lbl">Размышления <span class="tip" data-tip="Уровень размышлений по умолчанию. Клиент может переопределить его в запросе через reasoning_effort (xhigh, medium, low, off) или через /think и /no_think в сообщении; клиенты без такого переключателя получают это значение.">?</span></span><select id="think"><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
+              <label><span class="lbl">Бюджет размышлений (токенов, 0 — без лимита) <span class="tip" data-tip="Предел токенов размышлений на один ответ. 6000 держат долгое размышление в пределах примерно восьми минут на скорости Q4 — внутри тайм-аутов большинства клиентов; модели сообщают, что время вышло, и она отвечает с тем, что есть. 0 снимает ограничение.">?</span></span><input id="think_budget" type="number" min="0" step="500"></label>
+              <label><span class="lbl">Пропуск промахов <span class="tip" data-tip="Считать токен без экспертов, которые ещё не прочитаны с NVMe, вместо ожидания. Декод быстрее ценой небольшой измеренной потери качества: вывод перестаёт быть точным. Несовместимо с черновой головой.">?</span></span><select id="skip_miss"><option value="false">выкл</option><option value="true">вкл</option></select></label>
+              <label><span class="lbl">Спекулятивный блок <span class="tip" data-tip="Предсказывать экспертов следующего слоя, прогоняя его блок на текущем остатке, и подгружать их, пока считается текущий слой. Вывод точный; включено по умолчанию, медленнее ни разу не замерялось.">?</span></span><select id="spec_block"><option value="true">вкл</option><option value="false">выкл</option></select></label>
+              <label><span class="lbl">Черновая голова (MTP) <span class="tip" data-tip="Черновая голова чекпойнта (MTP/mtp-*.gguf): предлагает следующий токен, а основная модель проверяет его двухтокенным шагом, поэтому вывод остаётся её собственным; при температуре черновик сэмплируется из распределения головы и принимается по правилу спекулятивного сэмплирования, что сохраняет точное распределение модели. Работает после любого промпта. Замеры на эталонной машине (2026-09-10): +7–8% на коротких и 43K-повторах при ~80% принятия, в OpenCode на задаче кодинга +12% на Q4 и +19% на Q3 при 95–96% принятия. На этой машине: 94–95% принятия, ~12–12.6 ток/с при 128K. Стоит одну ступень VRAM и 2.7 ГБ закреплённой RAM — всё учтено в плане. Включается сама, если файл есть.">?</span></span><select id="mtp"><option value="false">выкл</option><option value="true">вкл</option></select></label>
+              <label><span class="lbl">Зрение (картинки) <span class="tip" data-tip="Загрузить проектор зрения (mmproj-*.gguf), чтобы понимать изображения в запросах. Работает на CPU: 0.9 ГБ весов лежат в RAM, кодирование идёт на ядрах (около 15 с на скриншот 1400x1000, 0.3 с на маленькую картинку), так что VRAM не тратит и ярус экспертов не уменьшается. Включено, если файл лежит рядом с моделью; выключенное даёт чисто текстовый сервер и освобождает 0.9 ГБ под ярус RAM.">?</span></span><select id="vision"><option value="true">вкл</option><option value="false">выкл</option></select></label>
+              <label><span class="lbl">Состояние внимания в RAM <span class="tip" data-tip="Где живут кэши внимания. «Кэш индексатора» держит ключи индексатора (3 МБ на 1K контекста) в закреплённой RAM и читает их по PCIe примерно за 0.35 мс на токен; «индексатор + KV-кэш» переносит и KV-кэш (7 МБ на 1K при q4_0), около 2 мс на токен. Освобождённая VRAM уходит ярусу экспертов: около 4% декода на ГБ при 128K, а при 256K это разница между ярусом и его отсутствием (замерено 7.0 против 9.7 ток/с). Ярусы выбирают сами: индексатор от 64K, оба от 128K (замерено +5% при 126K) или когда иначе ярус не помещается.">?</span></span><select id="state_host"><option value="none">нет (всё в VRAM)</option><option value="idx">кэш индексатора</option><option value="kv,idx">индексатор + KV-кэш</option></select></label>
             </form>
             <div class="est" id="est"></div>
-            <div class="row"><button class="secondary" id="savecustom">Save as Custom tier</button><button class="secondary" id="delcustom" hidden>Delete Custom tier</button><span class="muted" id="custommsg" style="font-size:12px"></span></div>
+            <div class="row"><button class="secondary" id="savecustom">Сохранить как «Свой»</button><button class="secondary" id="delcustom" hidden>Удалить «Свой»</button><span class="muted" id="custommsg" style="font-size:12px"></span></div>
           </details>
         </div>
         <div class="panel" id="st" hidden>
-          <h2>Self-test <span class="muted sub" id="st_sub"></span></h2>
+          <h2>Самопроверка <span class="muted sub" id="st_sub"></span></h2>
           <div class="steps" id="st_steps"></div>
           <div class="kv" id="st_result"></div>
           <p class="verdict" id="st_verdict"></p>
@@ -181,28 +209,28 @@
   <div class="tab" id="tab-chat">
     <div class="chat">
       <section>
-        <h2>Chat <span class="muted sub">— talks to the served endpoint directly, streamed; the history is kept here and replayed each turn</span></h2>
-        <div class="msgs" id="msgs"><div class="muted" id="chatempty">No model is being served. Start one on the Serve tab.</div></div>
+        <h2>Чат <span class="muted sub">— напрямую к запущенному эндпоинту, потоково; история хранится здесь и отправляется целиком каждый ход</span></h2>
+        <div class="msgs" id="msgs"><div class="muted" id="chatempty">Модель не запущена. Запустите её на вкладке «Сервер».</div></div>
         <div class="compose">
-          <textarea id="prompt" placeholder="Message… (Enter to send, Shift+Enter for a newline)"></textarea>
-          <div style="display:flex;flex-direction:column;gap:8px"><button id="send">Send</button><button id="abort" class="danger" disabled>Stop</button><button id="clear" class="secondary">Clear</button></div>
+          <textarea id="prompt" placeholder="Сообщение… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+          <div style="display:flex;flex-direction:column;gap:8px"><button id="send">Отправить</button><button id="abort" class="danger" disabled>Стоп</button><button id="clear" class="secondary">Очистить</button></div>
         </div>
       </section>
       <section>
-        <h2>Request settings</h2>
+        <h2>Параметры запроса</h2>
         <form onsubmit="return false" style="grid-template-columns:1fr">
-          <label>Thinking<select id="c_think"><option value="">server default</option><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
-          <label>Temperature<input id="c_temp" type="number" step="0.05" min="0" max="2" placeholder="preset"></label>
-          <label>Max tokens<input id="c_max" type="number" min="1" step="100" value="2000"></label>
-          <label>Thinking budget<input id="c_budget" type="number" min="0" step="500" placeholder="server default"></label>
-          <label>System prompt<textarea id="c_system" rows="3" placeholder="optional"></textarea></label>
+          <label>Размышления<select id="c_think"><option value="">как на сервере</option><option>xhigh</option><option>medium</option><option>low</option><option>off</option></select></label>
+          <label>Температура<input id="c_temp" type="number" step="0.05" min="0" max="2" placeholder="из пресета"></label>
+          <label>Макс. токенов<input id="c_max" type="number" min="1" step="100" value="2000"></label>
+          <label>Бюджет размышлений<input id="c_budget" type="number" min="0" step="500" placeholder="как на сервере"></label>
+          <label>Системный промпт<textarea id="c_system" rows="3" placeholder="необязательно"></textarea></label>
         </form>
-        <h2 style="margin-top:16px">Last reply</h2>
+        <h2 style="margin-top:16px">Последний ответ</h2>
         <div class="kv" style="grid-template-columns:1fr 1fr">
-          <div><span>generation</span><b id="c_tps">—</b><span>tok/s</span></div>
-          <div><span>prefill</span><b id="c_ptps">—</b><span>tok/s</span></div>
-          <div><span>tokens</span><b id="c_tok">—</b><span id="c_toknote">reply</span></div>
-          <div><span>time</span><b id="c_time">—</b><span>s of generation</span></div>
+          <div><span>генерация</span><b id="c_tps">—</b><span>ток/с</span></div>
+          <div><span>prefill</span><b id="c_ptps">—</b><span>ток/с</span></div>
+          <div><span>токены</span><b id="c_tok">—</b><span id="c_toknote">ответ</span></div>
+          <div><span>время</span><b id="c_time">—</b><span>с генерации</span></div>
         </div>
       </section>
     </div>
@@ -210,59 +238,60 @@
 
   <div class="tab" id="tab-stats">
     <section>
-      <h2>Endpoint</h2>
-      <div class="endpoint"><span>base URL <b id="endpoint">—</b> <span class="muted" id="modelid"></span></span><button class="secondary" id="copy">copy</button></div>
-      <div class="connect">Any OpenAI-compatible client works with any API key: base URL <code id="ep2">—</code>, model <code id="ep3">—</code>. Thinking is controlled per request with <code>reasoning_effort</code> (xhigh · medium · low · off) or by ending a message with <code>/think</code> or <code>/no_think</code>; every reply carries <code>usage</code> (input, cached and output tokens) and llama.cpp-style <code>timings</code>. <code>/stats</code> is what this page reads, once a second. <b>Claude Code</b> connects natively (the server also serves the Anthropic Messages API): <code>ANTHROPIC_BASE_URL=<span id="ep4">—</span> ANTHROPIC_AUTH_TOKEN=local ANTHROPIC_MODEL=<span id="ep5">—</span> claude</code>.</div>
+      <h2>Эндпоинт</h2>
+      <div class="endpoint"><span>базовый URL <b id="endpoint">—</b> <span class="muted" id="modelid"></span></span><button class="secondary" id="copy">копировать</button></div>
+      <div class="connect">Подходит любой OpenAI-совместимый клиент с любым API-ключом: базовый URL <code id="ep2">—</code>, модель <code id="ep3">—</code>. Размышления настраиваются в запросе через <code>reasoning_effort</code> (xhigh · medium · low · off) или окончанием сообщения <code>/think</code> / <code>/no_think</code>; каждый ответ содержит <code>usage</code> (входные, кэшированные и выходные токены) и <code>timings</code> в стиле llama.cpp. Эта страница раз в секунду читает <code>/stats</code>. <b>OpenCode</b>: провайдер <code>@ai-sdk/openai-compatible</code> с этим базовым URL. <b>Claude Code</b> подключается напрямую (сервер отдаёт и Anthropic Messages API): <code>ANTHROPIC_BASE_URL=<span id="ep4">—</span> ANTHROPIC_AUTH_TOKEN=local ANTHROPIC_MODEL=<span id="ep5">—</span> claude</code>.</div>
     </section>
     <section>
-      <h2>Now <span class="muted sub" id="nowsub">— polled every second</span></h2>
+      <h2>Сейчас <span class="muted sub" id="nowsub">— обновляется каждую секунду</span></h2>
       <div class="statehead"><b id="nowstate">—</b><span class="muted" id="nownote"></span></div>
       <div class="kv">
-        <div><span>generation</span><b id="tps">—</b><span id="tpsnote">tok/s</span><small id="tps2"></small></div>
-        <div class="wide"><span>prefill</span><b id="ptps">—</b><span id="ptpsnote">tok/s</span><div class="bar p" id="pbar" hidden><i></i></div><small id="ptps2"></small></div>
-        <div><span>input tokens</span><b id="cur_in">—</b><span>this request</span><small id="cur_in2"></small></div>
-        <div><span>cached</span><b id="cur_cached">—</b><span>reused from the prefix</span><small id="cur_cached2"></small></div>
-        <div><span>output tokens</span><b id="cur_out">—</b><span id="cur_outnote">so far</span><small id="cur_out2"></small></div>
+        <div><span>генерация</span><b id="tps">—</b><span id="tpsnote">ток/с</span><small id="tps2"></small></div>
+        <div class="wide"><span>prefill</span><b id="ptps">—</b><span id="ptpsnote">ток/с</span><div class="bar p" id="pbar" hidden><i></i></div><small id="ptps2"></small></div>
+        <div><span>входные токены</span><b id="cur_in">—</b><span>этот запрос</span><small id="cur_in2"></small></div>
+        <div><span>из кэша</span><b id="cur_cached">—</b><span>переиспользовано из префикса</span><small id="cur_cached2"></small></div>
+        <div><span>выходные токены</span><b id="cur_out">—</b><span id="cur_outnote">пока</span><small id="cur_out2"></small></div>
       </div>
       <canvas id="chart" width="1200" height="110"></canvas>
-      <div class="muted" style="font-size:12px;margin-top:4px"><span style="color:var(--acc)">■</span> generation tok/s · <span style="color:var(--warn)">■</span> prefill tok/s (right scale) · last 5 minutes · <span id="chartnote"></span></div>
+      <div class="muted" style="font-size:12px;margin-top:4px"><span style="color:var(--acc)">■</span> генерация, ток/с · <span style="color:var(--warn)">■</span> prefill, ток/с (правая шкала) · последние 5 минут · <span id="chartnote"></span></div>
     </section>
     <section>
-      <h2>Last request <span class="muted sub" id="lastsub"></span></h2>
+      <h2>Последний запрос <span class="muted sub" id="lastsub"></span></h2>
       <div class="kv">
-        <div><span>input tokens</span><b id="l_in">—</b><span id="l_innote">prompt, cached included</span></div>
-        <div><span>cached</span><b id="l_cached">—</b><span id="l_cachednote">reused, not re-read</span></div>
-        <div><span>prefilled</span><b id="l_new">—</b><span id="l_newnote">new tokens read</span></div>
-        <div><span>output tokens</span><b id="l_out">—</b><span id="l_outnote"></span></div>
-        <div><span>prefill</span><b id="l_ptps">—</b><span>tok/s</span><small id="l_ptps2"></small></div>
-        <div><span>generation</span><b id="l_tps">—</b><span>tok/s</span><small id="l_tps2"></small></div>
-        <div><span>finish</span><b id="l_finish" style="font-size:15px">—</b><span id="l_finishnote"></span></div>
+        <div><span>входные токены</span><b id="l_in">—</b><span id="l_innote">промпт, включая кэш</span></div>
+        <div><span>из кэша</span><b id="l_cached">—</b><span id="l_cachednote">переиспользовано, не перечитывалось</span></div>
+        <div><span>прочитано</span><b id="l_new">—</b><span id="l_newnote">новых токенов</span></div>
+        <div><span>выходные токены</span><b id="l_out">—</b><span id="l_outnote"></span></div>
+        <div><span>prefill</span><b id="l_ptps">—</b><span>ток/с</span><small id="l_ptps2"></small></div>
+        <div><span>генерация</span><b id="l_tps">—</b><span>ток/с</span><small id="l_tps2"></small></div>
+        <div><span>завершение</span><b id="l_finish" style="font-size:15px">—</b><span id="l_finishnote"></span></div>
       </div>
     </section>
     <section>
-      <h2>Session <span class="muted sub">— this server's lifetime</span></h2>
+      <h2>Сессия <span class="muted sub">— с момента запуска сервера</span></h2>
       <div class="kv">
-        <div><span>requests</span><b id="reqs">—</b><span id="reqsnote"></span></div>
-        <div><span>input tokens</span><b id="t_in">—</b><span id="t_innote"></span></div>
-        <div><span>cached</span><b id="t_cached">—</b><span id="t_cachednote"></span></div>
-        <div><span>output tokens</span><b id="t_out">—</b><span id="t_outnote"></span></div>
-        <div><span>generation, average</span><b id="t_tps">—</b><span>tok/s</span><small id="t_tps2"></small></div>
-        <div><span>prefill, average</span><b id="t_ptps">—</b><span>tok/s</span><small id="t_ptps2"></small></div>
-        <div><span>context in use</span><b id="ctxuse">—</b><span id="ctxnote"></span><small id="ctx2"></small></div>
-        <div><span>expert cache</span><b id="hit">—</b><span>hit · from VRAM</span><small id="hit2"></small></div>
-        <div><span>draft head</span><b id="spec">—</b><span id="specnote">accepted</span><small id="spec2"></small></div>
-        <div><span>CPU threads</span><b id="thr">—</b><span>for RAM-served experts</span></div>
+        <div><span>запросов</span><b id="reqs">—</b><span id="reqsnote"></span></div>
+        <div><span>входные токены</span><b id="t_in">—</b><span id="t_innote"></span></div>
+        <div><span>из кэша</span><b id="t_cached">—</b><span id="t_cachednote"></span></div>
+        <div><span>выходные токены</span><b id="t_out">—</b><span id="t_outnote"></span></div>
+        <div><span>генерация, в среднем</span><b id="t_tps">—</b><span>ток/с</span><small id="t_tps2"></small></div>
+        <div><span>prefill, в среднем</span><b id="t_ptps">—</b><span>ток/с</span><small id="t_ptps2"></small></div>
+        <div><span>занято контекста</span><b id="ctxuse">—</b><span id="ctxnote"></span><small id="ctx2"></small></div>
+        <div><span>кэш экспертов</span><b id="hit">—</b><span>попадания · из VRAM</span><small id="hit2"></small></div>
+        <div><span>черновая голова</span><b id="spec">—</b><span id="specnote">принято</span><small id="spec2"></small></div>
+        <div><span>потоки CPU</span><b id="thr">—</b><span>для экспертов из RAM</span></div>
       </div>
     </section>
   </div>
 
   <div class="tab" id="tab-log">
     <section>
-      <h2>Server log <span class="muted sub">— last lines, follows while you stay at the bottom</span></h2>
+      <h2>Лог сервера <span class="muted sub">— последние строки; прокручивается сам, пока вы внизу</span></h2>
       <pre id="log">—</pre>
     </section>
   </div>
 </main>
+<footer>qwfnfer · сборка cakescats · <a href="https://github.com/Apolog1ze-Dev/QwFNfer">upstream</a></footer>
 <script>
 const $ = id => document.getElementById(id);
 const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -270,8 +299,8 @@ let models = [], selected = null, reco = null, presetId = 'coding', customDirty 
 const fmt = (n, d=1) => (n === undefined || n === null || isNaN(n)) ? '—' : Number(n).toFixed(d);
 const big = n => (n === undefined || n === null || isNaN(n)) ? '—' : n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(Math.round(n));
 const kctx = c => (c/1024).toFixed(0) + 'K';
-const commas = n => (n === undefined || n === null || isNaN(n)) ? '—' : Math.round(Number(n)).toLocaleString('en-US');
-const secs = s => s === undefined || s === null || isNaN(s) ? '—' : s >= 3600 ? Math.floor(s/3600) + ' h ' + Math.floor((s%3600)/60) + ' min' : s >= 90 ? Math.floor(s/60) + ' min ' + Math.round(s%60) + ' s' : s >= 10 ? Math.round(s) + ' s' : s.toFixed(1) + ' s';
+const commas = n => (n === undefined || n === null || isNaN(n)) ? '—' : Math.round(Number(n)).toLocaleString('ru-RU');
+const secs = s => s === undefined || s === null || isNaN(s) ? '—' : s >= 3600 ? Math.floor(s/3600) + ' ч ' + Math.floor((s%3600)/60) + ' мин' : s >= 90 ? Math.floor(s/60) + ' мин ' + Math.round(s%60) + ' с' : s >= 10 ? Math.round(s) + ' с' : s.toFixed(1) + ' с';
 async function api(path, opts) { const r = await fetch(path, Object.assign({ cache: 'no-store' }, opts || {})); return r.json(); }
 const post = (path, body) => api(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body || {}) });
 
@@ -299,13 +328,13 @@ function renderModels() {
   if (!models.length) {
     // Nothing to serve. If the scan did find GGUFs and rejected them, the reason is the answer:
     // show it, rather than telling someone who has just downloaded 111 GB that there is nothing there.
-    let h = '<span class="muted">no Qwen3.8-Flash-Next GGUF found in ' + locations.map(l => '<code>' + esc(l.path) + '</code>').join(', ') + '.</span>';
+    let h = '<span class="muted">GGUF Qwen3.8-Flash-Next не найден в ' + locations.map(l => '<code>' + esc(l.path) + '</code>').join(', ') + '.</span>';
     if (skipped.length) {
-      h += '<div class="skipped">Found, but not served:' + skipped.slice(0, 8).map(k =>
+      h += '<div class="skipped">Найдены, но не подходят:' + skipped.slice(0, 8).map(k =>
         '<div><code title="' + esc(k.path) + '">' + esc(k.path.split('/').slice(-2).join('/')) + '</code><span>' + esc(k.why) + '</span></div>').join('') +
-        (skipped.length > 8 ? '<div class="muted">and ' + (skipped.length - 8) + ' more</div>' : '') + '</div>';
+        (skipped.length > 8 ? '<div class="muted">и ещё ' + (skipped.length - 8) + '</div>' : '') + '</div>';
     }
-    h += '<div class="muted" style="margin-top:8px">Download one (<code>hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16.gguf"</code>) or add the folder that holds it under Model locations. The caches above are the ones <code>hf</code> uses (<code>HF_HUB_CACHE</code>, <code>HUGGINGFACE_HUB_CACHE</code>, <code>HF_HOME</code>, <code>XDG_CACHE_HOME</code>, then <code>~/.cache</code>); a download made with <code>--local-dir</code> sits outside all of them and needs adding.</div>';
+    h += '<div class="muted" style="margin-top:8px">Скачайте модель (<code>hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q4_K_XL/*" "mmproj-F16.gguf"</code>) или добавьте папку с ней в «Где искать модели». Выше перечислены кэши, которые использует <code>hf</code> (<code>HF_HUB_CACHE</code>, <code>HUGGINGFACE_HUB_CACHE</code>, <code>HF_HOME</code>, <code>XDG_CACHE_HOME</code>, затем <code>~/.cache</code>); загрузка с <code>--local-dir</code> лежит вне их, её нужно добавить вручную.</div>';
     el.innerHTML = h; return;
   }
   let loc = null;
@@ -313,7 +342,7 @@ function renderModels() {
     if (m.location !== loc) { loc = m.location; const l = document.createElement('div'); l.className = 'loc'; l.textContent = loc; l.title = loc; el.appendChild(l); }
     const div = document.createElement('div'); div.className = 'model' + (m.path === selected ? ' sel' : '');
     const tuned = (reco && reco.tune && m.name === (reco.tune.model)) || false;
-    div.innerHTML = `<input type="radio" ${m.path === selected ? 'checked' : ''}><div><div class="name">${m.name} <span class="muted" style="font-weight:400">${m.size_gb} GB</span>${m.mmproj ? '<span class="badge">vision</span>' : ''}${m.mtp ? '<span class="badge">draft head</span>' : ''}${m.tuned_date ? '<span class="badge ok">tuned</span>' : ''}</div><div class="sub">${m.repo}${m.known_quant ? '' : ' · unknown quant, estimates are rough'}</div></div>`;
+    div.innerHTML = `<input type="radio" ${m.path === selected ? 'checked' : ''}><div><div class="name">${m.name} <span class="muted" style="font-weight:400">${m.size_gb} ГБ</span>${m.mmproj ? '<span class="badge">зрение</span>' : ''}${m.mtp ? '<span class="badge">mtp</span>' : ''}${m.tuned_date ? '<span class="badge ok">настроена</span>' : ''}</div><div class="sub">${m.repo}${m.known_quant ? '' : ' · неизвестный квант, оценки приблизительные'}</div></div>`;
     div.onclick = () => { selected = m.path; visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; customDirty = false; renderModels(); loadReco(); };
     el.appendChild(div);
   });
@@ -323,14 +352,14 @@ function renderLocations() {
   locations.forEach(l => {
     const n = models.filter(m => m.location === l.path).length;
     const row = document.createElement('div'); row.className = 'locrow';
-    row.innerHTML = `<code title="${l.path}">${l.path}</code><span class="muted">${l.builtin ? 'Hugging Face cache · ' : ''}${!l.exists ? 'missing' : (l.readable === false ? 'unreadable (permissions)' : n + ' model' + (n === 1 ? '' : 's'))}</span>` + (l.builtin ? '' : '<button class="x">remove</button>');
+    row.innerHTML = `<code title="${l.path}">${l.path}</code><span class="muted">${l.builtin ? 'кэш Hugging Face · ' : ''}${!l.exists ? 'не существует' : (l.readable === false ? 'нет доступа (права)' : 'моделей: ' + n)}</span>` + (l.builtin ? '' : '<button class="x">убрать</button>');
     const x = row.querySelector('.x'); if (x) x.onclick = async () => { await post('/api/locations', { remove: l.path }); await loadModels(); await loadReco(); };
     el.appendChild(row);
   });
 }
 $('locadd').onclick = async () => {
   const p = $('locpath').value.trim(); if (!p) return;
-  $('locmsg').textContent = 'scanning…';
+  $('locmsg').textContent = 'поиск…';
   const r = await post('/api/locations', { add: p });
   if (r.error) { $('locmsg').textContent = r.error; $('locmsg').className = 'err'; return; }
   $('locmsg').textContent = ''; $('locpath').value = ''; await loadModels(); await loadReco();
@@ -340,16 +369,16 @@ $('locpath').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preve
 async function loadHw() {
   const hw = await api('/api/hardware');
   $('hw').innerHTML = `
-    <div><span>GPU</span><b style="font-size:14px">${hw.gpu || 'none'}</b><span>${(hw.vram_total_mb/1024).toFixed(1)} GB VRAM, ${(hw.vram_used_mb/1024).toFixed(1)} used${hw.desktop_gpu ? ' · desktop on it' : ''}</span></div>
-    <div><span>RAM</span><b>${hw.ram_total_gb} GB</b><span>${hw.ram_available_gb} GB available</span></div>
-    <div><span>CPU</span><b>${hw.cpu_cores} cores</b><span>${hw.cpu_threads} threads · ${(hw.cpu || '').replace(/\s+(Processor|CPU).*$/, '').replace(/^(AMD|Intel\(R\)|Intel) /, '')}</span></div>
-    <div id="hwdrive"><span>drive under the model</span><b>—</b><span>run Auto-tune to measure it</span></div>`;
+    <div><span>GPU</span><b style="font-size:14px">${hw.gpu || 'нет'}</b><span>${(hw.vram_total_mb/1024).toFixed(1)} ГБ VRAM, занято ${(hw.vram_used_mb/1024).toFixed(1)}${hw.desktop_gpu ? ' · на ней рабочий стол' : ''}</span></div>
+    <div><span>RAM</span><b>${hw.ram_total_gb} ГБ</b><span>доступно ${hw.ram_available_gb} ГБ</span></div>
+    <div><span>CPU</span><b>${hw.cpu_cores} ядер</b><span>${hw.cpu_threads} потоков · ${(hw.cpu || '').replace(/\s+(Processor|CPU).*$/, '').replace(/^(AMD|Intel\(R\)|Intel) /, '')}</span></div>
+    <div id="hwdrive"><span>диск с моделью</span><b>—</b><span>измерит автонастройка</span></div>`;
 }
 function renderDrive() {
   const t = reco && reco.tune, el = $('hwdrive'); if (!el) return;
-  if (!t || !t.nvme) { el.innerHTML = '<span>drive under the model</span><b>—</b><span>run Auto-tune to measure it</span>'; return; }
+  if (!t || !t.nvme) { el.innerHTML = '<span>диск с моделью</span><b>—</b><span>измерит автонастройка</span>'; return; }
   const d = t.drive || {};
-  el.innerHTML = `<span>drive under the model</span><b>${fmt(t.nvme.gbs)} GB/s</b><span>${d.model || d.disk || ''}${d.rotational ? ' · spinning disk' : ''} · random 2 MiB reads</span>`;
+  el.innerHTML = `<span>диск с моделью</span><b>${fmt(t.nvme.gbs)} ГБ/с</b><span>${d.model || d.disk || ''}${d.rotational ? ' · HDD' : ''} · случайные чтения по 2 МиБ</span>`;
 }
 
 // ---- the plan ----
@@ -360,10 +389,10 @@ function renderPresets() {
   reco.tiers.forEach(p => {
     const div = document.createElement('div'); div.className = 'preset' + (p.id === presetId ? ' sel' : '');
     let body;
-    if (p.id === 'custom' && !p.saved) body = `<div class="pname">Custom</div><div class="pctx">${customDirty && presetId === 'custom' ? 'unsaved changes' : 'your own settings'}</div><div class="pnum">${customDirty && presetId === 'custom' ? 'save them under Advanced settings to keep this tier' : p.blurb}</div>`;
-    else body = `<div class="pname">${p.label}</div><div class="pctx">${kctx(p.ctx)} context · KV ${p.kv}${p.id === 'custom' && customDirty && presetId === 'custom' ? ' · unsaved changes' : ''}</div>` +
-      (p.measured && p.measured.chat ? `<div class="pnum"><b>${fmt(p.measured.chat)}</b> tok/s in chat<br><b>${fmt(p.measured.doc)}</b> tok/s on a long document</div><div class="pmeas">measured here ${p.measured.date.slice(0, 10)}${p.measured.prefill ? ' · prefill ' + fmt(p.measured.prefill, 0) + ' tok/s' : ''}</div>`
-                                       : `<div class="pnum"><b>${fmt(p.tok_s_short)}</b> tok/s in chat<br><b>${fmt(p.tok_s_long_doc)}</b> tok/s on a long document</div><div class="pctx" style="margin-top:4px">predicted</div>`) +
+    if (p.id === 'custom' && !p.saved) body = `<div class="pname">Свой</div><div class="pctx">${customDirty && presetId === 'custom' ? 'несохранённые изменения' : 'ваши настройки'}</div><div class="pnum">${customDirty && presetId === 'custom' ? 'сохраните их в «Расширенных настройках», чтобы оставить ярус' : p.blurb}</div>`;
+    else body = `<div class="pname">${p.label}</div><div class="pctx">контекст ${kctx(p.ctx)} · KV ${p.kv}${p.id === 'custom' && customDirty && presetId === 'custom' ? ' · не сохранено' : ''}</div>` +
+      (p.measured && p.measured.chat ? `<div class="pnum"><b>${fmt(p.measured.chat)}</b> ток/с в чате<br><b>${fmt(p.measured.doc)}</b> ток/с на длинном документе</div><div class="pmeas">замерено здесь ${p.measured.date.slice(0, 10)}${p.measured.prefill ? ' · prefill ' + fmt(p.measured.prefill, 0) + ' ток/с' : ''}</div>`
+                                       : `<div class="pnum"><b>${fmt(p.tok_s_short)}</b> ток/с в чате<br><b>${fmt(p.tok_s_long_doc)}</b> ток/с на длинном документе</div><div class="pctx" style="margin-top:4px">прогноз</div>`) +
       (p.note ? `<div class="pfit">${p.note}</div>` : '');
     div.innerHTML = body;
     div.onclick = () => { if (p.id === 'custom' && !p.saved) { presetId = 'custom'; customDirty = true; $('advanced').open = true; renderPresets(); renderPlan(); return; } presetId = p.id; customDirty = false; visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; loadReco(); };
@@ -374,26 +403,26 @@ function renderPlan() {
   const m = models.find(x => x.path === selected), e = reco && reco.estimates;
   if (!reco || !m) { $('plan').textContent = ''; $('reasons').textContent = ''; return; }
   const tier = reco.tiers.find(t => t.id === presetId);
-  const head = presetId === 'custom' ? (customDirty ? '<b>Custom (unsaved)</b> · ' : '<b>Custom</b> · ') : `<b>${tier ? tier.label : presetId}</b> · `;
-  const sh = $('state_host').value, shName = sh === 'kv,idx' ? 'indexer + KV cache in RAM' : sh === 'idx' ? 'indexer cache in RAM' : 'attention state in VRAM';
-  $('plan').innerHTML = head + `<b>${m.name}</b> · context <b>${commas($('ctx').value)}</b> tokens, KV <b>${$('kv').value}</b> · ` +
-    (e.vram_tier_gb > 0 ? `expert tier <b>${e.vram_tier_gb} GB</b> of VRAM (~${commas(e.vram_tier_blocks)} experts, ${(e.vram_served*100).toFixed(0)}% of lookups) + <b>${$('ram').value} GB</b> of RAM` : `<b>no VRAM expert tier</b> at this context on this GPU (experts from <b>${$('ram').value} GB</b> of RAM and the NVMe)`) +
-    ` · <b>${$('threads').value}</b> threads · predicted <b>${fmt(e.decode_tps_short)}</b> tok/s in chat, <b>${fmt(e.decode_tps_long_doc)}</b> on a long document, prefill ~<b>${e.prefill_tps_long}</b> tok/s · ` +
-    `<b>${shName}</b>${e.state_host_gb ? ' (' + e.state_host_gb + ' GB)' : ''} · vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · draft head <b>${$('mtp').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
+  const head = presetId === 'custom' ? (customDirty ? '<b>Свой (не сохранён)</b> · ' : '<b>Свой</b> · ') : `<b>${tier ? tier.label : presetId}</b> · `;
+  const sh = $('state_host').value, shName = sh === 'kv,idx' ? 'индексатор + KV-кэш в RAM' : sh === 'idx' ? 'кэш индексатора в RAM' : 'состояние внимания в VRAM';
+  $('plan').innerHTML = head + `<b>${m.name}</b> · контекст <b>${commas($('ctx').value)}</b> токенов, KV <b>${$('kv').value}</b> · ` +
+    (e.vram_tier_gb > 0 ? `ярус экспертов <b>${e.vram_tier_gb} ГБ</b> VRAM (~${commas(e.vram_tier_blocks)} экспертов, ${(e.vram_served*100).toFixed(0)}% обращений) + <b>${$('ram').value} ГБ</b> RAM` : `<b>без яруса экспертов в VRAM</b> при таком контексте на этой GPU (эксперты из <b>${$('ram').value} ГБ</b> RAM и с NVMe)`) +
+    ` · потоков <b>${$('threads').value}</b> · прогноз <b>${fmt(e.decode_tps_short)}</b> ток/с в чате, <b>${fmt(e.decode_tps_long_doc)}</b> на длинном документе, prefill ~<b>${e.prefill_tps_long}</b> ток/с · ` +
+    `<b>${shName}</b>${e.state_host_gb ? ' (' + e.state_host_gb + ' ГБ)' : ''} · зрение <b>${$('vision').value === 'true' ? 'вкл' : 'выкл'}</b> · MTP <b>${$('mtp').value === 'true' ? 'вкл' : 'выкл'}</b> · размышления <b>${$('think').value}</b>`;
   const cal = reco.calibration || {};
-  $('reasons').innerHTML = `KV cache ${reco.kv_reason || ''}. RAM tier ${reco.ram_reason || ''}. ${reco.state_reason || ''}.` + (cal.date ? ` Tuned on this machine ${cal.date}: ${cal.threads ? cal.threads + ' threads' : ''}${cal.nvme_gbs ? ', drive ' + fmt(cal.nvme_gbs) + ' GB/s' : ''}${cal.host_other_gb ? ', the server needs ' + fmt(cal.host_other_gb) + ' GB besides the tier' : ''}.` : ' Not tuned on this machine yet: the numbers are the cost model\'s predictions from the reference machine\'s constants, and the RAM tier keeps 2 GB for the estimate\'s uncertainty until the tune has measured it.');
+  $('reasons').innerHTML = `KV-кэш ${reco.kv_reason || ''}. Ярус RAM ${reco.ram_reason || ''}. ${reco.state_reason || ''}.` + (cal.date ? ` Настроено на этой машине ${cal.date}: ${cal.threads ? 'потоков ' + cal.threads : ''}${cal.nvme_gbs ? ', диск ' + fmt(cal.nvme_gbs) + ' ГБ/с' : ''}${cal.host_other_gb ? ', серверу нужно ' + fmt(cal.host_other_gb) + ' ГБ помимо яруса' : ''}.` : ' Автонастройка на этой машине ещё не проводилась: цифры — прогноз модели затрат по константам эталонной машины, а ярус RAM оставляет 2 ГБ на погрешность оценки, пока автонастройка её не измерит.');
 }
 function fillForm(r) {
   ['ctx','kv','ram','threads','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
   if (r.headroom_gb !== undefined && document.activeElement !== $('headroom')) $('headroom').value = r.headroom_gb;
   $('skip_miss').value = String(!!r.skip_miss); $('spec_block').value = String(r.spec_block !== false);
-  const von = $('vision').options[0]; von.disabled = !r.mmproj; von.textContent = r.mmproj ? 'on' : 'unavailable (no mmproj file)';
+  const von = $('vision').options[0]; von.disabled = !r.mmproj; von.textContent = r.mmproj ? 'вкл' : 'недоступно (нет файла mmproj)';
   $('vision').value = String(!!r.vision);
   if (r.state_host) $('state_host').value = r.state_host;
-  const mon = $('mtp').options[1]; mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? 'on' : 'unavailable (no MTP file)';
+  const mon = $('mtp').options[1]; mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? 'вкл' : 'недоступно (нет файла MTP)';
   $('mtp').value = String(!!r.mtp);
   const e = r.estimates;
-  $('est').innerHTML = `<span>VRAM expert tier <b>${e.vram_tier_gb > 0 ? e.vram_tier_gb + ' GB' : 'none'}</b> (~${e.vram_tier_blocks} blocks, ${(e.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>prefill batch <b>${r.batch}</b>${e.prefill_tps_long ? ` (~${e.prefill_tps_long} tok/s on a long document; lends ${e.lend_gb} GB of the tier while a prompt streams)` : ''}</span><span>KV + state <b>${e.state_vram_gb} GB</b> in VRAM${e.state_host_gb ? ` + <b>${e.state_host_gb} GB</b> in RAM` : ''}</span><span>dense core <b>${e.dense_core_gb} GB</b></span>${r.vision ? `<span>vision projector <b>${e.mmproj_gb} GB</b> in RAM, on the CPU</span>` : ''}<span>predicted decode <b>${fmt(e.decode_tps_short)}</b> tok/s in chat, <b>${fmt(e.decode_tps_long_doc)}</b> on a long document</span>`;
+  $('est').innerHTML = `<span>ярус экспертов в VRAM <b>${e.vram_tier_gb > 0 ? e.vram_tier_gb + ' ГБ' : 'нет'}</b> (~${e.vram_tier_blocks} блоков, ${(e.vram_served*100).toFixed(0)}% обращений из VRAM)</span><span>batch prefill <b>${r.batch}</b>${e.prefill_tps_long ? ` (~${e.prefill_tps_long} ток/с на длинном документе; занимает ${e.lend_gb} ГБ яруса, пока читается промпт)` : ''}</span><span>KV + состояние <b>${e.state_vram_gb} ГБ</b> в VRAM${e.state_host_gb ? ` + <b>${e.state_host_gb} ГБ</b> в RAM` : ''}</span><span>плотное ядро <b>${e.dense_core_gb} ГБ</b></span>${r.vision ? `<span>проектор зрения <b>${e.mmproj_gb} ГБ</b> в RAM, на CPU</span>` : ''}<span>прогноз декода <b>${fmt(e.decode_tps_short)}</b> ток/с в чате, <b>${fmt(e.decode_tps_long_doc)}</b> на длинном документе</span>`;
   $('delcustom').hidden = !r.custom_saved;
 }
 async function loadReco() {
@@ -419,7 +448,7 @@ $('kv').onchange = () => { markCustom('kv'); kvChoice = $('kv').value; ctxChoice
 $('vision').onchange = () => { markCustom('vision'); visionChoice = $('vision').value === 'true'; ctxChoice = +$('ctx').value; loadReco(); };
 $('state_host').onchange = () => { markCustom('state_host'); stateChoice = $('state_host').value; ctxChoice = +$('ctx').value; loadReco(); };
 ['ram','threads','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { markCustom(k); renderPresets(); renderPlan(); }));
-$('headroom').onchange = async () => { const r = await post('/api/config', { headroom_gb: +$('headroom').value }); if (r.error) { $('custommsg').textContent = r.error; return; } $('custommsg').textContent = 'headroom ' + r.headroom_gb + ' GB saved for this machine'; if (!customDirty) { visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; } await loadReco(); };
+$('headroom').onchange = async () => { const r = await post('/api/config', { headroom_gb: +$('headroom').value }); if (r.error) { $('custommsg').textContent = r.error; return; } $('custommsg').textContent = 'запас ' + r.headroom_gb + ' ГБ сохранён для этой машины'; if (!customDirty) { visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; } await loadReco(); };
 function settings() {
   return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, threads: +$('threads').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
@@ -429,21 +458,21 @@ function settings() {
 $('savecustom').onclick = async () => {
   const m = models.find(x => x.path === selected); if (!m) return;
   const r = await post('/api/custom', { model: m.name, settings: settings() });
-  $('custommsg').textContent = r.error || 'saved as the Custom tier for ' + m.name; customDirty = false; presetId = 'custom';
+  $('custommsg').textContent = r.error || 'сохранено как ярус «Свой» для ' + m.name; customDirty = false; presetId = 'custom';
   visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; await loadReco();
 };
 $('delcustom').onclick = async () => {
   const m = models.find(x => x.path === selected); if (!m) return;
-  await post('/api/custom', { model: m.name, delete: true }); $('custommsg').textContent = 'custom tier deleted'; customDirty = false; presetId = 'coding'; await loadReco();
+  await post('/api/custom', { model: m.name, delete: true }); $('custommsg').textContent = 'ярус «Свой» удалён'; customDirty = false; presetId = 'coding'; await loadReco();
 };
 $('start').onclick = async () => {
-  $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true; $('tune').disabled = true;
+  $('msg').textContent = 'запуск…'; $('msg').className = 'muted'; $('start').disabled = true; $('tune').disabled = true;
   const r = await post('/api/start', { model: selected, settings: settings() });
   if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; $('start').disabled = false; $('tune').disabled = false; }
-  else { $('msg').textContent = 'started, loading the model…' + (r.note ? ' (' + r.note + ')' : ''); hist = []; peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }; }
+  else { $('msg').textContent = 'запущено, модель загружается…' + (r.note ? ' (' + r.note + ')' : ''); hist = []; peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 }; }
   poll();
 };
-$('stop').onclick = async () => { $('msg').textContent = 'stopping…'; $('msg').className = 'muted'; await post('/api/stop'); poll(); };
+$('stop').onclick = async () => { $('msg').textContent = 'остановка…'; $('msg').className = 'muted'; await post('/api/stop'); poll(); };
 $('reco').onclick = () => { visionChoice = null; stateChoice = null; kvChoice = null; ctxChoice = null; customDirty = false; presetId = 'coding'; loadReco(); };
 $('copy').onclick = () => navigator.clipboard && navigator.clipboard.writeText($('endpoint').textContent);
 
@@ -453,7 +482,7 @@ $('tune').onclick = async () => {
   $('msg').textContent = ''; $('msg').className = 'muted';
   const r = await post('/api/tune', { model: selected, preset: presetId, settings: presetId === 'custom' ? settings() : null });
   if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; return; }
-  $('tunebox').hidden = false; $('tune_result').innerHTML = ''; $('tune_sweep').innerHTML = ''; $('tune_notes').textContent = ''; $('tune_verdict').textContent = ''; $('tune_steps').textContent = 'starting…';
+  $('tunebox').hidden = false; $('tune_result').innerHTML = ''; $('tune_sweep').innerHTML = ''; $('tune_notes').textContent = ''; $('tune_verdict').textContent = ''; $('tune_steps').textContent = 'запуск…';
   hist = []; peak = { tps: 0, ptps: 0, ctx: 0, hit: 0 };
   pollTune();
 };
@@ -474,28 +503,28 @@ function renderTune(t) {
   $('tunebar').hidden = !running && !t.error;
   $('tune_steps').textContent = (t.log || []).join('\n'); $('tune_steps').hidden = !running && !t.error && !(t.log || []).length;
   if (t.error) { $('tune_sub').textContent = ''; $('tune_verdict').textContent = t.error; $('tune_verdict').className = 'verdict bad'; if (!running) { $('tune_result').innerHTML = ''; return; } }
-  const r = t.result; if (!r || running) { if (running) { $('tune_sub').textContent = '— running: ' + (t.step || ''); $('tune_verdict').textContent = ''; $('tune_result').innerHTML = ''; $('tune_sweep').innerHTML = ''; } return; }
+  const r = t.result; if (!r || running) { if (running) { $('tune_sub').textContent = '— идёт: ' + (t.step || ''); $('tune_verdict').textContent = ''; $('tune_result').innerHTML = ''; $('tune_sweep').innerHTML = ''; } return; }
   const tier = reco && reco.tiers.find(p => p.id === r.preset);
-  $('tune_sub').textContent = `— ${r.model} · ${tier ? tier.label + ', ' : ''}${kctx(r.plan.ctx)} context · ${r.date} · ${secs(r.elapsed_s)}`;
+  $('tune_sub').textContent = `— ${r.model} · ${tier ? tier.label + ', ' : ''}контекст ${kctx(r.plan.ctx)} · ${r.date} · ${secs(r.elapsed_s)}`;
   const v = r.verify || {}, nv = r.nvme, d = r.drive || {};
   $('tune_result').innerHTML = `
-    <div><span>drive</span><b>${nv ? fmt(nv.gbs) + ' GB/s' : '—'}</b><span>${d.model || d.disk || 'random 2 MiB reads'}${d.rotational ? ' · spinning' : ''}</span><small>${nv ? 'reference NVMe 7.0' : 'not measured'}</small></div>
-    <div><span>threads</span><b>${r.threads}</b><span>of ${reco && reco.calibration ? reco.calibration.cpu_threads : '?'}</span><small>${r.sweep ? 'swept live on the server' : 'physical cores'}</small></div>
-    <div><span>KV cache</span><b>${r.plan.kv}</b><span>${r.plan.state_host !== 'none' ? 'state in RAM (' + r.plan.state_host + ')' : 'state in VRAM'}</span><small>${(r.kv_reason || '').split(':')[0]}</small></div>
-    <div><span>tiers</span><b>${r.built && r.built.vram_tier_gb !== undefined ? fmt(r.built.vram_tier_gb) + ' + ' + fmt(r.built.ram_tier_gb, 0) + ' GB' : r.plan.ram + ' GB RAM'}</b><span>VRAM + RAM expert tiers</span><small>batch ${r.plan.batch} · reserve ${r.plan.reserve} MB</small></div>
-    <div><span>chat, decode</span><b>${fmt(v.chat_tps)}</b><span>tok/s</span><small>predicted ${fmt(v.predicted_chat)}</small></div>
-    <div><span>document, prefill</span><b>${fmt(v.doc_prefill_tps, 0)}</b><span>tok/s</span><small>${commas(v.doc_tokens)} tokens in ${secs(v.doc_prefill_s)}</small></div>
-    <div><span>document, decode</span><b>${fmt(v.doc_tps)}</b><span>tok/s at ${kctx(v.doc_tokens || 0)}</span><small>predicted ${fmt(v.predicted_doc)}</small></div>
-    <div><span>grounded answer</span><b class="${v.found ? 'okc' : 'err'}">${v.found ? 'yes' : 'no'}</b><span>${v.found ? 'quoted the planted passphrase' : 'did not quote the passphrase'}</span></div>
-    <div><span>memory, worst point</span><b>${fmt(r.mem_min_gb)} GB</b><span>free with the first tier</span><small>${r.memory ? 'server needs ' + fmt(r.memory.host_other_gb) + ' GB besides the tier' : ''}</small></div>
-    <div><span>RAM tier</span><b>${r.memory && r.memory.after_resize ? fmt(r.memory.after_resize.ram_tier_gb) + ' GB' : fmt((r.built || {}).ram_tier_gb || r.plan.ram) + ' GB'}</b><span>${r.memory && r.memory.after_resize ? 're-sized from ' + fmt(r.memory.ram_tier_gb) + ' GB' : 'as planned'}</span><small>${r.memory && r.memory.after_resize ? fmt(r.memory.after_resize.min_free_gb) + ' GB free at the worst point after · chat ' + fmt(r.memory.after_resize.chat_tps) + ' tok/s' : (r.memory ? 'headroom ' + fmt(r.memory.headroom_gb) + ' GB' : '')}</small></div>`;
-  $('tune_sweep').innerHTML = r.sweep ? 'thread sweep: ' + r.sweep.map(s => `<span>${s.threads}: <b>${fmt(s.tok_s)}</b></span>`).join('') : '';
+    <div><span>диск</span><b>${nv ? fmt(nv.gbs) + ' ГБ/с' : '—'}</b><span>${d.model || d.disk || 'случайные чтения по 2 МиБ'}${d.rotational ? ' · HDD' : ''}</span><small>${nv ? 'эталонный NVMe — 7.0' : 'не измерен'}</small></div>
+    <div><span>потоки</span><b>${r.threads}</b><span>из ${reco && reco.calibration ? reco.calibration.cpu_threads : '?'}</span><small>${r.sweep ? 'подобрано на живом сервере' : 'по физическим ядрам'}</small></div>
+    <div><span>KV-кэш</span><b>${r.plan.kv}</b><span>${r.plan.state_host !== 'none' ? 'состояние в RAM (' + r.plan.state_host + ')' : 'состояние в VRAM'}</span><small>${(r.kv_reason || '').split(':')[0]}</small></div>
+    <div><span>ярусы</span><b>${r.built && r.built.vram_tier_gb !== undefined ? fmt(r.built.vram_tier_gb) + ' + ' + fmt(r.built.ram_tier_gb, 0) + ' ГБ' : r.plan.ram + ' ГБ RAM'}</b><span>ярусы экспертов VRAM + RAM</span><small>batch ${r.plan.batch} · резерв ${r.plan.reserve} МБ</small></div>
+    <div><span>чат, декод</span><b>${fmt(v.chat_tps)}</b><span>ток/с</span><small>прогноз ${fmt(v.predicted_chat)}</small></div>
+    <div><span>документ, prefill</span><b>${fmt(v.doc_prefill_tps, 0)}</b><span>ток/с</span><small>${commas(v.doc_tokens)} токенов за ${secs(v.doc_prefill_s)}</small></div>
+    <div><span>документ, декод</span><b>${fmt(v.doc_tps)}</b><span>ток/с при ${kctx(v.doc_tokens || 0)}</span><small>прогноз ${fmt(v.predicted_doc)}</small></div>
+    <div><span>ответ по тексту</span><b class="${v.found ? 'okc' : 'err'}">${v.found ? 'да' : 'нет'}</b><span>${v.found ? 'процитировал кодовую фразу' : 'не процитировал кодовую фразу'}</span></div>
+    <div><span>память, худшая точка</span><b>${fmt(r.mem_min_gb)} ГБ</b><span>свободно с первым ярусом</span><small>${r.memory ? 'серверу нужно ' + fmt(r.memory.host_other_gb) + ' ГБ помимо яруса' : ''}</small></div>
+    <div><span>ярус RAM</span><b>${r.memory && r.memory.after_resize ? fmt(r.memory.after_resize.ram_tier_gb) + ' ГБ' : fmt((r.built || {}).ram_tier_gb || r.plan.ram) + ' ГБ'}</b><span>${r.memory && r.memory.after_resize ? 'пересчитан с ' + fmt(r.memory.ram_tier_gb) + ' ГБ' : 'по плану'}</span><small>${r.memory && r.memory.after_resize ? 'после: в худшей точке свободно ' + fmt(r.memory.after_resize.min_free_gb) + ' ГБ · чат ' + fmt(r.memory.after_resize.chat_tps) + ' ток/с' : (r.memory ? 'запас ' + fmt(r.memory.headroom_gb) + ' ГБ' : '')}</small></div>`;
+  $('tune_sweep').innerHTML = r.sweep ? 'подбор потоков: ' + r.sweep.map(s => `<span>${s.threads}: <b>${fmt(s.tok_s)}</b></span>`).join('') : '';
   $('tune_notes').innerHTML = (r.notes || []).map(n => '• ' + n).join('<br>');
   const ratio = Math.min(v.predicted_doc ? v.doc_tps / v.predicted_doc : 1, v.predicted_chat ? v.chat_tps / v.predicted_chat : 1);
   let verdict, cls = 'ok';
-  if (!v.found) { verdict = 'The answer did not quote the passphrase: the model did not read the document correctly on this setup. Check the Log tab.'; cls = 'bad'; }
-  else if (ratio >= 0.85) verdict = `Tuned. The server is running with these flags; the tier card now shows the measured numbers, and the saved thread count and drive rate size every tier for this model from now on.`;
-  else { verdict = `Tuned, but decode came out ${Math.round((1 - ratio) * 100)}% under the cost model's prediction: a busy desktop, less free RAM, or a slower drive than assumed. The measured numbers are what the tier card shows now.`; cls = 'warn'; }
+  if (!v.found) { verdict = 'Ответ не процитировал кодовую фразу: при таких настройках модель прочитала документ неверно. Посмотрите вкладку «Лог».'; cls = 'bad'; }
+  else if (ratio >= 0.85) verdict = `Готово. Сервер работает с этими флагами; карточка яруса показывает измеренные цифры, а сохранённые число потоков и скорость диска теперь используются для всех ярусов этой модели.`;
+  else { verdict = `Настроено, но декод вышел на ${Math.round((1 - ratio) * 100)}% ниже прогноза: занятый рабочий стол, меньше свободной RAM или диск медленнее, чем предполагалось. Карточка яруса теперь показывает измеренные цифры.`; cls = 'warn'; }
   $('tune_verdict').textContent = verdict; $('tune_verdict').className = 'verdict ' + cls;
 }
 
@@ -505,7 +534,7 @@ $('selftest').onclick = async () => {
   $('msg').textContent = ''; $('msg').className = 'muted';
   const r = await post('/api/selftest', { model: selected, settings: settings() });
   if (r.error) { $('msg').textContent = r.error; $('msg').className = 'err'; return; }
-  $('st').hidden = false; $('st_result').innerHTML = ''; $('st_verdict').textContent = ''; $('st_steps').textContent = 'starting…';
+  $('st').hidden = false; $('st_result').innerHTML = ''; $('st_verdict').textContent = ''; $('st_steps').textContent = 'запуск…';
   pollSelftest();
 };
 async function pollSelftest() {
@@ -522,23 +551,23 @@ function renderSelftest(t) {
   $('st_steps').textContent = running || t.error ? (t.log || []).join('\n') : '';
   $('st_steps').hidden = !running && !t.error;
   if (t.error) { $('st_sub').textContent = ''; $('st_result').innerHTML = ''; $('st_verdict').textContent = t.error; $('st_verdict').className = 'verdict bad'; if (!running) return; }
-  const r = t.result; if (!r || running) { if (running) { $('st_sub').textContent = '— running'; $('st_verdict').textContent = ''; $('st_result').innerHTML = ''; } return; }
+  const r = t.result; if (!r || running) { if (running) { $('st_sub').textContent = '— идёт'; $('st_verdict').textContent = ''; $('st_result').innerHTML = ''; } return; }
   const pl = reco && reco.tiers.find(p => p.id === r.preset);
-  $('st_sub').textContent = `— ${r.model} · ${pl ? pl.label + ', ' : ''}${kctx(r.ctx)} context · ${r.date}`;
+  $('st_sub').textContent = `— ${r.model} · ${pl ? pl.label + ', ' : ''}контекст ${kctx(r.ctx)} · ${r.date}`;
   const d = r.doc, c = r.chat, p = r.predicted || {};
   $('st_result').innerHTML = `
-    <div><span>chat, decode</span><b>${fmt(c.tok_s)}</b><span>tok/s</span><small>predicted ${fmt(p.chat)} · ${c.n} tokens</small></div>
-    <div><span>document, prefill</span><b>${fmt(d.prefill_tok_s, 0)}</b><span>tok/s</span><small>${commas(d.tokens)} tokens in ${secs(d.prefill_s)}</small></div>
-    <div><span>document, decode</span><b>${fmt(d.tok_s)}</b><span>tok/s at ${kctx(d.tokens)} of context</span><small>predicted ${fmt(p.doc)}</small></div>
-    <div><span>grounded answer</span><b class="${d.found ? 'okc' : 'err'}">${d.found ? 'yes' : 'no'}</b><span>${d.found ? 'found the passphrase planted in the document' : 'did not quote the planted passphrase'}</span></div>
-    <div><span>expert cache</span><b>${(r.cache.hit*100).toFixed(0)}% · ${(r.cache.vram_served*100).toFixed(0)}%</b><span>hit · from VRAM</span><small>predicted ${(p.vram_served*100).toFixed(0)}% from VRAM</small></div>
-    <div><span>VRAM in use</span><b>${fmt(r.vram_used_gb)} / ${fmt(r.vram_total_gb, 0)} GB</b><span>${r.ram_available_gb} GB of RAM still free</span></div>`;
+    <div><span>чат, декод</span><b>${fmt(c.tok_s)}</b><span>ток/с</span><small>прогноз ${fmt(p.chat)} · ${c.n} токенов</small></div>
+    <div><span>документ, prefill</span><b>${fmt(d.prefill_tok_s, 0)}</b><span>ток/с</span><small>${commas(d.tokens)} токенов за ${secs(d.prefill_s)}</small></div>
+    <div><span>документ, декод</span><b>${fmt(d.tok_s)}</b><span>ток/с при контексте ${kctx(d.tokens)}</span><small>прогноз ${fmt(p.doc)}</small></div>
+    <div><span>ответ по тексту</span><b class="${d.found ? 'okc' : 'err'}">${d.found ? 'да' : 'нет'}</b><span>${d.found ? 'нашёл кодовую фразу в документе' : 'не процитировал кодовую фразу'}</span></div>
+    <div><span>кэш экспертов</span><b>${(r.cache.hit*100).toFixed(0)}% · ${(r.cache.vram_served*100).toFixed(0)}%</b><span>попадания · из VRAM</span><small>прогноз ${(p.vram_served*100).toFixed(0)}% из VRAM</small></div>
+    <div><span>занято VRAM</span><b>${fmt(r.vram_used_gb)} / ${fmt(r.vram_total_gb, 0)} ГБ</b><span>свободно ещё ${r.ram_available_gb} ГБ RAM</span></div>`;
   const ratio = p.doc ? d.tok_s / p.doc : 1, ratioC = p.chat ? c.tok_s / p.chat : 1;
   let v, cls = 'ok';
-  if (!d.found) { v = 'The answer did not quote the passphrase: the model did not read the document correctly on this setup. Check the Log tab and try a smaller context.'; cls = 'bad'; }
-  else if (Math.min(ratio, ratioC) >= 0.9) v = `This machine runs ${r.model} at these settings as predicted${Math.max(ratio, ratioC) > 1.15 ? ', faster than the estimate' : ''}. The server is still running: point your tools at the endpoint or use the Chat tab.`;
-  else if (Math.min(ratio, ratioC) >= 0.7) { v = `A little below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% on the slower of the two). A busy desktop, a slower NVMe or less free RAM than the estimate assumed do this; run Auto-tune to measure and adapt. The server is still running.`; cls = 'warn'; }
-  else { v = `Well below the prediction (${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% slower): check that nothing else is using the GPU or the NVMe, that the model files are on an NVMe, and that the RAM tier fitted (Log tab). Auto-tune measures the drive and adapts the flags.`; cls = 'bad'; }
+  if (!d.found) { v = 'Ответ не процитировал кодовую фразу: при таких настройках модель прочитала документ неверно. Посмотрите вкладку «Лог» и попробуйте контекст поменьше.'; cls = 'bad'; }
+  else if (Math.min(ratio, ratioC) >= 0.9) v = `Эта машина тянет ${r.model} с такими настройками, как и прогнозировалось${Math.max(ratio, ratioC) > 1.15 ? ', даже быстрее оценки' : ''}. Сервер продолжает работать: подключайте инструменты к эндпоинту или откройте вкладку «Чат».`;
+  else if (Math.min(ratio, ratioC) >= 0.7) { v = `Немного ниже прогноза (на ${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% в более медленном из двух). Так бывает при занятом рабочем столе, более медленном NVMe или меньшем объёме свободной RAM; запустите автонастройку, чтобы измерить и подстроиться. Сервер продолжает работать.`; cls = 'warn'; }
+  else { v = `Заметно ниже прогноза (на ${Math.round((1 - Math.min(ratio, ratioC)) * 100)}% медленнее): проверьте, что GPU и NVMe больше ничем не заняты, что модель лежит на NVMe и что ярус RAM поместился (вкладка «Лог»). Автонастройка измерит диск и подстроит флаги.`; cls = 'bad'; }
   $('st_verdict').textContent = v; $('st_verdict').className = 'verdict ' + cls;
 }
 
@@ -549,16 +578,16 @@ function setLocked(s) {
   $('settingsbox').classList.toggle('locked', running || jobs); $('settingsbox2').classList.toggle('locked', running || jobs); $('models').classList.toggle('locked', running || jobs);
   $('lockhint').hidden = !running || jobs;
   $('start').disabled = running || jobs; $('stop').disabled = !running || jobs; $('selftest').disabled = jobs; $('tune').disabled = jobs;
-  $('tune').textContent = running ? 'Auto-tune (restarts the server)' : 'Auto-tune & start';
-  if (!running && $('msg').textContent.startsWith('started, loading')) $('msg').textContent = '';
+  $('tune').textContent = running ? 'Автонастройка (перезапустит сервер)' : 'Автонастройка и запуск';
+  if (!running && $('msg').textContent.startsWith('запущено, модель')) $('msg').textContent = '';
   const b = $('banner');
-  if (!running) { b.className = 'banner off'; b.innerHTML = `<span>No model is being served.${s.exit_code !== undefined && s.exit_code !== null ? ' The last server exited with code ' + s.exit_code + ' — see the Log tab.' : ''}</span>`; return; }
+  if (!running) { b.className = 'banner off'; b.innerHTML = `<span>Модель не запущена.${s.exit_code !== undefined && s.exit_code !== null ? ' Последний сервер завершился с кодом ' + s.exit_code + ' — см. вкладку «Лог».' : ''}</span>`; return; }
   const st = s.settings || {}, p = s.props || {};
   const flags = st.ctx ? [`--ctx ${st.ctx}`, `--kv ${st.kv}`, `--ram ${st.ram}`, `--threads ${p.n_threads || st.threads}`, `--batch ${st.batch}`, `--reserve ${st.reserve}`, `--think ${st.think}`, `--think-budget ${st.think_budget}`, st.skip_miss ? '--skip-miss' : '', st.spec_block ? '--spec-block' : '', st.state_host && st.state_host !== 'none' ? `--state-host ${st.state_host}` : '', st.mtp ? '--mtp (draft head)' : '', st.vision ? '--mmproj (vision)' : ''].filter(Boolean)
                         : [p.n_ctx ? `ctx ${p.n_ctx}` : '', p.kv_type ? `kv ${p.kv_type}` : '', p.n_threads ? `threads ${p.n_threads}` : '', p.n_batch ? `batch ${p.n_batch}` : '', p.default_generation_settings ? `think ${p.default_generation_settings.reasoning_effort}` : '', p.skip_miss ? 'skip-miss' : '', p.spec_block ? 'spec-block' : '', p.state_host && p.state_host !== 'none' ? `state-host ${p.state_host}` : '', p.mtp ? 'mtp' : '', p.vision ? 'vision' : ''].filter(Boolean);
   const tb = s.tiers_built || {};
   b.className = 'banner';
-  b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'LOADING' : 'NOW SERVING'}${s.external ? ' (started outside the console)' : ''}${st.preset ? ' · ' + (({chat:'Chat', coding:'Agentic coding', coding_plus:'Agentic coding+', custom:'Custom'})[st.preset] || st.preset) + ' tier' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· model id ' + s.model_id : ''}${tb.vram_tier_gb !== undefined ? ' · expert tiers ' + fmt(tb.vram_tier_gb) + ' GB VRAM + ' + fmt(tb.ram_tier_gb, 0) + ' GB RAM' : ''}</span></span>
+  b.innerHTML = `<span><span class="muted" style="font-size:12px">${s.state === 'loading' ? 'ЗАГРУЗКА' : 'РАБОТАЕТ'}${s.external ? ' (запущен вне консоли)' : ''}${st.preset ? ' · ярус «' + (({chat:'Чат', coding:'Агентный кодинг', coding_plus:'Агентный кодинг+', custom:'Свой'})[st.preset] || st.preset) + '»' : ''}</span><br><b>${s.model || '—'}</b> <span class="muted">${s.model_id ? '· id модели ' + s.model_id : ''}${tb.vram_tier_gb !== undefined ? ' · ярусы экспертов ' + fmt(tb.vram_tier_gb) + ' ГБ VRAM + ' + fmt(tb.ram_tier_gb, 0) + ' ГБ RAM' : ''}</span></span>
     <span class="flags">${flags.map(f => `<span>${f}</span>`).join('')}</span>
     <span class="muted" style="margin-left:auto;font-family:var(--mono);font-size:12.5px">${s.endpoint}</span>`;
 }
@@ -568,24 +597,24 @@ function drawChart() {
   if (hist.length < 2) return;
   const N = 300, w = c.width / (N - 1), h = c.height - 16, top = 4;
   const maxT = Math.max(5, peak.tps, ...hist.map(x => x.tps)), maxP = Math.max(50, ...hist.map(x => x.ptps));
-  g.strokeStyle = '#2b3340'; g.beginPath(); g.moveTo(0, top + h - (peak.tps / maxT) * h); g.lineTo(c.width, top + h - (peak.tps / maxT) * h); g.stroke();
-  g.strokeStyle = '#f6c453'; g.lineWidth = 1.5; g.beginPath(); let started = false;
+  g.strokeStyle = '#33224d'; g.beginPath(); g.moveTo(0, top + h - (peak.tps / maxT) * h); g.lineTo(c.width, top + h - (peak.tps / maxT) * h); g.stroke();
+  g.strokeStyle = '#ffcf4a'; g.lineWidth = 1.5; g.beginPath(); let started = false;
   hist.forEach((v, i) => { const x = c.width - (hist.length - 1 - i) * w, y = top + h - (v.ptps / maxP) * h; if (v.ptps > 0) { started ? g.lineTo(x, y) : g.moveTo(x, y); started = true; } else started = false; });
   g.stroke();
-  g.strokeStyle = '#6ee7b7'; g.lineWidth = 2; g.beginPath();
+  g.strokeStyle = '#b36bff'; g.lineWidth = 2; g.beginPath();
   hist.forEach((v, i) => { const x = c.width - (hist.length - 1 - i) * w, y = top + h - (v.tps / maxT) * h; i ? g.lineTo(x, y) : g.moveTo(x, y); });
-  g.stroke(); g.fillStyle = '#8b95a3'; g.font = '12px system-ui'; g.fillText(maxT.toFixed(0) + ' tok/s', 6, 14); g.textAlign = 'right'; g.fillText(maxP.toFixed(0) + ' tok/s prefill', c.width - 6, 14); g.textAlign = 'left';
+  g.stroke(); g.fillStyle = '#9c8cbd'; g.font = '12px ui-monospace, monospace'; g.fillText(maxT.toFixed(0) + ' ток/с', 6, 14); g.textAlign = 'right'; g.fillText(maxP.toFixed(0) + ' ток/с prefill', c.width - 6, 14); g.textAlign = 'left';
 }
 function renderLive(s) {
   lastLive = s;
-  $('dot').className = 'dot ' + s.state; $('state').textContent = s.state + (s.external ? ' (external)' : '');
-  $('uptime').textContent = s.uptime_s ? 'up ' + secs(s.uptime_s) : '';
+  $('dot').className = 'dot ' + s.state; $('state').textContent = (({loading:'загрузка', ready:'готов', busy:'занят', exited:'остановлен', stopped:'остановлен', none:'нет сервера'})[s.state] || s.state) + (s.external ? ' (внешний)' : '');
+  $('uptime').textContent = s.uptime_s ? 'работает ' + secs(s.uptime_s) : '';
   $('endpoint').textContent = s.endpoint; $('ep2').textContent = s.endpoint; $('ep4').textContent = s.endpoint.replace(/\/v1$/, '');
   const chatable = s.state === 'ready' || s.state === 'busy';
   $('send').disabled = !chatable || chatting || !!s.selftest_running || !!(s.tune && s.tune.running); const ce = $('chatempty'); if (ce) ce.hidden = chatable || $('msgs').children.length > 1;
   const st = s.stats;
   const lp = $('livepill');
-  if (!st) { lp.hidden = true; $('nowstate').textContent = s.state === 'loading' ? 'loading the model' : 'no server'; $('nownote').textContent = ''; $('pbar').hidden = true; hist.push({ tps: 0, ptps: 0 }); if (hist.length > 300) hist.shift(); drawChart(); return; }
+  if (!st) { lp.hidden = true; $('nowstate').textContent = s.state === 'loading' ? 'загрузка модели' : 'нет сервера'; $('nownote').textContent = ''; $('pbar').hidden = true; hist.push({ tps: 0, ptps: 0 }); if (hist.length > 300) hist.shift(); drawChart(); return; }
   const g = st.generation, p = st.prompt, t = st.totals, c = st.expert_cache, L = st.last, sp = st.speculative || {};
   const prefilling = !!(st.busy && p.prefilling), generating = st.busy && !p.prefilling;
   const nowTps = generating ? g.tokens_per_second : 0, nowP = prefilling ? p.tokens_per_second : 0;
@@ -596,52 +625,52 @@ function renderLive(s) {
   // the header pill and the Now block
   lp.hidden = !st.busy;
   const left = prefilling && p.tokens_per_second > 0 ? (p.n - p.done) / p.tokens_per_second : null;
-  lp.textContent = prefilling ? `prefilling ${commas(p.done)} / ${commas(p.n)} · ${fmt(p.tokens_per_second, 0)} tok/s` : generating ? `generating ${commas(g.n)} tok · ${fmt(g.tokens_per_second)} tok/s` : '';
-  $('nowstate').textContent = prefilling ? 'prefilling' : generating ? 'generating' : 'idle';
-  $('nownote').textContent = prefilling ? `${commas(p.done)} of ${commas(p.n)} new prompt tokens read, ${fmt(p.ms/1000, 0)} s so far${left !== null ? ', about ' + secs(left) + ' left' : ''}${p.cached ? ' · ' + commas(p.cached) + ' tokens reused from the previous turn' : ''}` : generating ? `${commas(g.n)} tokens in ${secs(g.ms/1000)}` : (L ? 'last request finished ' + secs(Math.max(0, Date.now()/1000 - L.completed_at)) + ' ago' : 'no request yet');
-  $('tps').textContent = generating ? fmt(g.tokens_per_second) : (L ? fmt(L.tokens_per_second) : '—'); $('tpsnote').textContent = generating ? 'tok/s, generating now' : 'tok/s, last request';
-  $('tps2').textContent = `peak ${fmt(peak.tps)} · session average ${fmt(t.generated_tokens_per_second)}`;
-  $('ptps').textContent = prefilling ? fmt(p.tokens_per_second, 0) : (L ? fmt(L.prompt_tokens_per_second, 0) : '—'); $('ptpsnote').textContent = prefilling ? 'tok/s, reading the prompt now' : 'tok/s, last request';
+  lp.textContent = prefilling ? `prefill ${commas(p.done)} / ${commas(p.n)} · ${fmt(p.tokens_per_second, 0)} ток/с` : generating ? `генерация ${commas(g.n)} ток · ${fmt(g.tokens_per_second)} ток/с` : '';
+  $('nowstate').textContent = prefilling ? 'prefill' : generating ? 'генерация' : 'ожидание';
+  $('nownote').textContent = prefilling ? `прочитано ${commas(p.done)} из ${commas(p.n)} новых токенов промпта, прошло ${fmt(p.ms/1000, 0)} с${left !== null ? ', осталось около ' + secs(left) : ''}${p.cached ? ' · ' + commas(p.cached) + ' токенов из прошлого хода' : ''}` : generating ? `${commas(g.n)} токенов за ${secs(g.ms/1000)}` : (L ? 'последний запрос завершён ' + secs(Math.max(0, Date.now()/1000 - L.completed_at)) + ' назад' : 'запросов ещё не было');
+  $('tps').textContent = generating ? fmt(g.tokens_per_second) : (L ? fmt(L.tokens_per_second) : '—'); $('tpsnote').textContent = generating ? 'ток/с, генерация сейчас' : 'ток/с, последний запрос';
+  $('tps2').textContent = `пик ${fmt(peak.tps)} · среднее за сессию ${fmt(t.generated_tokens_per_second)}`;
+  $('ptps').textContent = prefilling ? fmt(p.tokens_per_second, 0) : (L ? fmt(L.prompt_tokens_per_second, 0) : '—'); $('ptpsnote').textContent = prefilling ? 'ток/с, читается промпт' : 'ток/с, последний запрос';
   $('pbar').hidden = !prefilling; if (prefilling) $('pbar').querySelector('i').style.width = (p.n ? Math.min(100, 100 * p.done / p.n) : 0).toFixed(1) + '%';
-  $('ptps2').textContent = prefilling ? `${commas(p.done)} / ${commas(p.n)} tokens · ${secs(p.ms/1000)}${left !== null ? ' · ~' + secs(left) + ' left' : ''}` : `peak ${fmt(peak.ptps, 0)} · session average ${fmt(t.prompt_tokens_per_second, 0)}`;
+  $('ptps2').textContent = prefilling ? `${commas(p.done)} / ${commas(p.n)} токенов · ${secs(p.ms/1000)}${left !== null ? ' · осталось ~' + secs(left) : ''}` : `пик ${fmt(peak.ptps, 0)} · среднее за сессию ${fmt(t.prompt_tokens_per_second, 0)}`;
   const cur = st.busy ? p : (L ? { input: L.input_tokens, cached: L.cached_tokens, n: L.prompt_tokens } : null);
-  $('cur_in').textContent = cur ? commas(cur.input) : '—'; $('cur_in2').textContent = cur ? (st.busy ? 'the request running now' : 'the last request') : '';
-  $('cur_cached').textContent = cur ? commas(cur.cached) : '—'; $('cur_cached2').textContent = cur && cur.input ? (100 * cur.cached / cur.input).toFixed(0) + '% of the input' : '';
-  $('cur_out').textContent = st.busy ? commas(g.n) : (L ? commas(L.generated_tokens) : '—'); $('cur_outnote').textContent = st.busy ? 'so far' : 'last request'; $('cur_out2').textContent = st.busy ? (prefilling ? 'waiting for the prefill' : secs(g.ms/1000)) : (L ? secs(L.generation_ms/1000) : '');
+  $('cur_in').textContent = cur ? commas(cur.input) : '—'; $('cur_in2').textContent = cur ? (st.busy ? 'текущий запрос' : 'последний запрос') : '';
+  $('cur_cached').textContent = cur ? commas(cur.cached) : '—'; $('cur_cached2').textContent = cur && cur.input ? (100 * cur.cached / cur.input).toFixed(0) + '% входа' : '';
+  $('cur_out').textContent = st.busy ? commas(g.n) : (L ? commas(L.generated_tokens) : '—'); $('cur_outnote').textContent = st.busy ? 'пока' : 'последний запрос'; $('cur_out2').textContent = st.busy ? (prefilling ? 'ждём окончания prefill' : secs(g.ms/1000)) : (L ? secs(L.generation_ms/1000) : '');
   // the last completed request
   if (L) {
-    $('lastsub').textContent = '— finished ' + new Date(L.completed_at * 1000).toLocaleTimeString();
-    $('l_in').textContent = commas(L.input_tokens); $('l_cached').textContent = commas(L.cached_tokens); $('l_cachednote').textContent = L.input_tokens ? (100 * L.cached_tokens / L.input_tokens).toFixed(0) + '% of the input, not re-read' : 'reused, not re-read';
-    $('l_new').textContent = commas(L.prompt_tokens); $('l_newnote').textContent = L.prompt_tokens ? 'new tokens read in ' + secs(L.prompt_ms/1000) : 'nothing new to read';
-    $('l_out').textContent = commas(L.generated_tokens); $('l_outnote').textContent = 'in ' + secs(L.generation_ms/1000);
-    $('l_ptps').textContent = L.prompt_tokens ? fmt(L.prompt_tokens_per_second, 0) : '—'; $('l_ptps2').textContent = L.prompt_tokens ? `${commas(L.prompt_tokens)} tokens, ${secs(L.prompt_ms/1000)}` : 'prefix reused';
-    $('l_tps').textContent = fmt(L.tokens_per_second); $('l_tps2').textContent = L.speculative && L.speculative.pairs ? `${L.speculative.accepted} of ${L.speculative.drafted} drafts accepted` : '';
-    $('l_finish').textContent = L.finish_reason || '—'; $('l_finishnote').textContent = L.finish_reason === 'length' ? 'hit max_tokens' : L.finish_reason === 'tool_calls' ? 'the model called a tool' : L.finish_reason === 'stop' ? 'the model ended its turn' : '';
-  } else { $('lastsub').textContent = '— none yet'; }
+    $('lastsub').textContent = '— завершён в ' + new Date(L.completed_at * 1000).toLocaleTimeString('ru-RU');
+    $('l_in').textContent = commas(L.input_tokens); $('l_cached').textContent = commas(L.cached_tokens); $('l_cachednote').textContent = L.input_tokens ? (100 * L.cached_tokens / L.input_tokens).toFixed(0) + '% входа, не перечитывалось' : 'переиспользовано, не перечитывалось';
+    $('l_new').textContent = commas(L.prompt_tokens); $('l_newnote').textContent = L.prompt_tokens ? 'новых токенов за ' + secs(L.prompt_ms/1000) : 'нового нечего читать';
+    $('l_out').textContent = commas(L.generated_tokens); $('l_outnote').textContent = 'за ' + secs(L.generation_ms/1000);
+    $('l_ptps').textContent = L.prompt_tokens ? fmt(L.prompt_tokens_per_second, 0) : '—'; $('l_ptps2').textContent = L.prompt_tokens ? `${commas(L.prompt_tokens)} токенов, ${secs(L.prompt_ms/1000)}` : 'префикс переиспользован';
+    $('l_tps').textContent = fmt(L.tokens_per_second); $('l_tps2').textContent = L.speculative && L.speculative.pairs ? `принято ${L.speculative.accepted} из ${L.speculative.drafted} черновиков` : '';
+    $('l_finish').textContent = L.finish_reason || '—'; $('l_finishnote').textContent = L.finish_reason === 'length' ? 'упёрся в max_tokens' : L.finish_reason === 'tool_calls' ? 'модель вызвала инструмент' : L.finish_reason === 'stop' ? 'модель закончила ответ' : '';
+  } else { $('lastsub').textContent = '— ещё не было'; }
   // the session
-  $('reqs').textContent = t.requests; $('reqsnote').textContent = t.requests ? 'avg ' + big(Math.round(t.generated_tokens / t.requests)) + ' output per request' : 'since start';
-  $('t_in').textContent = big(t.input_tokens); $('t_innote').textContent = commas(t.input_tokens) + ' tokens';
-  $('t_cached').textContent = big(t.cached_tokens); $('t_cachednote').textContent = t.input_tokens ? (100 * t.cached_tokens / t.input_tokens).toFixed(0) + '% of the input reused' : '';
-  $('t_out').textContent = big(t.generated_tokens); $('t_outnote').textContent = commas(t.generated_tokens) + ' tokens in ' + secs(t.generation_seconds);
-  $('t_tps').textContent = fmt(t.generated_tokens_per_second); $('t_tps2').textContent = 'peak ' + fmt(peak.tps);
-  $('t_ptps').textContent = fmt(t.prompt_tokens_per_second, 0); $('t_ptps2').textContent = commas(t.prompt_tokens) + ' tokens read in ' + secs(t.prompt_seconds);
-  $('ctxuse').textContent = big(st.context.n_past); $('ctxnote').textContent = 'of ' + big(st.context.n_ctx) + ' (' + (100 * st.context.n_past / Math.max(1, st.context.n_ctx)).toFixed(0) + '%)'; $('ctx2').textContent = 'highest reached ' + big(peak.ctx);
-  $('hit').textContent = (c.hit_rate*100).toFixed(1) + '% · ' + (c.vram_served*100).toFixed(0) + '%'; $('hit2').textContent = 'best hit ' + (peak.hit*100).toFixed(1) + '% · ' + (c.bytes_from_disk/1e9).toFixed(1) + ' GB read from the drive';
-  $('spec').textContent = sp.drafted ? (sp.acceptance*100).toFixed(0) + '%' : (lastStatus && lastStatus.props && lastStatus.props.mtp ? '—' : 'off'); $('specnote').textContent = sp.drafted ? 'of drafts accepted' : ''; $('spec2').textContent = sp.pairs ? `${commas(sp.pairs)} verify steps · ${fmt(sp.tokens_per_step, 2)} tokens per step` : '';
+  $('reqs').textContent = t.requests; $('reqsnote').textContent = t.requests ? 'в среднем ' + big(Math.round(t.generated_tokens / t.requests)) + ' ток на ответ' : 'с запуска';
+  $('t_in').textContent = big(t.input_tokens); $('t_innote').textContent = commas(t.input_tokens) + ' токенов';
+  $('t_cached').textContent = big(t.cached_tokens); $('t_cachednote').textContent = t.input_tokens ? (100 * t.cached_tokens / t.input_tokens).toFixed(0) + '% входа переиспользовано' : '';
+  $('t_out').textContent = big(t.generated_tokens); $('t_outnote').textContent = commas(t.generated_tokens) + ' токенов за ' + secs(t.generation_seconds);
+  $('t_tps').textContent = fmt(t.generated_tokens_per_second); $('t_tps2').textContent = 'пик ' + fmt(peak.tps);
+  $('t_ptps').textContent = fmt(t.prompt_tokens_per_second, 0); $('t_ptps2').textContent = commas(t.prompt_tokens) + ' токенов прочитано за ' + secs(t.prompt_seconds);
+  $('ctxuse').textContent = big(st.context.n_past); $('ctxnote').textContent = 'из ' + big(st.context.n_ctx) + ' (' + (100 * st.context.n_past / Math.max(1, st.context.n_ctx)).toFixed(0) + '%)'; $('ctx2').textContent = 'максимум ' + big(peak.ctx);
+  $('hit').textContent = (c.hit_rate*100).toFixed(1) + '% · ' + (c.vram_served*100).toFixed(0) + '%'; $('hit2').textContent = 'лучшее ' + (peak.hit*100).toFixed(1) + '% · ' + (c.bytes_from_disk/1e9).toFixed(1) + ' ГБ прочитано с диска';
+  $('spec').textContent = sp.drafted ? (sp.acceptance*100).toFixed(0) + '%' : (lastStatus && lastStatus.props && lastStatus.props.mtp ? '—' : 'выкл'); $('specnote').textContent = sp.drafted ? 'черновиков принято' : ''; $('spec2').textContent = sp.pairs ? `${commas(sp.pairs)} шагов проверки · ${fmt(sp.tokens_per_step, 2)} ток за шаг` : '';
   $('thr').textContent = st.threads || '—';
-  hist.push({ tps: nowTps, ptps: nowP }); if (hist.length > 300) hist.shift(); drawChart(); $('chartnote').textContent = 'grey line: peak ' + fmt(peak.tps) + ' tok/s';
+  hist.push({ tps: nowTps, ptps: nowP }); if (hist.length > 300) hist.shift(); drawChart(); $('chartnote').textContent = 'тёмная линия — пик ' + fmt(peak.tps) + ' ток/с';
   if (chatting && chatWaiting) chatWaiting(st);
 }
 async function pollLive() {
-  let s; try { s = await api('/api/live'); } catch (e) { $('state').textContent = 'console unreachable'; return; }
+  let s; try { s = await api('/api/live'); } catch (e) { $('state').textContent = 'консоль недоступна'; return; }
   renderLive(s);
   if (s.tune && s.tune.running && !tuneTimer) pollTune();
   if (s.selftest_running && !stTimer) pollSelftest();
 }
 async function poll() {
-  let s; try { s = await api('/api/status'); } catch (e) { $('state').textContent = 'console unreachable'; return; }
+  let s; try { s = await api('/api/status'); } catch (e) { $('state').textContent = 'консоль недоступна'; return; }
   lastStatus = s;
-  $('modelid').textContent = s.model_id ? '(model: ' + s.model_id + ', OpenAI-compatible)' : ''; $('ep3').textContent = s.model_id || 'any'; $('ep5').textContent = s.model_id || 'qwen3.8-flash-next';
+  $('modelid').textContent = s.model_id ? '(модель: ' + s.model_id + ', OpenAI-совместимо)' : ''; $('ep3').textContent = s.model_id || 'any'; $('ep5').textContent = s.model_id || 'qwen3.8-flash-next';
   setLocked(s);
   // While a server runs, the cards and the settings show what is being served.
   const running = s.state === 'loading' || s.state === 'ready' || s.state === 'busy';
@@ -662,7 +691,7 @@ async function poll() {
 let chatHistory = [], chatting = false, aborter = null, chatWaiting = null;
 function addMsg(role, text) {
   const d = document.createElement('div'); d.className = 'msg ' + role;
-  d.innerHTML = `<div class="who">${role}</div>${role === 'assistant' ? '<details hidden><summary>thinking</summary><div class="think"></div></details>' : ''}<div class="text"></div><div class="meta"></div>`;
+  d.innerHTML = `<div class="who">${({user:'вы', assistant:'модель'})[role] || role}</div>${role === 'assistant' ? '<details hidden><summary>размышления</summary><div class="think"></div></details>' : ''}<div class="text"></div><div class="meta"></div>`;
   d.querySelector('.text').textContent = text || ''; $('msgs').appendChild(d); $('msgs').scrollTop = $('msgs').scrollHeight; return d;
 }
 async function send() {
@@ -677,8 +706,8 @@ async function send() {
   if ($('c_budget').value !== '') body.reasoning_budget = +$('c_budget').value;
   chatting = true; $('send').disabled = true; $('abort').disabled = false; aborter = new AbortController();
   let reasoning = '', content = '', timings = null, t0 = performance.now(), tFirst = 0;
-  meta.textContent = 'sending…';
-  chatWaiting = st => { if (tFirst) return; const p = st.prompt; if (st.busy && p.prefilling) meta.textContent = `reading the prompt: ${commas(p.done)} / ${commas(p.n)} new tokens · ${fmt(p.tokens_per_second, 0)} tok/s · ${secs(p.ms/1000)}${p.cached ? ' · ' + commas(p.cached) + ' reused' : ''}`; else if (st.busy) meta.textContent = 'thinking about the first token…'; };
+  meta.textContent = 'отправка…';
+  chatWaiting = st => { if (tFirst) return; const p = st.prompt; if (st.busy && p.prefilling) meta.textContent = `читается промпт: ${commas(p.done)} / ${commas(p.n)} новых токенов · ${fmt(p.tokens_per_second, 0)} ток/с · ${secs(p.ms/1000)}${p.cached ? ' · ' + commas(p.cached) + ' из кэша' : ''}`; else if (st.busy) meta.textContent = 'готовится первый токен…'; };
   try {
     const r = await fetch(endpoint + '/chat/completions', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body), signal: aborter.signal });
     if (!r.ok) { textEl.textContent = 'HTTP ' + r.status + ': ' + (await r.text()).slice(0, 400); textEl.classList.add('err'); throw new Error('http'); }
@@ -690,13 +719,13 @@ async function send() {
         const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
         if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
         let j; try { j = JSON.parse(line.slice(6)); } catch (e) { continue; }
-        if (j.error) { textEl.textContent += '\n[error] ' + j.error.message; textEl.classList.add('err'); continue; }
+        if (j.error) { textEl.textContent += '\n[ошибка] ' + j.error.message; textEl.classList.add('err'); continue; }
         const ch = j.choices && j.choices[0]; if (!ch) continue;
         if (ch.delta && (ch.delta.reasoning_content || ch.delta.content || ch.delta.tool_calls) && !tFirst) tFirst = performance.now();
         if (ch.delta.reasoning_content) { reasoning += ch.delta.reasoning_content; det.hidden = false; det.open = !content; think.textContent = reasoning; think.scrollTop = think.scrollHeight; }
         if (ch.delta.content) { content += ch.delta.content; textEl.textContent = content; det.open = false; }
-        if (ch.delta.tool_calls) { content += '\n[tool call] ' + JSON.stringify(ch.delta.tool_calls); textEl.textContent = content; }
-        if (j.timings) { timings = j.timings; if (tFirst) meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens`; }
+        if (ch.delta.tool_calls) { content += '\n[вызов инструмента] ' + JSON.stringify(ch.delta.tool_calls); textEl.textContent = content; }
+        if (j.timings) { timings = j.timings; if (tFirst) meta.textContent = `${fmt(timings.predicted_per_second)} ток/с · ${timings.predicted_n} ток`; }
         if (j.usage) timings = Object.assign(timings || {}, { usage: j.usage });
         $('msgs').scrollTop = $('msgs').scrollHeight;
       }
@@ -705,12 +734,12 @@ async function send() {
     if (timings) {
       const u = timings.usage || {};
       $('c_tps').textContent = fmt(timings.predicted_per_second); $('c_ptps').textContent = timings.prompt_n ? fmt(timings.prompt_per_second, 0) : '—';
-      $('c_tok').textContent = timings.predicted_n; $('c_toknote').textContent = `reply · ${commas(u.prompt_tokens || timings.prompt_input_n)} input, ${commas(u.prompt_tokens_details ? u.prompt_tokens_details.cached_tokens : timings.prompt_cached_n)} cached`; $('c_time').textContent = fmt(timings.predicted_ms/1000, 1);
-      meta.textContent = `${fmt(timings.predicted_per_second)} tok/s · ${timings.predicted_n} tokens · prompt ${commas(u.prompt_tokens || timings.prompt_input_n)} (${commas(timings.prompt_cached_n)} cached, ${commas(timings.prompt_n)} read at ${fmt(timings.prompt_per_second, 0)} tok/s) · first token after ${fmt((tFirst - t0)/1000, 1)} s`;
+      $('c_tok').textContent = timings.predicted_n; $('c_toknote').textContent = `ответ · вход ${commas(u.prompt_tokens || timings.prompt_input_n)}, из кэша ${commas(u.prompt_tokens_details ? u.prompt_tokens_details.cached_tokens : timings.prompt_cached_n)}`; $('c_time').textContent = fmt(timings.predicted_ms/1000, 1);
+      meta.textContent = `${fmt(timings.predicted_per_second)} ток/с · ${timings.predicted_n} ток · промпт ${commas(u.prompt_tokens || timings.prompt_input_n)} (из кэша ${commas(timings.prompt_cached_n)}, прочитано ${commas(timings.prompt_n)} на ${fmt(timings.prompt_per_second, 0)} ток/с) · первый токен через ${fmt((tFirst - t0)/1000, 1)} с`;
     }
   } catch (e) {
-    if (e.name === 'AbortError') { meta.textContent = 'stopped'; chatHistory.push({ role: 'assistant', content: content || '' }); }
-    else if (e.message !== 'http') { textEl.textContent = 'request failed: ' + e; textEl.classList.add('err'); }
+    if (e.name === 'AbortError') { meta.textContent = 'остановлено'; chatHistory.push({ role: 'assistant', content: content || '' }); }
+    else if (e.message !== 'http') { textEl.textContent = 'запрос не удался: ' + e; textEl.classList.add('err'); }
   }
   chatting = false; chatWaiting = null; $('abort').disabled = true; $('send').disabled = false; poll();
 }
