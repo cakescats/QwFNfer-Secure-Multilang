@@ -124,6 +124,7 @@ for so in $RUNTIME_SOS; do cp -L "$RUNTIME_LIBS/$so" "$OUT/bin/"; done
 cp tools/qwfn_console.py tools/qwfn_auth.py tools/qwfn_i18n.py tools/qwfn_router.py "$OUT/tools/"
 cp tools/console/index.html tools/console/login.html tools/console/console.css "$OUT/tools/console/"
 mkdir -p "$OUT/tools/console/i18n"; cp tools/console/i18n/*.json "$OUT/tools/console/i18n/"
+mkdir -p "$OUT/tools/console/img"; cp tools/console/img/*.png "$OUT/tools/console/img/"
 cp scripts/qwfnfer "$OUT/qwfnfer"; chmod +x "$OUT/qwfnfer" "$OUT/bin/qwfn-server" "$OUT/bin/qwfn-tok"
 mkdir -p "$OUT/scripts"; cp scripts/claude-desktop.sh scripts/gen-cert.sh "$OUT/scripts/"; chmod +x "$OUT/scripts/claude-desktop.sh" "$OUT/scripts/gen-cert.sh"
 cp README.md LICENSE "$OUT/"; echo "$VERSION" > "$OUT/VERSION"

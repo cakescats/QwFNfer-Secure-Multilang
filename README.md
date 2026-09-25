@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/img/cakescats-logo.svg" width="96" height="96" alt="cakescats">
+  <img src="docs/img/cakescats-logo.png" width="112" height="112" alt="cakescats">
   <h1>qwfnfer · cakescats</h1>
   <p><b>Qwen3.8-Flash-Next (MoE 125B, 111 ГБ) на одной видеокарте 16 ГБ, 30 ГБ RAM и NVMe.</b><br>
   Сборка движка <a href="https://github.com/Apolog1ze-Dev/QwFNfer">QwFNfer</a> от cakescats: исправления движка, замеры, консоль с входом по паролю, API-ключом и переключением языков (RU / EN).</p>

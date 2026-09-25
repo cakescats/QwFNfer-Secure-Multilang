@@ -18,7 +18,7 @@
 
 ### Изменено
 
-- **Тема** по [phone.cakescats.com](https://phone.cakescats.com/ru/): ночной синий `#070c2b`, орхидея `#cd89e8`, неоновый циан `#57f3fe`, Mulish; пиксельные заголовки Pixelify Sans (с кириллицей); пиксельный логотип по фирменному коту — белая морда, рыжие полосатые уши, бирюзовые глаза, чип на лбу.
+- **Тема** по [phone.cakescats.com](https://phone.cakescats.com/ru/): ночной синий `#070c2b`, орхидея `#cd89e8`, неоновый циан `#57f3fe`, Mulish; пиксельные заголовки Pixelify Sans (с кириллицей); логотип и favicon — фирменный кот cakescats с сайта (32, 180 и 192 px, `tools/console/img/`).
 - `qwfn_console.py` вернулся к английскому исходнику upstream — перевод теперь в каталогах, что упрощает слияние с upstream.
 - `scripts/package.sh` кладёт в бандл новые файлы консоли и `gen-cert.sh`.
 

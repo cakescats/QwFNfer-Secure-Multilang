@@ -1228,7 +1228,7 @@ class H(http.server.BaseHTTPRequestHandler):
     # ---- the gate: every GET and POST passes here first
     def _gate(self, method, path):
         """None when the request may go on; otherwise it has been answered."""
-        if method == "GET" and (path in OPEN_GET or path.startswith("/lang/")): return None
+        if method == "GET" and (path in OPEN_GET or path.startswith(("/lang/", "/img/"))): return None
         if method == "POST" and path in OPEN_POST:
             return None if self.headers.get("X-Qwfn") == "1" else self._json({"error": "missing X-Qwfn header"}, 403)
         tok = self.headers.get("X-Qwfn-Token")
@@ -1257,6 +1257,12 @@ class H(http.server.BaseHTTPRequestHandler):
             try: body = open(os.path.join(CONSOLE_DIR, "console.css"), "rb").read()
             except Exception: body = b""
             self._send(200, body, "text/css; charset=utf-8"); return True
+        if path.startswith("/img/"):
+            # the brand images: a fixed list, never a path from the request
+            name = path[len("/img/"):]
+            if name not in ("logo-32x32.png", "logo-180x180.png", "logo-192x192.png"): return self._json({"error": "not found"}, 404) or True
+            body = open(os.path.join(CONSOLE_DIR, "img", name), "rb").read()
+            self._send(200, body, "image/png", [("Cache-Control", "max-age=86400")]); return True
         if path.startswith("/lang/"):
             code = path[len("/lang/"):]
             back = "/"

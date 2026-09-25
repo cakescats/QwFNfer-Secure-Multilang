@@ -27,7 +27,7 @@ code { font-family:var(--mono) }
 header { display:flex; align-items:center; gap:12px; padding:12px 22px; border-bottom:1px solid var(--line); flex-wrap:wrap;
          background:rgba(7,12,43,.82); backdrop-filter:blur(8px); position:sticky; top:0; z-index:10 }
 header h1 { display:flex; align-items:center; gap:10px; margin:0 12px 0 0; font:400 15px/1 var(--pixel); letter-spacing:1px; text-transform:uppercase }
-header h1 .logo svg { display:block; image-rendering:pixelated; filter:drop-shadow(0 0 8px rgba(205,137,232,.45)) }
+header h1 .logo img { display:block; border-radius:8px; filter:drop-shadow(0 0 8px rgba(205,137,232,.45)) }
 header h1 small { display:block; margin-top:5px; font:400 9.5px/1 var(--pixel); color:var(--cyan); letter-spacing:1.5px }
 .pill { display:inline-flex; align-items:center; gap:8px; padding:5px 11px; border:1px solid var(--line2); border-radius:999px; background:var(--panel); color:var(--dim); font-size:12.5px }
 .pill:empty { display:none }
@@ -147,7 +147,7 @@ footer a { color:var(--acc); text-decoration:none }
 .auth { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px 16px }
 .auth .card { width:100%; max-width:400px; background:linear-gradient(180deg, var(--panel), var(--bg2)); border:1px solid var(--line2); border-radius:20px; padding:28px 26px; box-shadow:0 20px 60px rgba(0,0,0,.45), var(--glow-acc) }
 .auth .brand { display:flex; flex-direction:column; align-items:center; gap:10px; margin-bottom:18px; text-align:center }
-.auth .brand svg { image-rendering:pixelated; filter:drop-shadow(0 0 12px rgba(205,137,232,.5)) }
+.auth .brand img { filter:drop-shadow(0 0 14px rgba(205,137,232,.5)) }
 .auth h1 { margin:0; font:400 16px/1.2 var(--pixel); letter-spacing:1px; text-transform:uppercase }
 .auth p { color:var(--dim); font-size:13px; margin:0 0 14px; text-align:center }
 .auth form { grid-template-columns:1fr; gap:12px }
