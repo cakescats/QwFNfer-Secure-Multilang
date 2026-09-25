@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -882,6 +883,8 @@ int main(int argc, char ** argv) {
           "\n"
           "      --host HOST     bind address (default 127.0.0.1)\n"
           "      --port N        port (default 8080)\n"
+          "      --api-key KEY   require this key on every request but /health (Authorization: Bearer KEY or x-api-key: KEY);\n"
+          "                      also --api-key-file PATH, or the QWFN_API_KEY environment variable. Off by default.\n"
           "      --mmproj PATH   vision projector gguf; enables image input. It runs on the CPU (weights in RAM, no VRAM\n"
           "                      at all): a 1400x1000 screenshot encodes in ~15 s, a 320x240 image in 0.3 s\n"
           "      --vision-threads N  threads for the image encode (default: --threads, the physical cores)\n"
@@ -908,6 +911,7 @@ int main(int argc, char ** argv) {
     }
 
     std::string host = "127.0.0.1", mmproj_path, alias, def_effort = "xhigh";
+    std::string api_key = getenv("QWFN_API_KEY") ? getenv("QWFN_API_KEY") : "";
     int vision_threads = 0;
     int def_reasoning_budget = 0;
     int port = 8080;
@@ -923,6 +927,14 @@ int main(int argc, char ** argv) {
         auto next = [&]() { return argv[++i]; };
         if (a == "--host"   && i + 1 < argc) { host = next(); continue; }
         if (a == "--port"   && i + 1 < argc) { port = atoi(next()); continue; }
+        if (a == "--api-key" && i + 1 < argc) { api_key = next(); continue; }
+        if (a == "--api-key-file" && i + 1 < argc) {
+            // A file keeps the key out of the process list (ps shows argv to every user).
+            std::ifstream f(next()); std::getline(f, api_key);
+            while (!api_key.empty() && (api_key.back() == '\r' || api_key.back() == ' ')) api_key.pop_back();
+            if (api_key.empty()) { fprintf(stderr, "--api-key-file: empty or unreadable\n"); return 1; }
+            continue;
+        }
         if (a == "--mmproj" && i + 1 < argc) { mmproj_path = next(); continue; }
         if (a == "--vision-threads" && i + 1 < argc) { vision_threads = atoi(next()); continue; }
         if (a == "--alias"  && i + 1 < argc) { alias = next(); continue; }
@@ -1487,9 +1499,27 @@ int main(int argc, char ** argv) {
     signal(SIGUSR2, on_stall_probe);
     // A local web page (the console, a harness) may read /stats and /props
     // from another origin: allow it.
-    svr.set_default_headers({{"Access-Control-Allow-Origin", "*"}, {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
+    svr.set_default_headers({{"Access-Control-Allow-Origin", "*"}, {"Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version"},
                              {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"}});
     svr.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) { res.status = 204; });
+    // API key: checked before routing, so every endpoint but /health and the CORS
+    // preflight is covered, including ones added later. OpenAI clients send it as
+    // "Authorization: Bearer KEY", Anthropic ones (Claude Code) as "x-api-key: KEY".
+    if (!api_key.empty()) {
+        svr.set_pre_routing_handler([api_key](const httplib::Request & req, httplib::Response & res) {
+            if (req.method == "OPTIONS" || req.path == "/health") return httplib::Server::HandlerResponse::Unhandled;
+            std::string got = req.get_header_value("x-api-key");
+            const std::string auth = req.get_header_value("Authorization");
+            if (got.empty() && auth.size() > 7 && (auth[0] | 0x20) == 'b' && auth.compare(1, 6, "earer ") == 0) got = auth.substr(7);
+            // Constant-time compare: the length is not secret, the bytes are.
+            unsigned char diff = got.size() == api_key.size() ? 0 : 1;
+            for (size_t i = 0; i < got.size() && i < api_key.size(); i++) diff |= (unsigned char) (got[i] ^ api_key[i]);
+            if (diff == 0) return httplib::Server::HandlerResponse::Unhandled;
+            res.status = 401;
+            res.set_content(R"({"error":{"message":"invalid or missing API key","type":"authentication_error"}})", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        });
+    }
     svr.set_write_timeout(3600, 0);
     // Stall watchdog: a generation that produces no token for 30 s is logged
     // with what the expert cache is waiting on, every 30 s until it moves.
