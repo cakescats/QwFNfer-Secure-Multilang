@@ -358,11 +358,12 @@ bool engine::init(const model_index * hot, const model_index * cold,
             p_vslot_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_I32, hp_.n_expert);
             p_vmask_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, hp_.n_expert);
             p_pc_    = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, 2 * n_embd);
+            if (t_pack_) p_pack_ = ggml_new_tensor_1d(pctx_, GGML_TYPE_F32, pack_n_);
             pbuf_    = ggml_backend_alloc_ctx_tensors_from_buft(pctx_, hb);
             if (!pbuf_ || ggml_backend_buffer_get_type(pbuf_) != hb) {
                 if (pbuf_) ggml_backend_buffer_free(pbuf_);
                 ggml_free(pctx_); pbuf_ = nullptr; pctx_ = nullptr; p_gids_ = nullptr; p_gw_ = nullptr;
-                p_vslot_ = nullptr; p_vmask_ = nullptr; p_pc_ = nullptr;
+                p_vslot_ = nullptr; p_vmask_ = nullptr; p_pc_ = nullptr; p_pack_ = nullptr;
             }
         }
     }
@@ -703,6 +704,7 @@ void engine::set_embeddings(int32_t pos, const float * emb, int32_t n) {
 
 void engine::reset() {
     mtp_have_h_ = false; mtp_kv_valid_ = true; mtp_draft_ = -1; rb_valid_ = false;
+    failed_ = false; poisoned_ = false; fail_msg_.clear();   // the state a failure poisoned is gone now
     st_.reset(); n_past_ = 0;
     pool_dirty_ = true;
     if (qbuf_) {
@@ -774,11 +776,9 @@ void engine::qsa_decode_prepare(int32_t n_past) {
                 ggml_tensor * t_bp = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4 * n_whole); ggml_set_input(t_bp);
                 qd_.pool_cache = pool_cache_[il];
                 gb.qsa_pool_rebuild((int) il, qd_, n_whole, t_bp);
-                if (!ggml_gallocr_alloc_graph(galloc_gpu_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
+                if (!alloc_graph(galloc_gpu_, g, "pooled-key rebuild allocation", il)) { ggml_free(c); return; }
                 ggml_backend_tensor_set(t_bp, bpa.data(), 0, bpa.size() * 4);
-                if (ggml_backend_graph_compute(w_.backend(), g) != GGML_STATUS_SUCCESS) {
-                    fprintf(stderr, "[qwfn] compute failed\n"); abort();
-                }
+                if (!compute_graph(w_.backend(), g, "pooled-key rebuild", il)) { ggml_free(c); return; }
                 ggml_free(c);
             }
         }
@@ -795,16 +795,58 @@ std::string engine::memory_summary() const {
     return o.str();
 }
 
+// A graph that cannot be allocated or computed used to abort() the process.
+// Every one of those eighteen call sites was reachable from an HTTP request, so
+// one prompt that asked for more device memory than was left took the whole
+// server down mid-session. They now record the failure and unwind.
+//
+// The sequence state cannot unwind with them: the recurrent layers have already
+// written part of this token, and a scan -- unlike a KV cache -- cannot be
+// rewound. The engine therefore marks itself unusable until reset().
+void engine::note_failure(const char * what, uint32_t layer) {
+    poisoned_ = true;
+    if (failed_) return;              // keep the first one; the rest are fallout
+    failed_ = true;
+    fail_msg_ = std::string(what) + " failed";
+    if (layer != UINT32_MAX) fail_msg_ += " at layer " + std::to_string(layer);
+    fail_msg_ += " (" + std::to_string(n_past_) + " tokens of context); the engine "
+                 "state was discarded -- lower the batch or the context, or raise the VRAM reserve";
+    fprintf(stderr, "[qwfn] %s\n", fail_msg_.c_str());
+}
+
+bool engine::take_failure(std::string & err) {
+    if (!failed_) return false;
+    err = fail_msg_;
+    failed_ = false;                  // the poison stays until reset()
+    fail_msg_.clear();
+    return true;
+}
+
+bool engine::alloc_graph(ggml_gallocr_t ga, ggml_cgraph * g, const char * what, uint32_t layer) {
+    if (failed_) return false;        // already unwinding
+    if (ggml_gallocr_alloc_graph(ga, g)) return true;
+    note_failure(what ? what : "graph allocation", layer);
+    return false;
+}
+
+bool engine::compute_graph(ggml_backend_t be, ggml_cgraph * g, const char * what, uint32_t layer) {
+    if (failed_) return false;
+    if (ggml_backend_graph_compute(be, g) == GGML_STATUS_SUCCESS) return true;
+    note_failure(what ? what : "graph compute", layer);
+    return false;
+}
+
 void engine::run_on(ggml_cgraph * gf, bool gpu) {
     ggml_gallocr_t ga = gpu ? galloc_gpu_ : galloc_cpu_;
     ggml_backend_t be = gpu ? w_.backend() : wh_.backend();
-    if (!ggml_gallocr_alloc_graph(ga, gf)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
-    if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[qwfn] compute failed\n"); abort();
-    }
+    if (!alloc_graph(ga, gf, "graph allocation", UINT32_MAX)) return;
+    compute_graph(be, gf, "graph compute", UINT32_MAX);
 }
 
 const float * engine::eval(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err) {
+    // An earlier failure left the recurrent state part-written. It cannot be
+    // rewound, so nothing may run on it until the caller resets.
+    if (poisoned_) { err = "engine state discarded by an earlier failure; reset before evaluating again"; return nullptr; }
     if (n_new <= 0 || n_new > (int32_t) cfg_.n_batch) {
         err = "n_new out of range (1.." + std::to_string(cfg_.n_batch) + ")"; return nullptr;
     }
@@ -1521,10 +1563,18 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
         ggml_set_output(logits);
         ggml_build_forward_expand(g, logits);
         run_on(g, true);
+        // Before the read: a recorded failure short-circuits alloc_graph(), so
+        // this graph may never have been allocated and `logits` would have no
+        // data pointer. (The earlier run_on()s in this function all publish
+        // through persistent tensors, which always have one.)
+        if (failed()) { take_failure(err); ggml_free(c); return false; }
         ggml_backend_tensor_get(logits, logits_.data(), 0, (size_t) n_vocab_ * sizeof(float));   // one position: logits_ holds two for a decoded pair
         ggml_free(c);
     }
     ec_.settle_promotions();
+    // run_on() no longer aborts, so a graph that failed anywhere in this batch
+    // is reported here rather than being carried into n_past_.
+    if (failed()) { take_failure(err); return false; }
     if (mtp_on_) { mtp_have_h_ = true; mtp_h_rows_ = 1; }
     n_past_ += T;
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1686,7 +1736,15 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     ggml_backend_buffer_t ibuf = use_qd ? nullptr : ggml_backend_alloc_ctx_tensors_from_buft(ictx, w_.buft());
     if (!use_qd && !ibuf) { ggml_free(ictx); err = "failed to allocate per-call inputs"; return false; }
 
-    if (use_qd) qsa_decode_prepare((int32_t) n_past);
+    if (use_qd) {
+        qsa_decode_prepare((int32_t) n_past);
+        if (failed()) {
+            take_failure(err);
+            if (ibuf) ggml_backend_buffer_free(ibuf);
+            if (ictx) ggml_free(ictx);
+            return false;
+        }
+    }
 
     if (use_qd && decode) for (int64_t k = 1; k < T; k++) qsa_decode_prepare_k((int) k, (int32_t) (n_past + k));
     if (!use_qd) {
@@ -1816,6 +1874,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // packing graphs and read the routing from tensors they never write:
         // stale expert ids in every layer, fast garbage, surviving reset.)
         bool ran_packed = false;
+        // A replayed graph A is launched here and waited for at the routing
+        // readback below; these carry the timing across that gap.
+        bool gA_async = false;
+        std::chrono::steady_clock::time_point gA_t0{};
         if (replayable && gA_[il].gf) {
             ran_packed = gA_pack_[il] != 0;
             const auto ta0 = std::chrono::steady_clock::now();
@@ -1834,16 +1896,17 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 err = "replay compute failed"; return false;
             }
             const auto ta2 = std::chrono::steady_clock::now();
-            ggml_backend_synchronize(w_.backend());
-            const auto ta3 = std::chrono::steady_clock::now();
+            // No synchronize here. The only thing that needs graph A to have
+            // finished is the routing readback a few lines below, and that
+            // readback is itself queued on this backend's stream -- so it
+            // already orders after the graph. Waiting first made it two round
+            // trips per layer, 96 per decoded token, for one dependency.
+            // t_replay_wait and t_layerA are closed out after the readback.
+            gA_async = true;
+            gA_t0    = ta0;
             t_replay_alloc  += std::chrono::duration<double>(ta1 - ta0).count();
             t_replay_launch += std::chrono::duration<double>(ta2 - ta1).count();
-            t_replay_wait   += std::chrono::duration<double>(ta3 - ta2).count();
             n_replay++;
-            const double dtA = std::chrono::duration<double>(ta3 - ta0).count();
-            t_layerA += dtA;
-            if (hp_.is_attn_layer(il)) { t_layerA_attn += dtA; n_layerA_attn++; }
-            else                       { t_layerA_rec  += dtA; n_layerA_rec++;  }
             cur_res = 1 - cur_res;
             pending = true;
         } else {
@@ -2062,11 +2125,17 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                           " tokens of context (layer " + std::to_string(il) + "); lower the batch or raise the reserve";
                     fprintf(stderr, "[qwfn] %s\n", err.c_str());
                     ggml_free(c);
+                    if (ibuf) ggml_backend_buffer_free(ibuf);
+                    if (ictx) ggml_free(ictx);
                     return false;
                 }
                 const auto tc = std::chrono::steady_clock::now();
-                if (ggml_backend_graph_compute(w_.backend(), g) != GGML_STATUS_SUCCESS) {
-                    fprintf(stderr, "[qwfn] compute failed\n"); abort();
+                if (!compute_graph(w_.backend(), g, "layer graph", il)) {
+                    ggml_free(c);
+                    if (ibuf) ggml_backend_buffer_free(ibuf);
+                    if (ictx) ggml_free(ictx);
+                    take_failure(err);
+                    return false;
                 }
                 const auto td = std::chrono::steady_clock::now();
                 if (decode && hp_.is_attn_layer(il)) {
@@ -2087,17 +2156,40 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         }
 
         const bool packed = decode && ran_packed;
+        const auto t_rb0 = std::chrono::steady_clock::now();
         if (packed) {
             const size_t pn = (size_t) T * (n_embd + 2 * U + 2 * QWFN_SPEC_MAX);
-            ggml_backend_tensor_get(t_pack_, pack_host_.data(), 0, pn * sizeof(float));
-            const float * pk = pack_host_.data();
+            const float * pk;
+            if (p_pack_) {
+                // Queued on the backend's stream, so it both orders after graph A
+                // and lands in pinned memory: one wait, one DMA, where this used
+                // to be a synchronize followed by a pageable copy the driver
+                // stages through a bounce buffer of its own.
+                ggml_backend_tensor_get_async(w_.backend(), t_pack_, p_pack_->data, 0, pn * sizeof(float));
+                ggml_backend_synchronize(w_.backend());
+                pk = (const float *) p_pack_->data;
+            } else {
+                if (gA_async) ggml_backend_synchronize(w_.backend());
+                ggml_backend_tensor_get(t_pack_, pack_host_.data(), 0, pn * sizeof(float));
+                pk = pack_host_.data();
+            }
             ggml_backend_tensor_set(h_cur_, pk, 0, (size_t) T * n_embd * sizeof(float));   // host tensor: a memcpy
             const float * pw = pk + T * n_embd, * ps = pw + U * T, * pp = ps + U * T, * pc = pp + QWFN_SPEC_MAX * T;
             for (int64_t k = 0; k < U * T; k++) { wgt_[k] = pw[k]; sel_[k] = (int32_t) lrintf(ps[k]); }
             for (int64_t k = 0; k < (int64_t) QWFN_SPEC_MAX * T; k++) { pred_next_[k] = (int32_t) lrintf(pp[k]); scores_next_[k] = pc[k]; }
         } else {
+            if (gA_async) ggml_backend_synchronize(w_.backend());
             ggml_backend_tensor_get(t_sel_, sel_.data(), 0, (size_t) U * T * sizeof(int32_t));
             ggml_backend_tensor_get(t_w_,   wgt_.data(), 0, (size_t) U * T * sizeof(float));
+        }
+        if (gA_async) {
+            // The replay's wait, where it actually happens now.
+            const auto t_rb1 = std::chrono::steady_clock::now();
+            t_replay_wait += std::chrono::duration<double>(t_rb1 - t_rb0).count();
+            const double dtA = std::chrono::duration<double>(t_rb1 - gA_t0).count();
+            t_layerA += dtA;
+            if (hp_.is_attn_layer(il)) { t_layerA_attn += dtA; n_layerA_attn++; }
+            else                       { t_layerA_rec  += dtA; n_layerA_rec++;  }
         }
         if (t_xdec_ && decode && T == 1) {   // this token's true routing of layer il; the record is complete at the last layer
             memcpy(tok_sel_.data() + (size_t) il * U, sel_.data(), (size_t) U * sizeof(int32_t));
@@ -2246,15 +2338,13 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     ggml_tensor * w   = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, n, T); ggml_set_input(w);
                     ggml_tensor * acc = moe_id_graph(c, tv, ids, w, in, n_embd, hp_.n_ff_exp, n, T);
                     ggml_build_forward_expand(g, ggml_cpy(c, acc, v2(c, out)));
-                    if (!ggml_gallocr_alloc_graph(galloc_cpu_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
+                    if (!alloc_graph(galloc_cpu_, g, "RAM-tier MoE allocation", il)) { ggml_free(c); return; }
                     std::vector<int32_t> sid((size_t) n * T); std::vector<float> sw((size_t) n * T);
                     for (int64_t j = 0; j < T; j++)
                         for (int k = 0; k < n; k++) { sid[j * n + k] = eh[which[k]].slot; sw[j * n + k] = w_tok(which[k], j); }
                     ggml_backend_tensor_set(ids, sid.data(), 0, sid.size() * sizeof(int32_t));
                     ggml_backend_tensor_set(w,   sw.data(),  0, sw.size() * sizeof(float));
-                    if (ggml_backend_graph_compute(wh_.backend(), g) != GGML_STATUS_SUCCESS) {
-                        fprintf(stderr, "[qwfn] compute failed\n"); abort();
-                    }
+                    if (!compute_graph(wh_.backend(), g, "RAM-tier MoE", il)) { ggml_free(c); return; }
                     ggml_free(c);
                     if (check_moe) {
                         // Diagnostic: the per-expert graph on the same inputs must
@@ -2297,7 +2387,15 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     // yet: their slots go up for the next graph's late fold,
                     // through pinned staging on the compute stream -- after the
                     // promotion copies, before the graph that reads them.
-                    if ((int) late_gpu.size() > n_late_) { fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), n_late_); abort(); }
+                    if ((int) late_gpu.size() > n_late_) {
+                        // More experts were promoted by this fetch than the next
+                        // graph's fold has slots for. Computing only the first
+                        // n_late_ would drop the rest from the sum silently, so
+                        // fail the request instead.
+                        fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), n_late_);
+                        note_failure("late expert fold overflow", il);
+                        return;
+                    }
                     std::vector<int32_t> gids((size_t) U * T, 0); std::vector<float> gw((size_t) U * T, 0.0f);
                     for (int64_t j = 0; j < T; j++)
                         for (size_t k = 0; k < late_gpu.size(); k++) { gids[j * U + k] = eh[late_gpu[k]].slot; gw[j * U + k] = w_tok(late_gpu[k], j); }
@@ -2325,9 +2423,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     for (int e : which) { gids[e] = eh[e].slot; gw[e] = wgt_[e]; }
                     ggml_backend_tensor_set(t_gids_, gids.data(), 0, (size_t) U * sizeof(int32_t));
                     ggml_backend_tensor_set(t_gw_,   gw.data(),   0, (size_t) U * sizeof(float));
-                    if (!ggml_gallocr_alloc_graph(gM_[il].ga, gM_[il].gf)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
+                    if (!alloc_graph(gM_[il].ga, gM_[il].gf, "VRAM-tier MoE allocation", il)) return;
                     if (ggml_backend_graph_compute_async(w_.backend(), gM_[il].gf) != GGML_STATUS_SUCCESS) {
-                        fprintf(stderr, "[qwfn] compute failed\n"); abort();
+                        note_failure("VRAM-tier MoE", il); return;
                     }
                     if (check_moe) {
                         ggml_backend_synchronize(w_.backend());
@@ -2346,9 +2444,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 } else {
                     ggml_cgraph * g;
                     ggml_context * c = moe_graph(which, t_cur_, t_pg_, &g);
-                    if (!ggml_gallocr_alloc_graph(galloc_moe_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
+                    if (!alloc_graph(galloc_moe_, g, "GPU MoE allocation", il)) { ggml_free(c); return; }
                     if (ggml_backend_graph_compute_async(w_.backend(), g) != GGML_STATUS_SUCCESS) {
-                        fprintf(stderr, "[qwfn] compute failed\n"); abort();
+                        note_failure("GPU MoE", il); ggml_free(c); return;
                     }
                     moe_ctx_ = c;
                 }
@@ -2491,13 +2589,13 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     ggml_build_forward_expand(g, ggml_cpy(c,
                             ggml_view_2d(c, wd,    n_embd, T, wd->nb[2],    (size_t) k * wd->nb[1]),
                             ggml_view_2d(c, h_wd_, n_embd, T, h_wd_->nb[2], (size_t) pos_in_all[which[k]] * h_wd_->nb[1])));
-                if (!ggml_gallocr_alloc_graph(galloc_cpu_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
+                if (!alloc_graph(galloc_cpu_, g, "CPU MoE row pass allocation", il)) { ggml_free(c); return; }
                 std::vector<int32_t> sid((size_t) n * T); std::vector<float> sw((size_t) n * T);
                 for (int64_t j = 0; j < T; j++)
                     for (int k = 0; k < n; k++) { sid[j * n + k] = eh[which[k]].slot; sw[j * n + k] = w_tok(which[k], j); }
                 ggml_backend_tensor_set(ids, sid.data(), 0, sid.size() * sizeof(int32_t));
                 ggml_backend_tensor_set(w,   sw.data(),  0, sw.size() * sizeof(float));
-                if (ggml_backend_graph_compute(wh_.backend(), g) != GGML_STATUS_SUCCESS) { fprintf(stderr, "[qwfn] compute failed\n"); abort(); }
+                if (!compute_graph(wh_.backend(), g, "CPU MoE row pass", il)) { ggml_free(c); return; }
                 ggml_free(c);
                 t_moe_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
                 n_exp_cpu += which.size();
@@ -2519,8 +2617,8 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 for (int k = 1; k < n; k++)
                     a = ggml_add(c, a, ggml_view_2d(c, h_wd_, n_embd, T, h_wd_->nb[2], (size_t) k * h_wd_->nb[1]));
                 ggml_build_forward_expand(g, ggml_cpy(c, a, v2(c, h_partial_)));
-                if (!ggml_gallocr_alloc_graph(galloc_cpu_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
-                if (ggml_backend_graph_compute(wh_.backend(), g) != GGML_STATUS_SUCCESS) { fprintf(stderr, "[qwfn] compute failed\n"); abort(); }
+                if (!alloc_graph(galloc_cpu_, g, "CPU MoE reduction allocation", il)) { ggml_free(c); return; }
+                if (!compute_graph(wh_.backend(), g, "CPU MoE reduction", il)) { ggml_free(c); return; }
                 ggml_free(c);
                 ggml_backend_tensor_get(h_partial_, acc.data(), 0, nfl * sizeof(float));
                 t_moe_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
@@ -2717,11 +2815,19 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     acc = ggml_add(c, acc, moe_id_graph(c, sv, sid, sw, t_cur_, n_embd, hp_.n_ff_exp, ts.width, T));
                 }
                 ggml_build_forward_expand(g, ggml_cpy(c, acc, v2(c, t_pg_)));
-                if (!ggml_gallocr_alloc_graph(galloc_gpu_, g)) { fprintf(stderr, "[qwfn] galloc failed\n"); abort(); }
+                if (!alloc_graph(galloc_gpu_, g, "cache-batched MoE allocation", il)) {
+                    ggml_free(c); take_failure(err);
+                    if (ibuf) ggml_backend_buffer_free(ibuf);
+                    if (ictx) ggml_free(ictx);
+                    return false;
+                }
                 if (tid) { ggml_backend_tensor_set(tid, tt.ids.data(), 0, tt.ids.size() * 4); ggml_backend_tensor_set(tw, tt.w.data(), 0, tt.w.size() * 4); }
                 if (sid) { ggml_backend_tensor_set(sid, ts.ids.data(), 0, ts.ids.size() * 4); ggml_backend_tensor_set(sw, ts.w.data(), 0, ts.w.size() * 4); }
-                if (ggml_backend_graph_compute(w_.backend(), g) != GGML_STATUS_SUCCESS) {
-                    fprintf(stderr, "[qwfn] compute failed\n"); abort();
+                if (!compute_graph(w_.backend(), g, "cache-batched MoE", il)) {
+                    ggml_free(c); take_failure(err);
+                    if (ibuf) ggml_backend_buffer_free(ibuf);
+                    if (ictx) ggml_free(ictx);
+                    return false;
                 }
                 ggml_free(c);
                 t_moe_gpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
@@ -2929,6 +3035,27 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 t_warm += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
             }
         }
+        // A graph that could not be allocated or computed anywhere in this
+        // layer -- including inside the void helpers above, which can only
+        // return -- stops the eval here rather than running 47 more layers on
+        // whatever those buffers happen to hold.
+        if (failed()) {
+            take_failure(err);
+            // Unwind what is still running against the buffers we are about to
+            // free: an asynchronous MoE graph, and the reads landing in the
+            // cache's slots.
+            if (moe_inflight_) {
+                ggml_backend_synchronize(w_.backend());
+                if (moe_ctx_) { ggml_free(moe_ctx_); moe_ctx_ = nullptr; }
+                moe_inflight_ = false;
+            }
+            if (ec_.has_inflight()) { ec_.fetch_end(); ec_.prefetch_settle(); }
+            deferred_wait_ = false;
+            ec_.settle_promotions();
+            if (ibuf) ggml_backend_buffer_free(ibuf);
+            if (ictx) ggml_free(ictx);
+            return false;
+        }
     }
     if (!decode) ec_.settle_promotions();   // warm-up promotions landed
 
@@ -2956,6 +3083,13 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         ggml_set_output(logits);
         ggml_build_forward_expand(g, logits);
         run_on(g, true);
+        if (failed()) {
+            take_failure(err);
+            ggml_free(c);
+            if (ibuf) ggml_backend_buffer_free(ibuf);
+            if (ictx) ggml_free(ictx);
+            return false;
+        }
         ggml_backend_tensor_get(logits, logits_.data(), 0, (size_t) n_vocab_ * n_out * sizeof(float));
         ggml_free(c);
     }
@@ -3102,6 +3236,17 @@ bool engine::mtp_draft(int64_t pos, int64_t n, int64_t h_row, ggml_tensor * e_sr
         run_on(g, true);
         t_mtp_post += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq2).count();
     }
+    if (failed()) {
+        // The draft head's own graphs; see run_on(). This has to be caught
+        // before `am` is read below: once a failure is recorded, alloc_graph()
+        // short-circuits, so the graphs after it were never allocated and their
+        // output tensors have no data pointer at all.
+        take_failure(err);
+        if (mbuf) ggml_backend_buffer_free(mbuf);
+        if (mctx) ggml_free(mctx);
+        ggml_free(c);
+        return false;
+    }
     // n int32s back instead of n x 248K logits and a host scan -- unless the
     // caller samples the draft itself, which needs the last position's logits.
     std::vector<int32_t> top((size_t) n);
@@ -3204,6 +3349,9 @@ void engine::qsa_decode_prepare_k(int k, int32_t n_past2) {
 }
 
 const float * engine::eval_decode(const int32_t * hist, int32_t n_hist, int32_t n_new, std::string & err) {
+    // An earlier failure left the recurrent state part-written. It cannot be
+    // rewound, so nothing may run on it until the caller resets.
+    if (poisoned_) { err = "engine state discarded by an earlier failure; reset before evaluating again"; return nullptr; }
     if (n_new < 1 || n_new > 1 + MTP_MAX_DRAFTS) { err = "eval_decode: a token and at most " + std::to_string(MTP_MAX_DRAFTS) + " drafts"; return nullptr; }
     if (n_past_ + n_new > (int32_t) cfg_.n_ctx) { err = "context exhausted"; return nullptr; }
     if (n_new >= 2 && cfg_.skip_miss) { err = "eval_decode: a verified step and --skip-miss do not combine"; return nullptr; }

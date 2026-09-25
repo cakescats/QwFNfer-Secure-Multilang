@@ -1206,7 +1206,11 @@ int main(int argc, char ** argv) {
                         const std::function<void()> & on_tick = nullptr) -> bool {
         // Prefix continuation: only valid when the new prompt strictly extends
         // what the engine already holds.
-        if (prefix_reuse(P) == 0) {
+        // needs_reset(): a previous request hit a graph failure and unwound. The
+        // engine survived (it no longer aborts the process), but its recurrent
+        // state is part-written and cannot be continued, so this request starts
+        // from a clean engine whatever the prefix says.
+        if (prefix_reuse(P) == 0 || S.eng.needs_reset()) {
             S.eng.reset();
             S.eng.clear_embeddings();
             S.consumed.clear();

@@ -288,6 +288,16 @@ public:
     int32_t n_past() const { return n_past_; }
     int64_t n_vocab() const { return n_vocab_; }
 
+    // A graph that could not be allocated or computed used to abort() the
+    // process. In a server that is a whole session killed by one request that
+    // asked for more device memory than was left. It now records the failure
+    // and unwinds, but the sequence state cannot be unwound with it: the
+    // recurrent layers have already written part of this token, and unlike a KV
+    // cache a scan cannot be rewound. So the engine marks itself unusable, and
+    // the caller must reset() before evaluating anything else. reset() clears
+    // the mark.
+    bool needs_reset() const { return poisoned_; }
+
     // The vision tower shares the language model's backend and buffer type.
     ggml_backend_t             backend() const { return w_.backend(); }
     ggml_backend_buffer_type_t buft()    const { return w_.buft(); }
@@ -373,6 +383,23 @@ private:
     void build_qsa_inputs(int64_t n_kv, int64_t T, uint32_t ratio);
     void run_on(ggml_cgraph * gf, bool gpu);
 
+    // --- graph failures, instead of abort() ---------------------------------
+    // Both of these record the first failure and return false; later calls in
+    // the same eval are no-ops, so a void helper deep inside the layer loop can
+    // simply return and the loop checks failed() at its next boundary. The
+    // failure poisons the sequence state (see needs_reset()).
+    void note_failure(const char * what, uint32_t layer);
+    bool failed() const { return failed_; }
+    // Moves the recorded message into `err` and clears the per-eval flag. The
+    // poison stays until reset().
+    bool take_failure(std::string & err);
+    bool alloc_graph(ggml_gallocr_t ga, ggml_cgraph * g, const char * what, uint32_t layer);
+    bool compute_graph(ggml_backend_t be, ggml_cgraph * g, const char * what, uint32_t layer);
+
+    bool        failed_   = false;
+    bool        poisoned_ = false;
+    std::string fail_msg_;
+
     const model_index * mi_ = nullptr;
     engine_config       cfg_;
     int                 n_threads_ = 8;
@@ -455,6 +482,11 @@ private:
     ggml_context *        pctx_ = nullptr;
     ggml_backend_buffer_t pbuf_ = nullptr;
     ggml_tensor *         p_gids_ = nullptr, * p_gw_ = nullptr;
+    // Pinned landing area for the per-layer routing readback. A
+    // device-to-host copy into a pageable std::vector is staged through a
+    // driver buffer; into pinned memory it is a DMA, and it can be queued
+    // on the backend's stream instead of blocking on its own.
+    ggml_tensor *         p_pack_ = nullptr;
     // In-graph VRAM MoE: per-layer residency tables on the device (slot and
     // mask by expert id), their pinned staging, and the version each holds.
     bool                  moe_in_graph_ = false;
