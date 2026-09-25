@@ -12,12 +12,22 @@ last request, the session's totals).
     python3 tools/qwfn_console.py --start         # and start the last served model and tier
     python3 tools/qwfn_console.py --port 8091 --server-port 8080
 
-Standard library only. Binds 127.0.0.1. One engine at a time: the console starts
-one qwfn-server and refuses to start a second while any qwfn engine is running.
-State lives in ~/.cache/qwfn-console: config.json (model locations, custom tiers,
-tune results, the last served model), server.log, selftest.json.
+    python3 tools/qwfn_console.py --host 0.0.0.0 --tls-cert cert.pem --tls-key key.pem   # the local network, over HTTPS
+
+Standard library only. Binds 127.0.0.1 unless --host says otherwise. Sign-in is
+required: the first visit creates the first account (from this machine, or anywhere
+with the setup code printed in the terminal). The model server gets an API key that
+the console generates and passes to it; see the Access tab. The page speaks every
+language in tools/console/i18n (English and Russian so far). One engine at a time:
+the console starts one qwfn-server and refuses to start a second while any qwfn
+engine is running.
+State lives in ~/.cache/qwfn-console (or $QWFN_CONSOLE_DIR): config.json (model
+locations, custom tiers, tune results, the last served model, accounts and the API
+key; mode 0600), server.log, selftest.json.
 """
-import argparse, glob, http.server, json, math, mmap, os, random, signal, socket, struct, subprocess, sys, threading, time, urllib.parse, urllib.request
+import argparse, glob, hashlib, http.client, http.cookies, http.server, ipaddress, json, math, mmap, os, random, signal, socket, ssl, struct, subprocess, sys, threading, time, urllib.parse, urllib.request
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qwfn_auth, qwfn_i18n
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _expand(p):
@@ -43,15 +53,15 @@ HF_HUBS = hf_hubs()
 HF = HF_HUBS[0]          # the one the page names; the others are scanned too when they exist
 # The engine: bin/ in the release bundle, build/ in a source checkout, or QWFN_SERVER.
 SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in (os.path.join(ROOT, "bin", "qwfn-server"), os.path.join(ROOT, "build", "qwfn-server")) if os.path.exists(p)), os.path.join(ROOT, "build", "qwfn-server"))
-LOG_DIR = os.path.join(os.path.expanduser("~/.cache"), "qwfn-console")
-os.makedirs(LOG_DIR, exist_ok=True)
+LOG_DIR = _expand(os.environ.get("QWFN_CONSOLE_DIR") or os.path.join(os.path.expanduser("~/.cache"), "qwfn-console"))
+os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
 CONFIG_FILE = os.path.join(LOG_DIR, "config.json")
 
 STATE = {"proc": None, "model": None, "settings": None, "started": 0.0, "log": os.path.join(LOG_DIR, "server.log"), "port": 8080, "ext_model": None}
 LOCK = threading.Lock()
 
 # ---- persistent config: model locations, custom tiers, tune results, the last served model
-CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0}
+CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0, "auth": {}}
 def load_config():
     try:
         c = json.load(open(CONFIG_FILE))
@@ -64,11 +74,33 @@ def headroom_gb():
     except Exception: return 3.0
 def save_config():
     try:
+        # accounts and the API key live here: owner-only from the first byte
         tmp = CONFIG_FILE + ".tmp"
-        json.dump(CONFIG, open(tmp, "w"), indent=1); os.replace(tmp, CONFIG_FILE)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f: json.dump(CONFIG, f, indent=1)
+        os.replace(tmp, CONFIG_FILE); os.chmod(CONFIG_FILE, 0o600)
     except Exception:
         pass
 load_config()
+AUTH = qwfn_auth.Auth(CONFIG, save_config)
+I18N = qwfn_i18n.Catalogs(os.path.join(ROOT, "tools", "console", "i18n"))
+KEY_FILE = os.path.join(LOG_DIR, "api_key")
+# Local scripts (scripts/claude-desktop.sh) have no browser session: they read this token,
+# new on every start and owner-only, and send it as X-Qwfn-Token from this machine.
+CLI_TOKEN_FILE = os.path.join(LOG_DIR, "console_token")
+CLI_TOKEN = __import__("secrets").token_urlsafe(32)
+def write_cli_token():
+    fd = os.open(CLI_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: f.write(CLI_TOKEN + "\n")
+
+def server_key():
+    """The key the console sends to the model server (always: an external server may require one)."""
+    return AUTH.a.get("api_key") or ""
+
+def auth_headers(extra=None):
+    h = dict(extra or {}); k = server_key()
+    if k: h["Authorization"] = "Bearer " + k
+    return h
 
 # ---- models ------------------------------------------------------------------
 QUANT_BLOCK_MB = {"Q3_K_XL": 2.27, "Q4_K_XL": 3.13, "IQ1_S": 1.62}   # routed-expert bytes per block (GGUF headers, 2026-09-10); the tiers hold blocks of this size
@@ -189,7 +221,7 @@ def scan_models(skipped=None):
     for loc in model_locations():
         if not loc["exists"]: continue
         if not loc.get("readable", True):
-            skip(loc["path"], "эта папка недоступна пользователю, от которого запущена консоль (права доступа)")
+            skip(loc["path"], "this folder cannot be read by the user running the console (permissions)")
             continue
         for f in sorted(list_gguf(loc)):
             base = os.path.basename(f)
@@ -199,21 +231,21 @@ def scan_models(skipped=None):
             d = os.path.dirname(f); stem = shard_stem(base)
             arch = gguf_arch(f)
             if arch is not None and arch != ARCH:
-                skip(f, f"GGUF архитектуры {arch}; движок работает только с {ARCH} (Qwen3.8-Flash-Next)"); continue
+                skip(f, f"a {arch} GGUF; this engine runs {ARCH} (Qwen3.8-Flash-Next)"); continue
             if arch is None and "Qwen3.8-Flash-Next" not in f:
-                skip(f, "заголовок GGUF не читается, а имя не похоже на Qwen3.8-Flash-Next" if os.path.exists(real)
-                        else "битая символическая ссылка: файла, на который она указывает, нет (повторите hf download)"); continue
+                skip(f, "the GGUF header could not be read and the name is not Qwen3.8-Flash-Next" if os.path.exists(real)
+                        else "a broken symlink: the blob it points at is missing (re-run the hf download)"); continue
             seen.add(real)
             qdir = os.path.basename(d); key = quant_of(qdir) or quant_of(base)
             if key in COLD_ONLY:
-                skip(f, f"{key} годится только как холодный ярус (хвост --cold), сам по себе не запускается. Для запуска скачайте UD-Q3_K_XL или UD-Q4_K_XL."); continue
+                skip(f, f"{key} is a cold tier only: it is served as the tail of --cold, never on its own. Download UD-Q3_K_XL or UD-Q4_K_XL to serve."); continue
             name = qdir if quant_of(qdir) else stem
             shards = [s for s in glob.glob(os.path.join(d, "*.gguf")) if os.path.basename(s).startswith(stem)]
             # A half-finished hf download leaves the snapshot pointing at blobs that are not there.
             # One missing shard used to raise here and empty the whole list; say it instead.
             gone = [s for s in shards if not os.path.exists(s)]
             if gone:
-                skip(f, "не хватает %d из %d шардов (загрузка прервалась: повторите hf download)" % (len(gone), len(shards))); continue
+                skip(f, "%d of %d shards are missing (an interrupted download: re-run the hf download)" % (len(gone), len(shards))); continue
             total = sum(os.stat(s).st_size for s in shards)
             # The first shard of a split GGUF can be tiny (this quant's holds 11 MB of metadata):
             # the drive probe reads the largest one, where the experts are.
@@ -348,9 +380,9 @@ def probe_nvme(path, seconds=2.0, nth=8, bs=2 << 20):
 # Refit 2026-09-06 to the server at 160K context with the speculative block on (tiers 1647 Q4 / 2364 Q3 blocks,
 # 12 GB RAM tier): Q4 short chat 10.4 -> 10.4, Q4 155K document 10.0 -> 10.1, Q3 short 15.8 -> 15.6, Q3 document 14.9 -> 14.9.
 CTX_STEPS = [8192, 16384, 32768, 65536, 131072, 163840, 262144]
-PRESETS = [("chat", "Чат", 32768, "короткие диалоги; самый быстрый декод"),
-           ("coding", "Агентный кодинг", 131072, "агент с вызовами инструментов; контекста хватит на целый репозиторий"),
-           ("coding_plus", "Агентный кодинг+", 262144, "весь обученный контекст модели, для самых длинных сессий")]
+PRESETS = [("chat", "Chat", 32768, "short conversations; the fastest decode"),
+           ("coding", "Agentic coding", 131072, "a coding harness with tool calls; room for a repository's worth of context"),
+           ("coding_plus", "Agentic coding+", 262144, "the model's full trained context, for the longest sessions")]
 PRESET_IDS = [p[0] for p in PRESETS] + ["custom"]
 QUANT_GPU_MS = {"Q3_K_XL": 20.0, "Q4_K_XL": 20.0, "IQ1_S": 16.0}   # graph A and the GPU-served experts, per token (fitted, see predict)
 QUANT_CPU_MS = {"Q3_K_XL": 0.105, "Q4_K_XL": 0.076, "IQ1_S": 0.080}   # per CPU-served expert, measured on the replays
@@ -514,9 +546,9 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
         return max(4, int(avail - other_for(sh_gb) - headroom))
     def ram_reason(sh_gb):
         r = ram_for(sh_gb)
-        return "%d ГБ: сейчас доступно %.1f ГБ, минус %.1f ГБ, которые серверу нужны помимо яруса (%s), минус %.1f ГБ запаса%s" % (
-            r, avail, other_for(sh_gb), "измерено автонастройкой %s" % (calib.get("date") or "")[:10] if measured else "оценка; автонастройка измерит точно", headroom,
-            "; из них 2.7 ГБ закреплённой RAM держит черновая голова" if mtp_on else "")
+        return "%d GB: %.1f GB available now, minus %.1f GB the server needs besides the tier (%s), minus %.1f GB of headroom%s" % (
+            r, avail, other_for(sh_gb), "measured by the tune on %s" % (calib.get("date") or "")[:10] if measured else "estimated; Auto-tune measures it", headroom,
+            "; the draft head holds 2.7 GB of that in pinned RAM" if mtp_on else "")
     # Threads for the CPU-served experts: the physical core count, or what the tune
     # measured. Measured 2026-09-10 on 8 cores / 16 threads at 131K: 4 -> 15.2 tok/s,
     # 6 -> 15.5, 8 -> 15.6, 12 -> 15.2, 16 -> 11.5 (SMT threads starve the reader and
@@ -545,12 +577,12 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
         for kvt, cap in (("f16", 0.02), ("q8_0", 0.10)):
             o = build(c, kvt, state_host_for(c, kvt), with_vision)
             cost = 1.0 - (o["tok_s_short"] / base["tok_s_short"] if base["tok_s_short"] else 1.0)
-            where = ("+%.1f мс/токен на сборку по PCIe и на %d ГБ меньше яруса RAM" % (state_host_ms(kvt, o["state_host"]) - state_host_ms("q4_0", base_sh), base["ram"] - o["ram"])) if "kv" in o["state_host"] \
-                    else ("%.1f ГБ яруса экспертов" % max(0.0, base["tier_gb"] - o["tier_gb"]))
+            where = ("%.1f ms/token more of PCIe gathers and %d GB less RAM tier" % (state_host_ms(kvt, o["state_host"]) - state_host_ms("q4_0", base_sh), base["ram"] - o["ram"])) if "kv" in o["state_host"] \
+                    else ("%.1f GB of expert tier" % max(0.0, base["tier_gb"] - o["tier_gb"]))
             fits = (o["tier_gb"] > 0 or base["tier_gb"] == 0) and o["ram"] >= 4
-            tried.append("%s стоил бы %s (%.0f%% декода%s)" % (kvt, where, cost * 100, "" if fits else ", и ярус экспертов не поместился бы"))
+            tried.append("%s would cost %s (%.0f%% of decode%s)" % (kvt, where, cost * 100, "" if fits else ", and the expert tier would not fit"))
             if fits and cost <= cap:
-                o["kv_reason"] = "%s: план это позволяет, %s (%.0f%% декода, в пределах порога %.0f%%)%s" % (kvt, where, cost * 100, cap * 100, "; " + "; ".join(tried[:-1]) if tried[:-1] else "")
+                o["kv_reason"] = "%s: the plan affords it, %s (%.0f%% of decode, under the %.0f%% cap)%s" % (kvt, where, cost * 100, cap * 100, "; " + "; ".join(tried[:-1]) if tried[:-1] else "")
                 return o
         base["kv_reason"] = "q4_0: " + "; ".join(tried)
         return base
@@ -558,12 +590,12 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
     tune = CONFIG["tune"].get(model["name"]) or {}
     for pid, label, ctx, blurb in PRESETS:
         o = option(ctx, vision); note = ""
-        if o["state_host"] != "none": note = "состояние внимания в RAM (%s): %.1f ГБ VRAM уходят ярусу экспертов" % (o["state_host"], o["state_host_gb"])
+        if o["state_host"] != "none": note = "attention state in RAM (%s): %.1f GB of VRAM for the expert tier" % (o["state_host"], o["state_host_gb"])
         if o["tier_gb"] == 0:
             fallback = [option(c, vision) for c in CTX_STEPS if c < ctx]
             fallback = [f for f in fallback if f["tier_gb"] > 0]
-            if fallback: o = fallback[-1]; note = "на этой GPU при %dK нет места под ярус экспертов: взят %dK" % (ctx // 1024, o["ctx"] // 1024)
-            else: note = "на этой GPU нет места под ярус экспертов в VRAM: эксперты идут из RAM и с NVMe"
+            if fallback: o = fallback[-1]; note = "no room for an expert tier at %dK on this GPU: %dK instead" % (ctx // 1024, o["ctx"] // 1024)
+            else: note = "no room for a VRAM expert tier on this GPU: experts come from RAM and the NVMe"
         t = {"id": pid, "label": label, "blurb": blurb, "ctx": ctx, "fits": o["ctx"] == ctx, "note": note, "ctx_actual": o["ctx"], "kv": o["kv"], "vision": o["vision"],
              "tier_gb": o["tier_gb"], "blocks": o["blocks"], "tok_s_short": o["tok_s_short"], "tok_s_long_doc": o["tok_s_long_doc"], "vram_served": o["vram_served"],
              "batch": o["batch"], "prefill_tps": o["prefill_tps"], "ram": o["ram"], "threads": o["threads"], "state_host": o["state_host"], "saved": True}
@@ -577,20 +609,20 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
             o = build(int(custom.get("ctx") or 131072), ck, csh, bool(custom.get("vision")) and bool(model.get("mmproj")))
             o["ram"] = int(custom.get("ram") or o["ram"]); o["threads"] = int(custom.get("threads") or o["threads"]); o["batch"] = int(custom.get("batch") or o["batch"])
             short = predict(q, o["tier_gb"], o["ram"], False, state_host_ms(ck, csh), nvme); longd = predict(q, o["tier_gb"], o["ram"], True, state_host_ms(ck, csh), nvme)
-            tiers.append({"id": "custom", "label": "Свой", "blurb": "ваши сохранённые настройки" + (" (" + custom["saved"] + ")" if custom.get("saved") else ""), "ctx": o["ctx"], "fits": True, "note": "",
+            tiers.append({"id": "custom", "label": "Custom", "blurb": "your saved settings" + (" (" + custom["saved"] + ")" if custom.get("saved") else ""), "ctx": o["ctx"], "fits": True, "note": "",
                           "ctx_actual": o["ctx"], "kv": ck, "vision": o["vision"], "tier_gb": o["tier_gb"], "blocks": o["blocks"], "tok_s_short": short["tok_s"], "tok_s_long_doc": longd["tok_s"],
                           "vram_served": short["vram_served"], "batch": o["batch"], "prefill_tps": o["prefill_tps"], "ram": o["ram"], "threads": o["threads"], "state_host": csh, "saved": True})
         except Exception:
             custom = None
     if not custom:
-        tiers.append({"id": "custom", "label": "Свой", "blurb": "ваши настройки: измените что угодно в «Расширенных» и сохраните здесь", "saved": False})
+        tiers.append({"id": "custom", "label": "Custom", "blurb": "your own settings: change anything under Advanced and save it here", "saved": False})
     if preset not in PRESET_IDS or (preset == "custom" and not custom): preset = "coding"
     p = next(t for t in tiers if t["id"] == preset)
     vision = p["vision"]; mm_gb = model.get("mmproj_gb", 0.0) if vision else 0.0
     chosen = option(p["ctx_actual"], vision) if preset != "custom" else None
     if preset == "custom":
         ck = custom.get("kv") if custom.get("kv") in KV_TYPES else "q4_0"; csh = custom.get("state_host") if custom.get("state_host") in STATE_HOST_OPTIONS else "none"
-        chosen = build(p["ctx"], ck, csh, vision); chosen["kv_reason"] = "ваш сохранённый ярус"
+        chosen = build(p["ctx"], ck, csh, vision); chosen["kv_reason"] = "your saved tier"
         chosen.update({"ram": p["ram"], "threads": p["threads"], "batch": p["batch"]})
     if ctx_override:   # the advanced form's own context: size everything for it
         try: chosen = option(max(1024, int(ctx_override)), vision)
@@ -605,8 +637,8 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
         # the replays; it costs a tier step and 2.7 GB of pinned RAM, both priced in.
         "mtp": mtp_on, "mtp_file": model.get("mtp"), "mtp_gb": model.get("mtp_gb", 0.0),
         "kv_reason": chosen.get("kv_reason", ""), "ram_reason": chosen.get("ram_reason", ""), "host_other_gb": chosen.get("host_other_gb"), "headroom_gb": headroom,
-        "state_reason": {"none": "состояние внимания в VRAM: контекст достаточно короткий", "idx": "кэш индексатора в RAM: небольшой чистый выигрыш начиная с 64K",
-                         "kv,idx": "индексатор + KV-кэш в RAM: от 128K их VRAM полезнее отдать ярусу экспертов (замерено +5% при 126K, а при 256K это разница между ярусом и его отсутствием)"}.get(chosen["state_host"], ""),
+        "state_reason": {"none": "attention state in VRAM: the context is short enough", "idx": "indexer cache in RAM: a small clean gain from 64K up",
+                         "kv,idx": "indexer + KV cache in RAM: from 128K their VRAM is worth more as expert tier (measured +5% at 126K, and the difference between a tier and none at 256K)"}.get(chosen["state_host"], ""),
         "estimates": {"vram_tier_gb": chosen["tier_gb"], "vram_tier_blocks": chosen["blocks"], "state_gb": chosen["state_gb"], "dense_core_gb": core,
                       "state_host_gb": chosen["state_host_gb"], "state_vram_gb": chosen["state_vram_gb"],
                       "mmproj_gb": round(mm_gb, 2),
@@ -643,7 +675,7 @@ def port_open(port):
 
 def fetch_json(url, timeout=2.0, data=None):
     try:
-        req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None, headers={"Content-Type": "application/json"} if data is not None else {})
+        req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None, headers=auth_headers({"Content-Type": "application/json"} if data is not None else {}))
         with urllib.request.urlopen(req, timeout=timeout) as r: return json.load(r)
     except Exception:
         return None
@@ -653,6 +685,13 @@ def server_argv(model, s):
             "--ctx", str(int(s["ctx"])), "--batch", str(int(s["batch"])),
             "--kv", s["kv"], "--reserve", str(int(s["reserve"])), "--think", s["think"], "--think-budget", str(int(s["think_budget"])),
             "--port", str(int(s["port"]))]
+    host = AUTH.a.get("server_host") or "127.0.0.1"
+    if host != "127.0.0.1": argv += ["--host", host]
+    if AUTH.a.get("require_key", True) and server_key():
+        # through a 0600 file, not argv: the process list is visible to every user
+        fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f: f.write(server_key() + "\n")
+        argv += ["--api-key-file", KEY_FILE]
     if s.get("skip_miss"): argv.append("--skip-miss")
     if s.get("spec_block", True): argv.append("--spec-block")
     if s.get("mtp"): argv += ["--mtp", model["mtp"]]
@@ -665,10 +704,10 @@ def server_argv(model, s):
 
 def start_server(model, s):
     with LOCK:
-        if STATE["proc"] and STATE["proc"].poll() is None: return {"error": "сервер, запущенный этой консолью, уже работает"}
+        if STATE["proc"] and STATE["proc"].poll() is None: return {"error": "a server started by this console is already running"}
         running = engines_running()
-        if running: return {"error": "на машине уже работает движок (допускается только один): " + "; ".join(running)[:300]}
-        if not os.path.exists(SERVER_BIN): return {"error": f"{SERVER_BIN} не найден: установите релизный бандл или соберите движок (cmake --build build)"}
+        if running: return {"error": "an engine is already running on this machine (one at a time): " + "; ".join(running)[:300]}
+        if not os.path.exists(SERVER_BIN): return {"error": f"{SERVER_BIN} not found: install the release bundle, or build first (cmake --build build)"}
         s = dict(s)
         # --ram-frac 0.85 keeps the engine's own MemAvailable clamp (a backstop for the
         # command line, 0.75 by default) above the size computed here, which is the
@@ -676,9 +715,9 @@ def start_server(model, s):
         if s.get("mtp") and s.get("skip_miss"):
             s["mtp"] = False   # the engine would refuse every request: a verified pair and skip-miss do not combine
         if s.get("mtp") and not model.get("mtp"):
-            return {"error": "в репозитории модели нет MTP/mtp-*.gguf: скачайте его в папку снапшота или выключите черновую голову"}
+            return {"error": "no MTP/mtp-*.gguf in this model's repository: download it into the snapshot directory, or turn the draft head off"}
         if s.get("vision") and not model.get("mmproj"):
-            return {"error": "рядом с моделью нет mmproj-*.gguf: скачайте mmproj-F16.gguf в папку снапшота или выключите зрение"}
+            return {"error": "no mmproj-*.gguf next to this model: download mmproj-F16.gguf into its snapshot directory, or turn Vision off"}
         # The memory the plan assumed may be gone (a browser, a build): say so before the engine
         # clamps the tier. Read twice: right after a stop the arena's pages are still coming back.
         other = 10.0 if s.get("host_other_gb") is None else float(s["host_other_gb"])
@@ -687,15 +726,15 @@ def start_server(model, s):
             time.sleep(2.0); free = mem_available_gb()
         if free and s.get("ram") and free - float(s["ram"]) - other < 1.0:
             if s.get("keep_ram"):   # the caller insists (a measurement): warn, do not shrink
-                s["ram_note"] = "ярус RAM оставлен %d ГБ, как задано: доступно %.1f ГБ, а серверу нужно ~%.1f ГБ помимо яруса, так что в худшей точке памяти не хватит" % (int(s["ram"]), free, other)
+                s["ram_note"] = "RAM tier kept at %d GB as asked: %.1f GB is available and the server needs ~%.1f GB besides the tier, so the machine will be short of memory at the worst point" % (int(s["ram"]), free, other)
             else:
-                s["ram"] = max(4, int(free - other - 1.0)); s["ram_note"] = "ярус RAM уменьшен до %d ГБ: сейчас доступно %.1f ГБ, а серверу нужно %.1f ГБ помимо яруса" % (s["ram"], free, other)
+                s["ram"] = max(4, int(free - other - 1.0)); s["ram_note"] = "RAM tier reduced to %d GB: %.1f GB is available right now and the server needs %.1f GB besides the tier" % (s["ram"], free, other)
         argv = server_argv(model, s)
         log = open(STATE["log"], "w")
         log.write("$ " + " ".join(argv) + "\n")
         if s.get("ram_note"): log.write("[console] " + s["ram_note"] + "\n")
         if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
-            log.write("[консоль] черновая голова выключена: проверка пар и skip-miss несовместимы (skip-miss идёт по одному токену)\n")
+            log.write("[console] draft head left off: a verified pair and skip-miss do not combine (skip-miss is one token at a time)\n")
         log.flush()
         # The bundle keeps ggml, the CUDA and C++ runtimes and liburing next to the engine; the
         # loader needs the directory for the libraries the CUDA backend dlopens.
@@ -720,7 +759,7 @@ def stop_server():
             for pid in pids:
                 try: os.kill(int(pid), signal.SIGTERM)
                 except Exception: pass
-            return {"ok": True, "note": "остановлен сервер, запущенный вне консоли" if pids else "сервер не запущен"}
+            return {"ok": True, "note": "stopped the server running outside the console" if pids else "no server running"}
         p.send_signal(signal.SIGTERM)
         for _ in range(50):
             if p.poll() is not None: break
@@ -793,7 +832,7 @@ def set_threads(n):
     if r and r.get("n_threads") == int(n):
         if STATE["settings"]: STATE["settings"]["threads"] = int(n)
         return {"ok": True, "threads": int(n)}
-    return {"error": "сервер не принял число потоков (идёт запрос?)"}
+    return {"error": "the server did not take the thread count (is a request running?)"}
 
 # ---- measurements through the server (the self-test and the tune share them) ----
 WORDS = ["amber", "basalt", "cedar", "delta", "ember", "falcon", "garnet", "harbor", "indigo", "juniper", "kestrel", "lagoon",
@@ -825,7 +864,7 @@ def chat_request(port, content, max_tokens, timeout=3600):
 def chat_messages(port, messages, max_tokens, timeout=3600):
     body = json.dumps({"model": "qwfn", "messages": messages, "max_tokens": max_tokens,
                        "reasoning_effort": "off", "temperature": 0.0, "stream": False}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=body, headers=auth_headers({"Content-Type": "application/json"}))
     with urllib.request.urlopen(req, timeout=timeout) as r: return json.load(r)
 
 def wait_ready(log, deadline_s=1200):
@@ -834,9 +873,9 @@ def wait_ready(log, deadline_s=1200):
         st = live_state()
         if st["state"] in ("ready", "busy"): return st
         if st["state"] in ("exited", "stopped"):
-            raise RuntimeError("сервер завершился при загрузке (код %s): см. вкладку «Лог»" % st.get("exit_code"))
+            raise RuntimeError("the server exited while loading (exit code %s): see the Log tab" % st.get("exit_code"))
         time.sleep(2)
-    raise RuntimeError("сервер не поднялся за %d мин" % (deadline_s // 60))
+    raise RuntimeError("the server did not become ready within %d minutes" % (deadline_s // 60))
 
 def measure_chat(port):
     # About 250 words: a three-sentence answer (76 tokens) sat inside the ~25-token cache
@@ -849,7 +888,7 @@ def measure_chat(port):
 def measure_doc(port, ctx, log):
     n_doc = min(32768, ctx // 2)
     doc, phrase = selftest_document(n_doc)
-    log("длинный документ: prefill около %dK токенов, затем ответ по тексту" % (n_doc // 1024))
+    log("long document: prefilling about %dK tokens, then a grounded answer" % (n_doc // 1024))
     prompt = doc + "\n\nTwo things: (1) What is the passphrase that the note in this document asks the reader to remember? Quote it exactly. (2) In two sentences, what is this document about?"
     r = chat_request(port, prompt, 160)
     t = r.get("timings") or {}
@@ -875,10 +914,10 @@ def run_selftest(model, settings):
         st = status(); started_here = False
         if st["state"] in ("ready", "busy", "loading"):
             if st.get("model") and st["model"] != model["name"]:
-                raise RuntimeError("сейчас обслуживается другая модель (%s): остановите её или тестируйте её" % st["model"])
-            log("используется запущенный сервер" if st["state"] != "loading" else "ждём, пока сервер загрузится")
+                raise RuntimeError("a different model is being served (%s): stop it first, or test that one" % st["model"])
+            log("using the running server" if st["state"] != "loading" else "waiting for the server to finish loading")
         else:
-            log("запуск сервера с показанными настройками")
+            log("starting the server with the settings shown")
             r = start_server(model, settings)
             if r.get("error"): raise RuntimeError(r["error"])
             started_here = True
@@ -913,7 +952,7 @@ def run_selftest(model, settings):
 
 def start_selftest(model, settings):
     with LOCK:
-        if SELFTEST["running"] or TUNE["running"]: return {"error": "самопроверка или автонастройка уже идёт"}
+        if SELFTEST["running"] or TUNE["running"]: return {"error": "a self-test or a tune is already running"}
         SELFTEST.update(running=True, step="starting", log=[], error=None, t0=time.time())
     threading.Thread(target=run_selftest, args=(model, settings), daemon=True).start()
     return {"ok": True}
@@ -971,7 +1010,7 @@ def run_tune(model, preset, settings_in):
         #    total minus 8 GB, cost 2 GB of RAM tier on the reference machine)
         st = status()
         if st["state"] in ("ready", "busy", "loading") or engines_running():
-            log("остановка запущенного сервера%s: автонастройка перезапустит его с рассчитанными флагами" % ("" if st["console_started"] else " (запущен вне консоли)"), 0.01)
+            log("stopping the running server%s: the tune restarts it with the planned flags" % ("" if st["console_started"] else " (started outside this console)"), 0.01)
             stop_server()
             for _ in range(40):
                 if not engines_running() and not port_open(STATE["port"]): break
@@ -980,27 +1019,27 @@ def run_tune(model, preset, settings_in):
         check_cancel()
         hw = hardware()
         # 1. the drive
-        log("проверка диска с моделью", 0.02)
+        log("checking the drive under the model", 0.02)
         dinfo = drive_info(model["path"]); result["drive"] = dinfo
         pf = model.get("probe_file") or model["path"]
         if dinfo.get("rotational"):
-            result["notes"].append("модель лежит на HDD (%s): в лучшем случае несколько токенов в секунду; перенесите её на NVMe" % (dinfo.get("model") or dinfo.get("disk")))
+            result["notes"].append("the model is on a spinning disk (%s): expect a few tokens per second at best; move it to an NVMe" % (dinfo.get("model") or dinfo.get("disk")))
             probe = probe_nvme(pf, seconds=1.0, nth=4)
         else:
             probe = probe_nvme(pf, seconds=2.5)
         check_cancel()
         if probe and not probe.get("error"):
             result["nvme"] = probe
-            log("диск: %.1f ГБ/с случайного чтения (%s)" % (probe["gbs"], dinfo.get("model") or dinfo.get("disk") or "unknown device"), 0.06)
-            if probe["gbs"] < 2.5: result["notes"].append("диск читает %.1f ГБ/с на паттерне движка; NVMe Gen4 даёт ~7. Декод будет упираться в подгрузку экспертов reads" % probe["gbs"])
+            log("drive: %.1f GB/s random reads (%s)" % (probe["gbs"], dinfo.get("model") or dinfo.get("disk") or "unknown device"), 0.06)
+            if probe["gbs"] < 2.5: result["notes"].append("the drive reads %.1f GB/s at the engine's pattern; a Gen4 NVMe does ~7. Expect decode to be limited by expert reads" % probe["gbs"])
         else:
-            log("проверка диска пропущена (%s)" % ((probe or {}).get("error") or "файл модели слишком мал для замера"), 0.06)
+            log("drive probe skipped (%s)" % ((probe or {}).get("error") or "the model file is too small to sample"), 0.06)
         gbs = (result.get("nvme") or {}).get("gbs")
         prev = tune_calibration(model)   # the previous tune's host-memory measurement sizes this run's first tier
         calib = {**prev, "threads": None, "nvme_mb_per_ms": NVME_MB_PER_MS * gbs / REF_PROBE_GBS if gbs else None, "nvme_gbs": gbs}
         # 2. the plan
         result["avail_gb"] = hw["ram_available_gb"]
-        log("расчёт яруса %s для этой машины (доступно %.1f ГБ RAM, запас %.1f ГБ)" % (preset, hw["ram_available_gb"], headroom_gb()), 0.08)
+        log("planning the %s tier for this machine (%.1f GB of RAM available, %.1f GB headroom)" % (preset, hw["ram_available_gb"], headroom_gb()), 0.08)
         plan = recommend(model, hw, preset, None, None, None, calib)
         if preset == "custom" and settings_in: plan = {**plan, **{k: v for k, v in settings_in.items() if k in plan}}
         result["plan"] = {k: plan[k] for k in ("ctx", "kv", "ram", "threads", "batch", "reserve", "state_host", "vision", "mtp", "spec_block", "skip_miss", "think", "think_budget", "port")}
@@ -1011,16 +1050,16 @@ def run_tune(model, preset, settings_in):
         log("VRAM expert tier ~%.1f GB, batch %d, reserve %d MB" % (plan["estimates"]["vram_tier_gb"], plan["batch"], plan["reserve"]))
         # 3. the server, with the plan
         check_cancel()
-        log("запуск сервера", 0.12)
+        log("starting the server", 0.12)
         r = start_server(model, plan)
         if r.get("error"): raise RuntimeError(r["error"])
         if r.get("note"): result["notes"].append(r["note"])
         st = wait_ready(log); port = st["port"]
         built = log_tiers(); result["built"] = built
         if built.get("vram_tier_gb") is not None:
-            log("движок построил ярус экспертов %.1f ГБ в VRAM (план %.1f) и %.1f ГБ в RAM (план %d)" % (built["vram_tier_gb"], plan["estimates"]["vram_tier_gb"], built.get("ram_tier_gb", 0), plan["ram"]), 0.3)
+            log("engine built a %.1f GB VRAM expert tier (planned %.1f) and a %.1f GB RAM tier (planned %d)" % (built["vram_tier_gb"], plan["estimates"]["vram_tier_gb"], built.get("ram_tier_gb", 0), plan["ram"]), 0.3)
             if plan["estimates"]["vram_tier_gb"] > 0 and built["vram_tier_gb"] < plan["estimates"]["vram_tier_gb"] - 1.0:
-                result["notes"].append("ярус VRAM вышел на %.1f ГБ меньше плана: VRAM занимает что-то ещё (проверьте, что грузит GPU)" % (plan["estimates"]["vram_tier_gb"] - built["vram_tier_gb"]))
+                result["notes"].append("the VRAM tier came out %.1f GB smaller than planned: something else holds VRAM (check the desktop's GPU use)" % (plan["estimates"]["vram_tier_gb"] - built["vram_tier_gb"]))
         watcher = threading.Thread(target=watch, daemon=True); watcher.start()
         # warm-up: the tiers fill on the first tokens
         log("warm-up", 0.32)
@@ -1043,7 +1082,7 @@ def run_tune(model, preset, settings_in):
         cores = int(hw.get("cpu_cores") or plan["threads"])
         sweep = {}
         if len(cands) >= 2:
-            log("подбор потоков на контексте %dK токенов" % (doc["tokens"] // 1024), 0.6)
+            log("thread sweep on the %dK-token context" % (doc["tokens"] // 1024), 0.6)
             conv = list(doc["conversation"]); order = cands + cands[::-1]
             for i, n in enumerate(order):
                 check_cancel()
@@ -1053,7 +1092,7 @@ def run_tune(model, preset, settings_in):
                 res = chat_messages(port, conv + [{"role": "user", "content": q}], 64); t = res.get("timings") or {}
                 tps = float(t.get("predicted_per_second") or 0)
                 conv += [{"role": "user", "content": q}, {"role": "assistant", "content": (res["choices"][0]["message"].get("content") or "")}]
-                if int(t.get("prompt_n") or 0) > 1000: log("  (префикс не переиспользован: перечитано %d токенов)" % int(t["prompt_n"]))
+                if int(t.get("prompt_n") or 0) > 1000: log("  (the prefix was not reused: %d tokens re-read)" % int(t["prompt_n"]))
                 sweep.setdefault(n, []).append(tps)
                 log("threads %2d: %.1f tok/s%s" % (n, tps, " (pass 2)" if i >= len(cands) else ""), 0.6 + 0.3 * (i + 1) / len(order))
             table = [{"threads": n, "tok_s": round(sum(v) / len(v), 2), "runs": [round(x, 1) for x in v]} for n, v in sorted(sweep.items())]
@@ -1063,19 +1102,19 @@ def run_tune(model, preset, settings_in):
             pick = pick_threads(table, cores)
             result["sweep"] = table; result["threads"] = pick
             set_threads(pick)
-            if pick == base_n: log("потоков: %d, по числу физических ядер (%.1f ток/с; лучший в подборе, %.1f на %d, не обогнал его во всех прогонах больше чем на 3%%)" % (pick, by_n[pick], best, best_n), 0.92)
-            else: log("потоков: %d (%.1f ток/с против %.1f на %d физических ядрах, во всех прогонах)" % (pick, by_n[pick], by_n[base_n], base_n), 0.92)
+            if pick == base_n: log("threads: %d, the physical cores (%.1f tok/s; the best of the sweep, %.1f at %d, did not beat it in every pass by over 3%%)" % (pick, by_n[pick], best, best_n), 0.92)
+            else: log("threads: %d (%.1f tok/s against %.1f at the %d physical cores, in every pass)" % (pick, by_n[pick], by_n[base_n], base_n), 0.92)
             worst_n = min(by_n, key=by_n.get)
-            if by_n[worst_n] < by_n[pick] * 0.9: result["notes"].append("%d потоков оказались на %.0f%% медленнее, чем %d: на этом CPU лишние потоки отнимают время у чтения с диска и у потока графа" % (worst_n, 100 * (1 - by_n[worst_n] / by_n[pick]), pick))
+            if by_n[worst_n] < by_n[pick] * 0.9: result["notes"].append("%d threads measured %.0f%% slower than %d: on this CPU the extra threads starve the drive reader and the graph thread" % (worst_n, 100 * (1 - by_n[worst_n] / by_n[pick]), pick))
         else:
-            result["threads"] = plan["threads"]; log("подбор потоков пропущен: %d потоков CPU" % hw.get("cpu_threads"), 0.92)
+            result["threads"] = plan["threads"]; log("thread sweep skipped: %d CPU threads" % hw.get("cpu_threads"), 0.92)
         stats = fetch_json(f"http://127.0.0.1:{port}/stats", 3.0) or {}
         c = stats.get("expert_cache") or {}
         result["verify"] = {"chat_tps": chat["tok_s"], "chat_n": chat["n"], "doc_tps": doc["tok_s"], "doc_prefill_tps": doc["prefill_tok_s"], "doc_tokens": doc["tokens"], "doc_prefill_s": doc["prefill_s"],
                             "found": doc["found"], "hit": round(c.get("hit_rate", 0), 3), "vram_served": round(c.get("vram_served", 0), 3),
                             "predicted_chat": plan["estimates"]["decode_tps_short"], "predicted_doc": plan["estimates"]["decode_tps_long_doc"]}
         log("chat %.1f tok/s (predicted %.1f) · document prefill %.0f tok/s, decode %.1f tok/s (predicted %.1f) · passphrase %s" % (chat["tok_s"], plan["estimates"]["decode_tps_short"], doc["prefill_tok_s"], doc["tok_s"], plan["estimates"]["decode_tps_long_doc"], "found" if doc["found"] else "NOT found"), 0.96)
-        if not doc["found"]: result["notes"].append("ответ не процитировал кодовую фразу из документа: проверьте вкладку «Лог»; меньший контекст или файл Q4 могут читаться лучше")
+        if not doc["found"]: result["notes"].append("the answer did not quote the passphrase planted in the document: check the Log tab; a smaller context or the Q4 file may read better")
         # 6. memory: what the server needs besides the tier, measured; then the tier that
         #    leaves the headroom, and a restart with it when that is a different size
         mem_watch["stop"] = True; time.sleep(0.6)
@@ -1084,10 +1123,10 @@ def run_tune(model, preset, settings_in):
         host_other = max(2.0, result["avail_gb"] - mn - built_ram)
         result["memory"] = {"avail_gb": result["avail_gb"], "min_free_gb": round(mn, 1), "ram_tier_gb": built_ram, "host_other_gb": round(host_other, 1),
                             "state_host_gb": plan["estimates"]["state_host_gb"], "mtp": bool(plan["mtp"]), "headroom_gb": headroom_gb()}
-        log("память: в худшей точке свободно %.1f ГБ; серверу нужно %.1f ГБ помимо яруса %.1f ГБ" % (mn, host_other, built_ram))
+        log("memory: %.1f GB free at the worst point; the server needs %.1f GB besides its %.1f GB tier" % (mn, host_other, built_ram))
         new_ram = max(4, int(result["avail_gb"] - host_other - headroom_gb()))
         if abs(new_ram - int(plan["ram"])) >= 1:
-            log("пересчёт яруса RAM %d -> %d ГБ (запас %.1f ГБ) и перезапуск сервера" % (plan["ram"], new_ram, headroom_gb()), 0.97)
+            log("re-sizing the RAM tier %d -> %d GB (%.1f GB headroom) and restarting the server with it" % (plan["ram"], new_ram, headroom_gb()), 0.97)
             plan["ram"] = new_ram; plan["host_other_gb"] = round(host_other, 1); result["plan"]["ram"] = new_ram
             stop_server()
             for _ in range(40):
@@ -1106,14 +1145,14 @@ def run_tune(model, preset, settings_in):
             mem_watch["stop"] = True; time.sleep(0.6)
             result["memory"]["after_resize"] = {"ram_tier_gb": (built2 or {}).get("ram_tier_gb", new_ram), "min_free_gb": round(mem_watch["min"], 1), "chat_tps": chat2["tok_s"]}
             result["verify"]["chat_tps_resized"] = chat2["tok_s"]
-            log("с ярусом %.1f ГБ: чат %.1f ток/с, в худшей точке свободно %.1f ГБ" % ((built2 or {}).get("ram_tier_gb", new_ram), chat2["tok_s"], mem_watch["min"]))
+            log("with the %.1f GB tier: chat %.1f tok/s, %.1f GB free at the worst point" % ((built2 or {}).get("ram_tier_gb", new_ram), chat2["tok_s"], mem_watch["min"]))
         else:
-            log("ярус RAM остаётся %d ГБ: столько позволяет измеренная память при запасе %.1f ГБ" % (plan["ram"], headroom_gb()))
+            log("the RAM tier stays at %d GB: that is what the measured memory allows at %.1f GB of headroom" % (plan["ram"], headroom_gb()))
         result["settings"] = {**result["plan"], "threads": result["threads"]}
         result["elapsed_s"] = round(time.time() - T["t0"])
         CONFIG["tune"][model["name"]] = result; save_config()
         T["result"] = result
-        log("готово за %d с: сервер работает с подобранными флагами" % result["elapsed_s"], 1.0)
+        log("done in %d s: the server is running with the tuned flags" % result["elapsed_s"], 1.0)
     except Exception as e:
         T["error"] = str(e); log("failed: %s" % e)
         if str(e) == "cancelled" and STATE["settings"]: set_threads(STATE["settings"].get("threads") or 8)
@@ -1123,26 +1162,196 @@ def run_tune(model, preset, settings_in):
 
 def start_tune(model, preset, settings):
     with LOCK:
-        if TUNE["running"] or SELFTEST["running"]: return {"error": "автонастройка или самопроверка уже идёт"}
+        if TUNE["running"] or SELFTEST["running"]: return {"error": "a tune or a self-test is already running"}
         TUNE.update(running=True, step="starting", log=[], error=None, t0=time.time(), progress=0.0, cancel=False)
     threading.Thread(target=run_tune, args=(model, preset, settings), daemon=True).start()
     return {"ok": True}
 
 # ---- HTTP -----------------------------------------------------------------------
-INDEX = os.path.join(ROOT, "tools", "console", "index.html")
+CONSOLE_DIR = os.path.join(ROOT, "tools", "console")
+INDEX = os.path.join(CONSOLE_DIR, "index.html")
+LOGIN = os.path.join(CONSOLE_DIR, "login.html")
+TLS = {"on": False}
+# Reachable without a session: the sign-in page and what it needs.
+OPEN_GET = ("/login", "/console.css", "/api/authstate")
+OPEN_POST = ("/api/login", "/api/setup")
+# Keys whose strings are engine output or data, never translated.
+NO_TRANSLATE = ("log", "path", "argv", "model_path", "location", "locations", "api_key", "users", "user", "repo")
+
 class H(http.server.BaseHTTPRequestHandler):
-    def _json(self, obj, code=200):
-        body = json.dumps(obj).encode()
-        self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    # ---- request context
+    def _cookies(self):
+        c = http.cookies.SimpleCookie()
+        try: c.load(self.headers.get("Cookie") or "")
+        except Exception: pass
+        return c
+    def _cookie(self, name):
+        c = self._cookies().get(name); return c.value if c else None
+    def _ip(self): return self.client_address[0]
+    def _local(self):
+        try: return ipaddress.ip_address(self._ip()).is_loopback
+        except ValueError: return False
+    def _lang(self):
+        l = self._cookie("qwfn_lang")
+        if l and I18N.has(l): return l
+        for part in (self.headers.get("Accept-Language") or "").split(","):
+            code = part.split(";")[0].strip().split("-")[0].lower()
+            if code and I18N.has(code): return code
+        return "en"
+    def _user(self): return AUTH.user_of(self._cookie("qwfn_session"))
+    # ---- responses
+    def _send(self, code, body, ctype, headers=()):
+        self.send_response(code); self.send_header("Content-Type", ctype); self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("Referrer-Policy", "same-origin")
+        for k, v in headers: self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def _json(self, obj, code=200, headers=()):
+        skip = NO_TRANSLATE if self.path.split("?")[0] in ("/api/status", "/api/log", "/api/live", "/api/access") else tuple(k for k in NO_TRANSLATE if k != "log")
+        body = json.dumps(I18N.obj(obj, self._lang(), skip)).encode()
+        self._send(code, body, "application/json", headers)
+    def _page(self, path):
+        try: html = open(path, encoding="utf-8").read()
+        except Exception: html = "<h1>%s missing</h1>" % os.path.basename(path)
+        self._send(200, I18N.page(html, self._lang()).encode(), "text/html; charset=utf-8",
+                   [("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")])
+    def _redirect(self, to, headers=()):
+        self.send_response(302); self.send_header("Location", to); self.send_header("Content-Length", "0")
+        for k, v in headers: self.send_header(k, v)
+        self.end_headers()
+    def _session_cookie(self, token, max_age):
+        c = "qwfn_session=%s; Path=/; HttpOnly; SameSite=Strict" % token
+        if max_age is not None: c += "; Max-Age=%d" % max_age
+        if TLS["on"]: c += "; Secure"
+        return ("Set-Cookie", c)
     def log_message(self, *a): pass
+
+    # ---- the gate: every GET and POST passes here first
+    def _gate(self, method, path):
+        """None when the request may go on; otherwise it has been answered."""
+        if method == "GET" and (path in OPEN_GET or path.startswith("/lang/")): return None
+        if method == "POST" and path in OPEN_POST:
+            return None if self.headers.get("X-Qwfn") == "1" else self._json({"error": "missing X-Qwfn header"}, 403)
+        tok = self.headers.get("X-Qwfn-Token")
+        if tok and self._local() and __import__("hmac").compare_digest(tok, CLI_TOKEN):
+            self.user = "local"; return None
+        user = self._user()
+        if not user:
+            if method == "GET" and not path.startswith(("/api/", "/proxy/")): self._redirect("/login"); return True
+            self._json({"error": "sign in"}, 401); return True
+        # A cross-site form cannot set a custom header; fetch() from this page does.
+        if method == "POST" and self.headers.get("X-Qwfn") != "1": self._json({"error": "missing X-Qwfn header"}, 403); return True
+        self.user = user
+        return None
+
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n > (1 << 20): return {}
+        try: return json.loads(self.rfile.read(n) or b"{}")
+        except Exception: return {}
+
+    def _auth_get(self, path):
+        if path == "/login":
+            if self._user(): self._redirect("/"); return True
+            self._page(LOGIN); return True
+        if path == "/console.css":
+            try: body = open(os.path.join(CONSOLE_DIR, "console.css"), "rb").read()
+            except Exception: body = b""
+            self._send(200, body, "text/css; charset=utf-8"); return True
+        if path.startswith("/lang/"):
+            code = path[len("/lang/"):]
+            back = "/"
+            ref = self.headers.get("Referer") or ""
+            if ref:
+                u = urllib.parse.urlparse(ref)
+                if u.netloc == (self.headers.get("Host") or ""): back = (u.path or "/") + (("?" + u.query) if u.query else "")
+            hdr = [("Set-Cookie", "qwfn_lang=%s; Path=/; Max-Age=31536000; SameSite=Lax" % code)] if I18N.has(code) else []
+            self._redirect(back, hdr); return True
+        if path == "/api/authstate":
+            self._json({"setup": not AUTH.has_users(), "local": self._local(), "signed_in": bool(self._user()),
+                        "lang": self._lang(), "languages": I18N.languages()}); return True
+        if path == "/api/access":
+            a = AUTH.a
+            self._json({"user": self.user, "users": sorted(a["users"]), "api_key": a["api_key"], "require_key": a.get("require_key", True),
+                        "server_host": a.get("server_host", "127.0.0.1"), "lang": self._lang(), "languages": I18N.languages()}); return True
+        return False
+
+    def _auth_post(self, path, body):
+        ip = self._ip()
+        if path == "/api/setup":
+            wait = AUTH.wait_s(ip)
+            if wait: return self._json({"error": "too many attempts: try again in %d s" % wait}, 429) or True
+            err = AUTH.setup(str(body.get("login") or "").strip(), str(body.get("password") or ""), self._local(), str(body.get("code") or "").strip())
+            if err:
+                if "setup code" in err: AUTH.failed(ip)
+                return self._json({"error": err}, 400) or True
+            token, age = AUTH.new_session(str(body.get("login")).strip(), bool(body.get("remember")))
+            return self._json({"ok": True}, 200, [self._session_cookie(token, age)]) or True
+        if path == "/api/login":
+            wait = AUTH.wait_s(ip)
+            if wait: return self._json({"error": "too many attempts: try again in %d s" % wait}, 429) or True
+            login = str(body.get("login") or "").strip()
+            if not AUTH.verify(login, str(body.get("password") or "")):
+                AUTH.failed(ip); return self._json({"error": "wrong login or password"}, 401) or True
+            AUTH.succeeded(ip)
+            token, age = AUTH.new_session(login, bool(body.get("remember")))
+            return self._json({"ok": True}, 200, [self._session_cookie(token, age)]) or True
+        if path == "/api/logout":
+            AUTH.end_session(self._cookie("qwfn_session"))
+            return self._json({"ok": True}, 200, [self._session_cookie("", 0)]) or True
+        if path == "/api/users":
+            if body.get("add") is not None: err = AUTH.add_user(str(body.get("add") or "").strip(), str(body.get("password") or ""))
+            elif body.get("remove"): err = AUTH.remove_user(str(body["remove"]), self.user)
+            else: err = "nothing to do"
+            return self._json({"error": err} if err else {"ok": True}) or True
+        if path == "/api/password":
+            wait = AUTH.wait_s(ip)
+            if wait: return self._json({"error": "too many attempts: try again in %d s" % wait}, 429) or True
+            err = AUTH.change_password(self.user, str(body.get("old") or ""), str(body.get("new") or ""))
+            if err == "the current password is wrong": AUTH.failed(ip)
+            if err: return self._json({"error": err}) or True
+            token, age = AUTH.new_session(self.user, False)
+            return self._json({"ok": True}, 200, [self._session_cookie(token, age)]) or True
+        if path == "/api/access":
+            a = AUTH.a
+            if body.get("new_key"): a["api_key"] = qwfn_auth.new_api_key()
+            if "require_key" in body: a["require_key"] = bool(body["require_key"])
+            if body.get("server_host") in ("127.0.0.1", "0.0.0.0"): a["server_host"] = body["server_host"]
+            save_config(); return self._json({"ok": True}) or True
+        return False
+
+    def _proxy(self, body_bytes):
+        """The Chat tab's requests, forwarded to the model server with the key and streamed back.
+        The page never needs the key, and it works from a machine that cannot reach the server."""
+        port = STATE["port"]
+        if not port_open(port): return self._json({"error": "the model server is not running"}, 503)
+        upstream = self.path[len("/proxy"):]
+        try:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
+            c.request("POST", upstream, body=body_bytes, headers=auth_headers({"Content-Type": "application/json"}))
+            r = c.getresponse()
+        except Exception as e:
+            return self._json({"error": "cannot reach the model server: %s" % e}, 502)
+        self.send_response(r.status)
+        self.send_header("Content-Type", r.getheader("Content-Type") or "application/json"); self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close"); self.end_headers()
+        self.close_connection = True
+        try:
+            while True:
+                chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                if not chunk: break
+                self.wfile.write(chunk); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass              # the page stopped reading (Stop button): dropping the upstream ends the generation
+        finally:
+            c.close()
+
     def do_GET(self):
         path = self.path.split("?")[0]
+        if self._gate("GET", path): return
+        if self._auth_get(path): return
         q = {k: v[0] for k, v in urllib.parse.parse_qs(self.path.split("?", 1)[1]).items()} if "?" in self.path else {}
         if path in ("/", "/index.html"):
-            try: body = open(INDEX, "rb").read()
-            except Exception: body = b"<h1>tools/console/index.html missing</h1>"
-            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+            self._page(INDEX); return
         if path == "/api/models":
             sk = []; ms = scan_models(sk)
             return self._json({"models": ms, "hf": HF, "hf_all": HF_HUBS, "skipped": sk, "locations": model_locations(), "last": CONFIG["last"]})
@@ -1161,7 +1370,13 @@ class H(http.server.BaseHTTPRequestHandler):
         if path == "/api/tune": return self._json({k: TUNE[k] for k in ("running", "step", "log", "result", "error", "progress")})
         self._json({"error": "not found"}, 404)
     def do_POST(self):
-        n = int(self.headers.get("Content-Length", 0)); body = json.loads(self.rfile.read(n) or b"{}")
+        path = self.path.split("?")[0]
+        if self._gate("POST", path): return
+        if path.startswith("/proxy/v1/"):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            return self._proxy(self.rfile.read(n) if n <= (256 << 20) else b"")
+        body = self._read_json()
+        if self._auth_post(path, body): return
         if self.path in ("/api/start", "/api/selftest", "/api/tune"):
             models = scan_models(); model = find_model(models, body.get("model"))
             if not model: return self._json({"error": "no models"}, 404)
@@ -1176,8 +1391,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/locations":
             if body.get("add"):
                 p = os.path.realpath(os.path.expanduser(str(body["add"]).strip()))
-                if not os.path.exists(p): return self._json({"error": "нет такого пути: " + p})
-                if not (os.path.isdir(p) or p.endswith(".gguf")): return self._json({"error": "укажите папку или файл .gguf"})
+                if not os.path.exists(p): return self._json({"error": "no such path: " + p})
+                if not (os.path.isdir(p) or p.endswith(".gguf")): return self._json({"error": "give a folder, or a .gguf file"})
                 if p != HF and p not in CONFIG["locations"]: CONFIG["locations"].append(p); save_config()
             if body.get("remove"):
                 CONFIG["locations"] = [x for x in CONFIG["locations"] if x != body["remove"]]; save_config()
@@ -1185,7 +1400,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/config":
             if "headroom_gb" in body:
                 try: CONFIG["headroom_gb"] = min(16.0, max(0.5, float(body["headroom_gb"]))); save_config()
-                except Exception: return self._json({"error": "запас задаётся числом в ГБ"})
+                except Exception: return self._json({"error": "headroom must be a number of GB"})
             return self._json({"ok": True, "headroom_gb": headroom_gb()})
         if self.path == "/api/custom":
             name = str(body.get("model") or "")
@@ -1200,11 +1415,38 @@ class H(http.server.BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--port", type=int, default=8090); ap.add_argument("--server-port", type=int, default=8080)
+    ap.add_argument("--host", default="127.0.0.1", help="address to listen on: 127.0.0.1 (default), or 0.0.0.0 for the local network")
+    ap.add_argument("--tls-cert", help="PEM certificate: serve HTTPS (scripts/gen-cert.sh makes a self-signed one)"); ap.add_argument("--tls-key", help="PEM private key for --tls-cert")
     ap.add_argument("--start", action="store_true", help="start the last served model and tier right away")
     ap.add_argument("--model", help="with --start: a model path or name instead of the last one"); ap.add_argument("--preset", help="with --start: chat | coding | coding_plus | custom")
     a = ap.parse_args(); STATE["port"] = a.server_port
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), H)
-    print(f"qwfn console on http://127.0.0.1:{a.port}  (server port {a.server_port}, models from {', '.join(l['path'] for l in model_locations() if l['builtin'])}" + (" and %d more location(s)" % len(CONFIG["locations"]) if CONFIG["locations"] else "") + ")", flush=True)
+    scheme = "http"
+    if a.tls_cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(a.tls_cert, a.tls_key)
+        class TLSServer(http.server.ThreadingHTTPServer):
+            # The handshake runs in the connection's own thread with a deadline: wrapping the
+            # listening socket would do it inside accept(), where one silent client stalls all.
+            def process_request_thread(self, request, client_address):
+                try:
+                    request.settimeout(15)
+                    request = ctx.wrap_socket(request, server_side=True)
+                    request.settimeout(None)
+                except (OSError, ssl.SSLError):
+                    try: request.close()
+                    except OSError: pass
+                    return
+                super().process_request_thread(request, client_address)
+        srv = TLSServer((a.host, a.port), H); TLS["on"] = True; scheme = "https"
+    else:
+        srv = http.server.ThreadingHTTPServer((a.host, a.port), H)
+        if a.host not in ("127.0.0.1", "localhost", "::1"):
+            print("warning: listening on %s without --tls-cert: passwords cross the network in clear text" % a.host, flush=True)
+    write_cli_token()
+    shown = "127.0.0.1" if a.host in ("0.0.0.0", "::") else a.host
+    if AUTH.setup_code:
+        print("no account yet: open the console from this machine to create one, or from another with the setup code %s" % AUTH.setup_code, flush=True)
+    print(f"qwfn console on {scheme}://{shown}:{a.port}" + (f" (listening on {a.host})" if shown != a.host else "") + f"  (server port {a.server_port}, models from {', '.join(l['path'] for l in model_locations() if l['builtin'])}" + (" and %d more location(s)" % len(CONFIG["locations"]) if CONFIG["locations"] else "") + ")", flush=True)
     if a.start:
         models = scan_models(); last = CONFIG["last"]
         m = find_model(models, a.model or last.get("model")) or (models[0] if models else None)

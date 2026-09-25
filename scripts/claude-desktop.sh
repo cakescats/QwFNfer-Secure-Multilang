@@ -52,6 +52,9 @@ die() { printf 'claude-desktop: %s\n' "$*" >&2; exit 1; }
 server="http://127.0.0.1:$server_port"
 console="http://127.0.0.1:$console_port"
 up() { curl -s -m 2 "$1/health" >/dev/null 2>&1; }
+# The console wants a session; local scripts use the token it writes on every start.
+token_file="${QWFN_CONSOLE_DIR:-$HOME/.cache/qwfn-console}/console_token"
+capi() { local path=$1; shift; curl -s -H "X-Qwfn-Token: $(cat "$token_file" 2>/dev/null)" -H 'X-Qwfn: 1' "$@" "$console$path"; }
 
 # ---- the running instance on this profile (Electron's single-instance lock) --------------
 instance_pid() {
@@ -82,36 +85,39 @@ command -v claude-desktop >/dev/null 2>&1 || die "claude-desktop is not on PATH 
 # ---- the engine ----------------------------------------------------------------------------
 if ! up "$server"; then
     [ $start_server -eq 1 ] || die "no server at $server; start one from the console (or drop --no-server)"
-    if ! curl -s -m 2 "$console/api/status" >/dev/null 2>&1; then
+    if ! capi /api/status -m 2 -f >/dev/null 2>&1; then
         say "starting the console at $console with the last served model"
         [ -f "$HERE/bin/libggml-base.so.0" ] && export LD_LIBRARY_PATH="$HERE/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         mkdir -p "$HOME/.cache/qwfn-console"
         (cd "$HERE" && setsid nohup python3 tools/qwfn_console.py --port "$console_port" --server-port "$server_port" --start \
             >"$HOME/.cache/qwfn-console/console.log" 2>&1 &)
-        for _ in $(seq 1 30); do curl -s -m 2 "$console/api/status" >/dev/null 2>&1 && break; sleep 1; done
-        curl -s -m 2 "$console/api/status" >/dev/null 2>&1 || die "the console did not come up; see ~/.cache/qwfn-console/console.log"
+        for _ in $(seq 1 30); do capi /api/status -m 2 -f >/dev/null 2>&1 && break; sleep 1; done
+        capi /api/status -m 2 -f >/dev/null 2>&1 || die "the console did not come up; see ~/.cache/qwfn-console/console.log"
     else
-        last=$(curl -s -m 5 "$console/api/config" | python3 -c 'import json,sys; l=json.load(sys.stdin).get("last") or {}; print(l.get("model",""), l.get("preset","coding"))')
+        last=$(capi /api/config -m 5 | python3 -c 'import json,sys; l=json.load(sys.stdin).get("last") or {}; print(l.get("model",""), l.get("preset","coding"))')
         set -- $last
         [ -n "${1:-}" ] || die "the console has never served a model: open $console, pick one and start it once"
         say "starting the engine through the console: $(basename "$1") ($2)"
-        r=$(curl -s -m 30 -X POST "$console/api/start" -H 'Content-Type: application/json' -d "{\"model\": \"$1\", \"preset\": \"$2\"}")
+        r=$(capi /api/start -m 30 -X POST -H 'Content-Type: application/json' -d "{\"model\": \"$1\", \"preset\": \"$2\"}")
         python3 -c 'import json,sys; d=json.loads(sys.argv[1]); e=d.get("error"); sys.exit(1) if e and print("claude-desktop: " + e, file=sys.stderr) is None else 0' "$r" || exit 1
     fi
     say "waiting for the engine at $server (a cold start loads the model: up to a few minutes)"
     for _ in $(seq 1 240); do up "$server" && break; sleep 2; done
     up "$server" || die "the engine did not answer at $server; see ~/.cache/qwfn-console/server.log"
 fi
-served=$(curl -s -m 5 "$server/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)
+# The model server's API key, if the console gave it one (Access tab).
+api_key=$(capi /api/access -m 5 | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a["api_key"] if a.get("require_key") else "local")' 2>/dev/null)
+[ -n "$api_key" ] || api_key=local
+served=$(curl -s -m 5 -H "Authorization: Bearer $api_key" "$server/v1/models" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)
 [ -n "$served" ] || served=qwen3.8-flash-next
 
 # ---- the profile: a config library with one applied entry ---------------------------------
 # The same files the in-app form (Developer -> Configure Third-Party Inference) writes.
 lib="$profile-3p/configLibrary"
 mkdir -p "$profile" "$lib"; chmod 700 "$profile" "$profile-3p" "$lib"
-changed=$(python3 - "$lib" "$server" "$model" "$served" <<'PY'
+changed=$(python3 - "$lib" "$server" "$model" "$served" "$api_key" <<'PY'
 import json, os, sys, uuid
-lib, server, model, served = sys.argv[1:5]
+lib, server, model, served, api_key = sys.argv[1:6]
 meta_path = os.path.join(lib, "_meta.json")
 meta = {"appliedId": "", "entries": []}
 try: meta = json.load(open(meta_path))
@@ -121,7 +127,7 @@ cid = ids[0] if ids else str(uuid.uuid4())
 conf = {
     "inferenceProvider": "gateway",
     "inferenceGatewayBaseUrl": server,
-    "inferenceGatewayApiKey": "local",
+    "inferenceGatewayApiKey": api_key,
     "inferenceGatewayAuthScheme": "bearer",
     "inferenceModels": [{"name": model, "labelOverride": served + " (local)", "anthropicFamilyTier": "sonnet", "isFamilyDefault": True}],
     "modelDiscoveryEnabled": False,
