@@ -34,6 +34,9 @@ patch in detail in [`B70-SYCL.md`](B70-SYCL.md).
 | Power cap below 140 W | 140 W -6%, 130 W -13-15% | — |
 | `--vram` above 24 | leaves under 2 GB of VRAM after a long document; the host needs ~1.5 GB free to stay clear of the driver's VRAM-to-RAM eviction | a card with more VRAM |
 | Rank-counting argsort (one barrier instead of bitonic stages) | +4% decode graph time | a top-k that reads each value once |
+| A larger locked RAM expert tier (`--ram 11` / `13` vs 8, preferred config) | 15% fewer expert misses but decode unchanged within the between-start I/O spread; 40K prefill 3.7% slower at 11, 7% at 13 | once expert-read speed is stable between starts |
+| Q8_0 matvec with 2 or 4 rows per sub-group (activation loads shared across rows) | no faster than one row (21.6 / 21.6 / 22.6 us per call): the activation re-reads hit the cache | — |
+| Top-k with a row in one sub-group (values in registers, no work-group barriers; patch 13 pays one per selected value) | 2x slower at decode shapes (predictor 8.0 -> 16.9 us, router 6.9 -> 12.2 us); correct | never in this form: patch 13's top-k is 0.70 ms/token in total |
 | Grouped oneMKL `gemm_batch` for the prefill MoE | no faster than per-expert GEMMs; prefill unchanged | — |
 | Grouped XMX MUL_MAT_ID kernel (joint_matrix, one launch over all experts) | correct, +3% prefill at 40K; the kernel plateaus near 20 TFLOP/s | the kernel gets well past that |
 | Device-side routing for the prefill MoE | same +3%: the host round trips were not the bottleneck | — |
@@ -53,7 +56,7 @@ split (`tools/perf/decab.py`):
 
 | part | ms/token | what it is |
 |---|---:|---|
-| layer graphs on the GPU | ~26 | dense matvecs (Q8_0 in overlay v3: ~7.4), bf16 hyper-connection matvecs (~5.5, at bandwidth), GPU experts (IQ4_NL down ~1.5, Q2_0 gate/up ~1.3), attention, DeltaNet, ~5,000 small kernels |
+| layer graphs on the GPU | ~26 | dense matvecs (Q8_0 in overlay v3: ~7.4; ~6.4 with patch 18), bf16 hyper-connection matvecs (~5.5, at bandwidth), GPU experts (IQ4_NL down ~1.5, Q2_0 gate/up ~1.3), attention, DeltaNet, ~5,000 small kernels |
 | expert I/O | ~7.6 (7-13 between starts) | waiting for missed experts read from the NVMe (~4 misses/token; 51% of expert blocks fit in VRAM) |
 | host | ~6.5 | CPU-computed experts (~7/token), routing readback, promotions |
 
@@ -65,11 +68,9 @@ Effort: S = a kernel or a switch, M = a few days, L = a week or more.
 | Idea | Expected | Effort | Helps the preferred config | First step |
 |---|---|---|---|---|
 | Expert residency for overlay v3 | the largest decode lever: expert I/O and most of the host time | M-L | yes | frequency-weighted VRAM tier; misses/token at 20-100K first |
-| Find the start-to-start expert-read variance | up to ~13% decode on some starts; cleaner comparisons | M | yes | per start: io_uring depth reached, submit/complete CPUs vs NVMe interrupts, compressed extents on the model files |
-| Q8_0 dense matvec (~67% of bandwidth) | ~3-4% decode | S-M | yes | a wide-load kernel like `mmvw` |
+| Find the start-to-start expert-read variance | up to ~13% decode on some starts; cleaner comparisons | M | yes | identical reads still vary +-9% between starts; ruled out: filesystem compression, the I/O scheduler, drive temperature, CPU clock, page-cache state. Left: background discard, the drive's own state |
 | Prefill upload overlap on a dedicated copy engine | ~8-15% prefill | M | yes | route uploads to a separate copy engine; keep the graph's small copies off that queue |
 | hc mixer weights in q8_0 (bf16 matvecs are at bandwidth) | ~2-3 ms/token | M | yes | overlay + NLL |
-| Router top-k over a work-group; radix top-k for the predictor | ~0.5-1 ms/token each | S | yes | small kernels |
 | Prefill DeltaNet | a few % prefill | M | yes | per-kernel profile at 40K |
 | XMX grouped MoE kernel past 20 TFLOP/s | a few seconds per 40K prefill | L | yes | tile and SLM layout profile |
 | GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed vs v3 unknown | M | maybe | NLL through the decode path + decode speed vs v3 |
