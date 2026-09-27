@@ -1013,6 +1013,26 @@
   [
    "'the passwords do not match'",
    "'пароли не совпадают'"
+  ],
+  [
+   "<label><span class=\"lbl\">CPU cores <span class=\"tip\" data-tip=\"Which cores run the experts served from RAM. On a hybrid CPU (Intel 12th gen and later) the work is split evenly across the threads and every layer waits for the slowest one, so threads on the efficiency cores hold the performance cores back and add heat. P-cores only pins the server to the performance cores, one thread per core. A machine setting, saved for every tier and model; takes effect when the server is next started.\">",
+   "<label><span class=\"lbl\">Ядра CPU <span class=\"tip\" data-tip=\"На каких ядрах считаются эксперты из RAM. На гибридном CPU (Intel 12-го поколения и новее) работа делится между потоками поровну, и каждый слой ждёт самый медленный, поэтому потоки на энергоэффективных ядрах тормозят производительные и добавляют нагрев. «Только P-ядра» привязывает сервер к производительным ядрам, по потоку на ядро. Настройка машины, общая для всех ярусов и моделей; действует со следующего запуска сервера.\">"
+  ],
+  [
+   "<option value=\"all\">all cores</option><option value=\"pcores\">P-cores only</option>",
+   "<option value=\"all\">все ядра</option><option value=\"pcores\">только P-ядра</option>"
+  ],
+  [
+   "`P-cores only (${r.pcores.physical} cores, CPU ${r.pcores.cpus})` : 'P-cores only (no hybrid CPU)'",
+   "`только P-ядра (${r.pcores.physical} ядер, CPU ${r.pcores.cpus})` : 'только P-ядра (CPU не гибридный)'"
+  ],
+  [
+   "'P-cores only: takes effect when the server is next started' : 'all cores: takes effect when the server is next started'",
+   "'только P-ядра: со следующего запуска сервера' : 'все ядра: со следующего запуска сервера'"
+  ],
+  [
+   "st.cpu === 'pcores' ? 'P-cores only' : ''",
+   "st.cpu === 'pcores' ? 'только P-ядра' : ''"
   ]
  ],
  "messages": [

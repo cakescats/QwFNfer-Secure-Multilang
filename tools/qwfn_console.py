@@ -61,7 +61,7 @@ STATE = {"proc": None, "model": None, "settings": None, "started": 0.0, "log": o
 LOCK = threading.Lock()
 
 # ---- persistent config: model locations, custom tiers, tune results, the last served model
-CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0, "auth": {}}
+CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0, "auth": {}, "cpu_mode": "all"}
 def load_config():
     try:
         c = json.load(open(CONFIG_FILE))
@@ -269,6 +269,28 @@ def find_model(models, ref):
     return None
 
 # ---- hardware ----------------------------------------------------------------
+def p_cores():
+    """The performance cores of a hybrid CPU (Intel 12th gen and later), as the kernel lists
+    them in /sys/devices/cpu_core/cpus: {"cpus": "0-11", "logical": 12, "physical": 6}, or None
+    on a CPU without efficiency cores."""
+    try:
+        spec = open("/sys/devices/cpu_core/cpus").read().strip()
+        if not os.path.exists("/sys/devices/cpu_atom/cpus"): return None
+        cpus = []
+        for part in spec.split(","):
+            a, _, b = part.partition("-")
+            cpus += list(range(int(a), int(b or a) + 1))
+        cores = set()
+        for c in cpus:
+            try: cores.add(open(f"/sys/devices/system/cpu/cpu{c}/topology/core_id").read().strip())
+            except Exception: cores.add(str(c))
+        return {"cpus": spec, "logical": len(cpus), "physical": len(cores)}
+    except Exception:
+        return None
+
+def cpu_mode():
+    return "pcores" if CONFIG.get("cpu_mode") == "pcores" and p_cores() else "all"
+
 def hardware():
     hw = {"gpu": None, "vram_total_mb": 0, "vram_used_mb": 0, "desktop_gpu": False, "ram_total_gb": 0, "ram_available_gb": 0, "cpu_threads": os.cpu_count() or 1, "cpu": ""}
     try:
@@ -624,12 +646,18 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
         ck = custom.get("kv") if custom.get("kv") in KV_TYPES else "q4_0"; csh = custom.get("state_host") if custom.get("state_host") in STATE_HOST_OPTIONS else "none"
         chosen = build(p["ctx"], ck, csh, vision); chosen["kv_reason"] = "your saved tier"
         chosen.update({"ram": p["ram"], "threads": p["threads"], "batch": p["batch"]})
+    if cpu_mode() == "pcores":
+        chosen["threads"] = min(int(chosen["threads"]), p_cores()["physical"])
     if ctx_override:   # the advanced form's own context: size everything for it
         try: chosen = option(max(1024, int(ctx_override)), vision)
         except Exception: pass
     out = {
         "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "threads": chosen["threads"], "batch": chosen["batch"], "reserve": chosen["reserve"], "think": "xhigh", "think_budget": 6000,
         "skip_miss": False, "spec_block": True, "port": STATE["port"], "preset": preset,
+        # Hybrid CPUs: the expert matmuls split evenly across threads and every layer waits for
+        # the slowest, so threads on efficiency cores hold the performance cores back (and add
+        # heat). "pcores" pins the server to the P-cores, one thread per core.
+        "cpu": cpu_mode(), "pcores": p_cores(),
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
         "state_host": chosen["state_host"],
         # The draft head, on when the file is there: measured through OpenCode on a coding
@@ -692,6 +720,11 @@ def server_argv(model, s):
         fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f: f.write(server_key() + "\n")
         argv += ["--api-key-file", KEY_FILE]
+    pc = p_cores()
+    if s.get("cpu") == "pcores" and pc:
+        # pinned to the performance cores; a thread count above them would only oversubscribe
+        argv = ["taskset", "-c", pc["cpus"]] + argv
+        i = argv.index("--threads"); argv[i + 1] = str(min(int(argv[i + 1]), pc["logical"]))
     if s.get("skip_miss"): argv.append("--skip-miss")
     if s.get("spec_block", True): argv.append("--spec-block")
     if s.get("mtp"): argv += ["--mtp", model["mtp"]]
@@ -1404,10 +1437,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 CONFIG["locations"] = [x for x in CONFIG["locations"] if x != body["remove"]]; save_config()
             return self._json({"ok": True, "locations": model_locations(), "models": scan_models()})
         if self.path == "/api/config":
+            if body.get("cpu_mode") in ("all", "pcores"):
+                CONFIG["cpu_mode"] = body["cpu_mode"]; save_config()
             if "headroom_gb" in body:
                 try: CONFIG["headroom_gb"] = min(16.0, max(0.5, float(body["headroom_gb"]))); save_config()
                 except Exception: return self._json({"error": "headroom must be a number of GB"})
-            return self._json({"ok": True, "headroom_gb": headroom_gb()})
+            return self._json({"ok": True, "headroom_gb": headroom_gb(), "cpu_mode": cpu_mode()})
         if self.path == "/api/custom":
             name = str(body.get("model") or "")
             if not name: return self._json({"error": "which model?"})
