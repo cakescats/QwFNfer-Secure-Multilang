@@ -280,11 +280,17 @@ def p_cores():
         for part in spec.split(","):
             a, _, b = part.partition("-")
             cpus += list(range(int(a), int(b or a) + 1))
-        cores = set()
+        # one logical CPU per physical P-core (the first SMT sibling): the measured best was
+        # 6 threads on CPUs 0,2,4,6,8,10 -- the whole 0-11 lets two busy threads share a core
+        # while another core idles
+        first = []
+        seen = set()
         for c in cpus:
-            try: cores.add(open(f"/sys/devices/system/cpu/cpu{c}/topology/core_id").read().strip())
-            except Exception: cores.add(str(c))
-        return {"cpus": spec, "logical": len(cpus), "physical": len(cores)}
+            try: sib = open(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list").read().strip()
+            except Exception: sib = str(c)
+            if sib not in seen:
+                seen.add(sib); first.append(c)
+        return {"cpus": spec, "logical": len(cpus), "physical": len(first), "one_per_core": ",".join(map(str, first))}
     except Exception:
         return None
 
@@ -723,8 +729,8 @@ def server_argv(model, s):
     pc = p_cores()
     if s.get("cpu") == "pcores" and pc:
         # pinned to the performance cores; a thread count above them would only oversubscribe
-        argv = ["taskset", "-c", pc["cpus"]] + argv
-        i = argv.index("--threads"); argv[i + 1] = str(min(int(argv[i + 1]), pc["logical"]))
+        argv = ["taskset", "-c", pc["one_per_core"]] + argv
+        i = argv.index("--threads"); argv[i + 1] = str(min(int(argv[i + 1]), pc["physical"]))
     if s.get("skip_miss"): argv.append("--skip-miss")
     if s.get("spec_block", True): argv.append("--spec-block")
     if s.get("mtp"): argv += ["--mtp", model["mtp"]]

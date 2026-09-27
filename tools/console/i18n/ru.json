@@ -1023,8 +1023,8 @@
    "<option value=\"all\">все ядра</option><option value=\"pcores\">только P-ядра</option>"
   ],
   [
-   "`P-cores only (${r.pcores.physical} cores, CPU ${r.pcores.cpus})` : 'P-cores only (no hybrid CPU)'",
-   "`только P-ядра (${r.pcores.physical} ядер, CPU ${r.pcores.cpus})` : 'только P-ядра (CPU не гибридный)'"
+   "`P-cores only (${r.pcores.physical} cores, CPU ${r.pcores.one_per_core})` : 'P-cores only (no hybrid CPU)'",
+   "`только P-ядра (${r.pcores.physical} ядер, CPU ${r.pcores.one_per_core})` : 'только P-ядра (CPU не гибридный)'"
   ],
   [
    "'P-cores only: takes effect when the server is next started' : 'all cores: takes effect when the server is next started'",

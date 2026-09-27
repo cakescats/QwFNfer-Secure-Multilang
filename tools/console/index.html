@@ -349,7 +349,7 @@ function renderPlan() {
 function fillForm(r) {
   ['ctx','kv','ram','threads','batch','reserve','port','think','think_budget'].forEach(k => $(k).value = r[k]);
   if (r.headroom_gb !== undefined && document.activeElement !== $('headroom')) $('headroom').value = r.headroom_gb;
-  const pco = $('cpumode').options[1]; pco.disabled = !r.pcores; pco.textContent = r.pcores ? `P-cores only (${r.pcores.physical} cores, CPU ${r.pcores.cpus})` : 'P-cores only (no hybrid CPU)';
+  const pco = $('cpumode').options[1]; pco.disabled = !r.pcores; pco.textContent = r.pcores ? `P-cores only (${r.pcores.physical} cores, CPU ${r.pcores.one_per_core})` : 'P-cores only (no hybrid CPU)';
   $('cpumode').value = r.cpu || 'all';
   $('skip_miss').value = String(!!r.skip_miss); $('spec_block').value = String(r.spec_block !== false);
   const von = $('vision').options[0]; von.disabled = !r.mmproj; von.textContent = r.mmproj ? 'on' : 'unavailable (no mmproj file)';
