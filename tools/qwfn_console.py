@@ -61,7 +61,7 @@ STATE = {"proc": None, "model": None, "settings": None, "started": 0.0, "log": o
 LOCK = threading.Lock()
 
 # ---- persistent config: model locations, custom tiers, tune results, the last served model
-CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0, "auth": {}, "cpu_mode": "all"}
+CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0, "auth": {}, "cpu_mode": "all", "cpu_auto": True}
 def load_config():
     try:
         c = json.load(open(CONFIG_FILE))
@@ -296,6 +296,96 @@ def p_cores():
 
 def cpu_mode():
     return "pcores" if CONFIG.get("cpu_mode") == "pcores" and p_cores() else "all"
+
+def cpu_auto():
+    return bool(CONFIG.get("cpu_auto", True))
+
+def _cpulist(spec):
+    out = []
+    for part in (spec or "").strip().split(","):
+        if not part: continue
+        a, _, b = part.partition("-")
+        out += list(range(int(a), int(b or a) + 1))
+    return out
+
+def cpu_topology():
+    """Online CPUs, their SMT siblings and core types, from /sys: which are performance and
+    efficiency cores (hybrid Intel), and whether cores run two hardware threads (SMT)."""
+    try: online = _cpulist(open("/sys/devices/system/cpu/online").read())
+    except Exception: online = list(range(os.cpu_count() or 1))
+    def rd(p):
+        try: return open(p).read()
+        except Exception: return ""
+    pset = set(_cpulist(rd("/sys/devices/cpu_core/cpus"))); eset = set(_cpulist(rd("/sys/devices/cpu_atom/cpus")))
+    first, smt = [], False
+    for c in online:
+        sib = _cpulist(rd(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")) or [c]
+        if len(sib) > 1: smt = True
+        if c == min(sib): first.append(c)
+    hybrid = bool(pset) and bool(eset)
+    return {"all": online, "phys": first, "p": [c for c in online if c in pset], "p_phys": [c for c in first if c in pset],
+            "e": [c for c in online if c in eset], "hybrid": hybrid, "smt": smt}
+
+def cpu_candidates(topo=None):
+    """The core sets worth measuring on this CPU, the default first."""
+    t = topo or cpu_topology()
+    c = []
+    if t["hybrid"]:
+        c.append(("p_phys", "P-cores, one thread per core", t["p_phys"]))
+        if t["smt"]: c.append(("p_smt", "P-cores with SMT", t["p"]))
+        c.append(("phys", "all physical cores (P+E)", t["phys"]))
+        if t["smt"]: c.append(("all", "all logical CPUs", t["all"]))
+    else:
+        c.append(("phys", "physical cores", t["phys"]))
+        if t["smt"]: c.append(("all", "all logical CPUs (SMT)", t["all"]))
+    seen, out = set(), []
+    for cid, label, cpus in c:
+        if cpus and tuple(cpus) not in seen:
+            seen.add(tuple(cpus)); out.append({"id": cid, "label": label, "cpus": ",".join(map(str, cpus)), "n": len(cpus)})
+    return out
+
+def server_pid():
+    p = STATE.get("proc")
+    if p and p.poll() is None: return p.pid
+    for l in engines_running():
+        if "qwfn-server" in l: return int(l.split()[0])
+    return None
+
+def set_affinity(cpus):
+    """Move every thread of the running server onto `cpus` (a list): new threads inherit it."""
+    pid = server_pid()
+    if not pid: return False
+    ok = False
+    for tid in os.listdir(f"/proc/{pid}/task"):
+        try: os.sched_setaffinity(int(tid), set(cpus)); ok = True
+        except Exception: pass
+    return ok
+
+def cpu_temp():
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(h + "/name").read().strip() in ("coretemp", "k10temp"): return int(open(h + "/temp1_input").read()) / 1000
+        except Exception: pass
+    return None
+
+def throttle_count():
+    n = 0
+    for f in glob.glob("/sys/devices/system/cpu/cpu*/thermal_throttle/package_throttle_count"):
+        try: n += int(open(f).read())
+        except Exception: pass
+    return n
+
+def cpuset_for(model):
+    """The core set the server should be pinned to: the tune's measured choice when the auto
+    mode is on (or, before any tune, the P-cores of a hybrid CPU), else the manual setting."""
+    if cpu_auto():
+        t = (CONFIG["tune"].get(model["name"]) or {}).get("cpu") or {}
+        if t.get("set"): return t["set"], int(t.get("threads") or 0) or None
+        pc = p_cores()
+        return (pc["one_per_core"], pc["physical"]) if pc else (None, None)
+    if cpu_mode() == "pcores":
+        pc = p_cores(); return pc["one_per_core"], pc["physical"]
+    return None, None
 
 def hardware():
     hw = {"gpu": None, "vram_total_mb": 0, "vram_used_mb": 0, "desktop_gpu": False, "ram_total_gb": 0, "ram_available_gb": 0, "cpu_threads": os.cpu_count() or 1, "cpu": ""}
@@ -652,18 +742,20 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
         ck = custom.get("kv") if custom.get("kv") in KV_TYPES else "q4_0"; csh = custom.get("state_host") if custom.get("state_host") in STATE_HOST_OPTIONS else "none"
         chosen = build(p["ctx"], ck, csh, vision); chosen["kv_reason"] = "your saved tier"
         chosen.update({"ram": p["ram"], "threads": p["threads"], "batch": p["batch"]})
-    if cpu_mode() == "pcores":
-        chosen["threads"] = min(int(chosen["threads"]), p_cores()["physical"])
     if ctx_override:   # the advanced form's own context: size everything for it
         try: chosen = option(max(1024, int(ctx_override)), vision)
         except Exception: pass
+    cset, cthreads = cpuset_for(model)
+    if cset:
+        chosen["threads"] = cthreads or min(int(chosen["threads"]), len(_cpulist(cset)))
     out = {
         "ctx": chosen["ctx"], "kv": chosen["kv"], "ram": chosen["ram"], "threads": chosen["threads"], "batch": chosen["batch"], "reserve": chosen["reserve"], "think": "xhigh", "think_budget": 6000,
         "skip_miss": False, "spec_block": True, "port": STATE["port"], "preset": preset,
         # Hybrid CPUs: the expert matmuls split evenly across threads and every layer waits for
         # the slowest, so threads on efficiency cores hold the performance cores back (and add
         # heat). "pcores" pins the server to the P-cores, one thread per core.
-        "cpu": cpu_mode(), "pcores": p_cores(),
+        "cpu": "auto" if cpu_auto() else cpu_mode(), "cpu_auto": cpu_auto(), "pcores": p_cores(), "cpuset": cset,
+        "cpu_tuned": (CONFIG["tune"].get(model["name"]) or {}).get("cpu"),
         "vision": vision, "mmproj": model.get("mmproj"), "mmproj_gb": model.get("mmproj_gb", 0.0),
         "state_host": chosen["state_host"],
         # The draft head, on when the file is there: measured through OpenCode on a coding
@@ -727,10 +819,11 @@ def server_argv(model, s):
         with os.fdopen(fd, "w") as f: f.write(server_key() + "\n")
         argv += ["--api-key-file", KEY_FILE]
     pc = p_cores()
-    if s.get("cpu") == "pcores" and pc:
-        # pinned to the performance cores; a thread count above them would only oversubscribe
-        argv = ["taskset", "-c", pc["one_per_core"]] + argv
-        i = argv.index("--threads"); argv[i + 1] = str(min(int(argv[i + 1]), pc["physical"]))
+    cs = s.get("cpuset") or (pc["one_per_core"] if s.get("cpu") == "pcores" and pc else None) or (cpuset_for(model)[0] if s.get("cpu") == "auto" else None)
+    if cs:
+        # pinned to the chosen cores; a thread count above them would only oversubscribe
+        argv = ["taskset", "-c", cs] + argv
+        i = argv.index("--threads"); argv[i + 1] = str(min(int(argv[i + 1]), len(_cpulist(cs))))
     if s.get("skip_miss"): argv.append("--skip-miss")
     if s.get("spec_block", True): argv.append("--spec-block")
     if s.get("mtp"): argv += ["--mtp", model["mtp"]]
@@ -1120,7 +1213,51 @@ def run_tune(model, preset, settings_in):
         cands = thread_candidates(int(hw.get("cpu_cores") or 1), int(hw.get("cpu_threads") or 1))
         cores = int(hw.get("cpu_cores") or plan["threads"])
         sweep = {}
-        if len(cands) >= 2:
+        csets = cpu_candidates() if cpu_auto() else []
+        if len(csets) >= 2 and server_pid():
+            # Which cores, not only how many threads: P-cores against E-cores on a hybrid CPU,
+            # one thread per core against both SMT threads. Every server thread is moved onto the
+            # set live (sched_setaffinity), the thread count follows the set's size, two passes in
+            # opposite order on the document's context. A set other than the first (P-cores one
+            # per core on a hybrid CPU, the physical cores otherwise) is taken only when it beats
+            # it in every pass by over 3%, as for the thread count.
+            log("CPU core sweep on the %dK-token context: %s" % (doc["tokens"] // 1024, "; ".join("%s (%s)" % (c["label"], c["cpus"]) for c in csets)), 0.6)
+            conv = list(doc["conversation"]); order = csets + csets[::-1]; runs = {}
+            for i, c in enumerate(order):
+                check_cancel()
+                if not set_affinity(_cpulist(c["cpus"])): raise RuntimeError("cannot set the server's CPU affinity")
+                r = set_threads(c["n"])
+                if r.get("error"): raise RuntimeError(r["error"])
+                q = "Continue with two more sentences about what this document describes, without repeating yourself."
+                th0 = throttle_count(); temps = []
+                done = threading.Event()
+                def sample():
+                    while not done.is_set():
+                        t = cpu_temp()
+                        if t: temps.append(t)
+                        done.wait(1.0)
+                sampler = threading.Thread(target=sample, daemon=True); sampler.start()
+                res = chat_messages(port, conv + [{"role": "user", "content": q}], 96); t = res.get("timings") or {}
+                done.set(); sampler.join(2)
+                tps = float(t.get("predicted_per_second") or 0)
+                conv += [{"role": "user", "content": q}, {"role": "assistant", "content": (res["choices"][0]["message"].get("content") or "")}]
+                rec = runs.setdefault(c["id"], {"runs": [], "temps": [], "throttle": 0})
+                rec["runs"].append(tps); rec["temps"] += temps; rec["throttle"] += throttle_count() - th0
+                log("cores %s (%s), %d threads: %.1f tok/s%s%s" % (c["cpus"], c["label"], c["n"], tps, " · %.0f°C" % (sum(temps) / len(temps)) if temps else "", " (pass 2)" if i >= len(csets) else ""), 0.6 + 0.3 * (i + 1) / len(order))
+            table = []
+            for c in csets:
+                rec = runs[c["id"]]
+                table.append({**c, "tok_s": round(sum(rec["runs"]) / len(rec["runs"]), 2), "runs": [round(x, 1) for x in rec["runs"]],
+                              "temp_c": round(sum(rec["temps"]) / len(rec["temps"])) if rec["temps"] else None, "throttle": rec["throttle"]})
+            base = table[0]
+            better = [row for row in table[1:] if row["runs"] and min(row["runs"]) > base["tok_s"] * 1.03]
+            pick = max(better, key=lambda row: row["tok_s"]) if better else base
+            set_affinity(_cpulist(pick["cpus"])); set_threads(pick["n"])
+            result["cpu"] = {"set": pick["cpus"], "threads": pick["n"], "label": pick["label"], "id": pick["id"], "table": table}
+            result["threads"] = pick["n"]; plan["cpuset"] = pick["cpus"]
+            if pick is base: log("cores: %s (%s), %d threads, %.1f tok/s; no other set beat it in every pass by over 3%%" % (pick["cpus"], pick["label"], pick["n"], pick["tok_s"]), 0.92)
+            else: log("cores: %s (%s), %d threads, %.1f tok/s against %.1f on %s" % (pick["cpus"], pick["label"], pick["n"], pick["tok_s"], base["tok_s"], base["label"]), 0.92)
+        elif len(cands) >= 2:
             log("thread sweep on the %dK-token context" % (doc["tokens"] // 1024), 0.6)
             conv = list(doc["conversation"]); order = cands + cands[::-1]
             for i, n in enumerate(order):
@@ -1173,7 +1310,7 @@ def run_tune(model, preset, settings_in):
                 time.sleep(0.5)
             time.sleep(1.5)
             check_cancel()
-            r = start_server(model, {**plan, "threads": result["threads"]})
+            r = start_server(model, {**plan, "threads": result["threads"], "cpuset": (result.get("cpu") or {}).get("set") or plan.get("cpuset")})
             if r.get("error"): raise RuntimeError(r["error"])
             if r.get("note"): result["notes"].append(r["note"])
             st = wait_ready(log); port = st["port"]
@@ -1187,7 +1324,7 @@ def run_tune(model, preset, settings_in):
             log("with the %.1f GB tier: chat %.1f tok/s, %.1f GB free at the worst point" % ((built2 or {}).get("ram_tier_gb", new_ram), chat2["tok_s"], mem_watch["min"]))
         else:
             log("the RAM tier stays at %d GB: that is what the measured memory allows at %.1f GB of headroom" % (plan["ram"], headroom_gb()))
-        result["settings"] = {**result["plan"], "threads": result["threads"]}
+        result["settings"] = {**result["plan"], "threads": result["threads"], "cpuset": (result.get("cpu") or {}).get("set")}
         result["elapsed_s"] = round(time.time() - T["t0"])
         CONFIG["tune"][model["name"]] = result; save_config()
         T["result"] = result
@@ -1443,12 +1580,14 @@ class H(http.server.BaseHTTPRequestHandler):
                 CONFIG["locations"] = [x for x in CONFIG["locations"] if x != body["remove"]]; save_config()
             return self._json({"ok": True, "locations": model_locations(), "models": scan_models()})
         if self.path == "/api/config":
+            if "cpu_auto" in body:
+                CONFIG["cpu_auto"] = bool(body["cpu_auto"]); save_config()
             if body.get("cpu_mode") in ("all", "pcores"):
                 CONFIG["cpu_mode"] = body["cpu_mode"]; save_config()
             if "headroom_gb" in body:
                 try: CONFIG["headroom_gb"] = min(16.0, max(0.5, float(body["headroom_gb"]))); save_config()
                 except Exception: return self._json({"error": "headroom must be a number of GB"})
-            return self._json({"ok": True, "headroom_gb": headroom_gb(), "cpu_mode": cpu_mode()})
+            return self._json({"ok": True, "headroom_gb": headroom_gb(), "cpu_mode": cpu_mode(), "cpu_auto": cpu_auto()})
         if self.path == "/api/custom":
             name = str(body.get("model") or "")
             if not name: return self._json({"error": "which model?"})

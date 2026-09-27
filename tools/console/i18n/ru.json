@@ -1033,6 +1033,30 @@
   [
    "st.cpu === 'pcores' ? 'P-cores only' : ''",
    "st.cpu === 'pcores' ? 'только P-ядра' : ''"
+  ],
+  [
+   "<option value=\"auto\" hidden>chosen by the auto-tune</option>",
+   "<option value=\"auto\" hidden>выбирает автонастройка</option>"
+  ],
+  [
+   "<span class=\"lbl\">Pick CPU cores in the auto-tune <span class=\"tip\" data-tip=\"The auto-tune reads the CPU topology (performance and efficiency cores, two hardware threads per core or one) and measures every sensible core set on the running server: P-cores one thread per core, P-cores with SMT, all physical cores, all logical CPUs. It keeps the fastest, and a set other than the first only when it wins every pass by over 3%. Until the first tune a hybrid CPU runs on its P-cores. Off: the CPU cores choice above applies.\">",
+   "<span class=\"lbl\">Подбирать ядра CPU при автонастройке <span class=\"tip\" data-tip=\"Автонастройка определяет топологию CPU (производительные и энергоэффективные ядра, один или два аппаратных потока на ядро — гипертрединг) и замеряет на работающем сервере все разумные наборы ядер: P-ядра по потоку на ядро, P-ядра с гипертредингом, все физические ядра, все логические CPU. Оставляет самый быстрый, причём набор, отличный от первого, — только если он выигрывает в каждом проходе больше чем на 3%. До первой автонастройки гибридный CPU работает на P-ядрах. Выключено — действует выбор «Ядра CPU» выше.\">"
+  ],
+  [
+   "`auto-tune: CPU ${r.cpu_tuned.set} (${r.cpu_tuned.threads} threads)` : r.cpuset ? `auto-tune pending: CPU ${r.cpuset}` : 'auto-tune pending: all cores'",
+   "`автонастройка: CPU ${r.cpu_tuned.set} (${r.cpu_tuned.threads} потоков)` : r.cpuset ? `до автонастройки: CPU ${r.cpuset}` : 'до автонастройки: все ядра'"
+  ],
+  [
+   "'CPU cores: picked by the next auto-tune' : 'CPU cores: the manual choice applies from the next server start'",
+   "'ядра CPU подберёт следующая автонастройка' : 'ядра CPU: ручной выбор, со следующего запуска сервера'"
+  ],
+  [
+   "'core sets: '",
+   "'наборы ядер: '"
+  ],
+  [
+   "{ p_phys: 'P-cores', p_smt: 'P-cores + SMT', phys: 'physical cores', all: 'all logical CPUs' }",
+   "{ p_phys: 'P-ядра', p_smt: 'P-ядра + гипертрединг', phys: 'физические ядра', all: 'все логические CPU' }"
   ]
  ],
  "messages": [
