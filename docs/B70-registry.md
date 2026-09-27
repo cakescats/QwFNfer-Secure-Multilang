@@ -36,6 +36,8 @@ patch in detail in [`B70-SYCL.md`](B70-SYCL.md).
 | Rank-counting argsort (one barrier instead of bitonic stages) | +4% decode graph time | a top-k that reads each value once |
 | A larger locked RAM expert tier (`--ram 11` / `13` vs 8, preferred config) | 15% fewer expert misses but decode unchanged within the between-start I/O spread; 40K prefill 3.7% slower at 11, 7% at 13 | once expert-read speed is stable between starts |
 | Q8_0 matvec with 2 or 4 rows per sub-group (activation loads shared across rows) | no faster than one row (21.6 / 21.6 / 22.6 us per call): the activation re-reads hit the cache | — |
+| Hyper-connection mixers at Q8_0 (Unsloth's format for them) | quality unchanged, GPU time -1.8 ms/token, but host launch time +1.8 ms/token: each Q8_0 matvec adds an activation-quantize kernel, the SiLU fusion is lost, and some scales are too small to fold 1/hc exactly | after a Q8_0 matvec that reads f32 activations |
+| Split-K Q8_0 matvec for matrices with few rows | no faster than one sub-group per row | — |
 | Top-k with a row in one sub-group (values in registers, no work-group barriers; patch 13 pays one per selected value) | 2x slower at decode shapes (predictor 8.0 -> 16.9 us, router 6.9 -> 12.2 us); correct | never in this form: patch 13's top-k is 0.70 ms/token in total |
 | Grouped oneMKL `gemm_batch` for the prefill MoE | no faster than per-expert GEMMs; prefill unchanged | — |
 | Grouped XMX MUL_MAT_ID kernel (joint_matrix, one launch over all experts) | correct, +3% prefill at 40K; the kernel plateaus near 20 TFLOP/s | the kernel gets well past that |
@@ -70,7 +72,7 @@ Effort: S = a kernel or a switch, M = a few days, L = a week or more.
 | Expert residency for overlay v3 | the largest decode lever: expert I/O and most of the host time | M-L | yes | frequency-weighted VRAM tier; misses/token at 20-100K first |
 | Find the start-to-start expert-read variance | up to ~13% decode on some starts; cleaner comparisons | M | yes | identical reads still vary +-9% between starts; ruled out: filesystem compression, the I/O scheduler, drive temperature, CPU clock, page-cache state. Left: background discard, the drive's own state |
 | Prefill upload overlap on a dedicated copy engine | ~8-15% prefill | M | yes | route uploads to a separate copy engine; keep the graph's small copies off that queue |
-| hc mixer weights in q8_0 (bf16 matvecs are at bandwidth) | ~2-3 ms/token | M | yes | overlay + NLL |
+| One-token Q8_0 matvec on f32 activations (no q8_1 quantize kernel before each dense Q8_0 matvec; the decode graphs are launch-bound) | ~1 ms/token; makes Q8_0 hyper-connection mixers pay off | S-M | yes | patch 18's layout with f32 activation loads; SiLU/scale epilogue |
 | Prefill DeltaNet | a few % prefill | M | yes | per-kernel profile at 40K |
 | XMX grouped MoE kernel past 20 TFLOP/s | a few seconds per 40K prefill | L | yes | tile and SLM layout profile |
 | GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed vs v3 unknown | M | maybe | NLL through the decode path + decode speed vs v3 |
