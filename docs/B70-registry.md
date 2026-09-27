@@ -66,17 +66,23 @@ split (`tools/perf/decab.py`):
 
 ## Ideas -- not yet tried
 
-Ranked by expected gain for the preferred config per effort. When one is tried, move it to a table above.
-Effort: S = a kernel or a switch, M = a few days, L = a week or more.
+Ranked by expected gain for the preferred config (overlay v4, patches 01-21, `--vram 25`) per effort. Decode is now
+close to GPU-bound -- per layer graph ~310 us of host launch overlaps ~450 us of GPU work -- so GPU work, expert
+misses and expert I/O are what is left; launch-side savings no longer pay. When one is tried, move it to a table
+above. Effort: S = a kernel, a switch or one measurement session, M = a few days, L = a week or more.
 
 | Idea | Expected | Effort | Helps the preferred config | First step |
 |---|---|---|---|---|
-| Expert residency for overlay v3 | the largest decode lever: expert I/O and most of the host time | M-L | yes | frequency-weighted VRAM tier; misses/token at 20-100K first |
-| Find the start-to-start expert-read variance | up to ~13% decode on some starts; cleaner comparisons | M | yes | identical reads still vary +-9% between starts; ruled out: filesystem compression, the I/O scheduler, drive temperature, CPU clock, page-cache state. Left: background discard, the drive's own state |
+| A fresh decode-time budget on the current build | the map for the GPU-side ideas below (the one above predates patches 18-21) | S | yes | per-kernel device time and effective GB/s per kernel family |
+| Expert residency | the largest decode lever: ~2.2 misses/token cost expert I/O and most of the host time, more at long context | M-L | yes | misses per token at 20-100K; keep the most-used experts resident |
+| Find the start-to-start expert-read variance | identical reads vary +-9% between starts; cleaner comparisons | S | yes | background discard (TRIM) and the drive's host-memory buffer are left; ruled out: filesystem compression, the I/O scheduler, drive temperature, CPU clock, page-cache state |
 | Prefill upload overlap on a dedicated copy engine | ~8-15% prefill | M | yes | route uploads to a separate copy engine; keep the graph's small copies off that queue |
+| Expert matvec kernels (IQ4_NL down, Q2_0 gate/up) closer to bandwidth | ~0.5-1 ms/token | M | yes | effective GB/s of each in the new budget |
+| The remaining BF16 one-token matvecs | up to ~0.6 ms/token if the tensors can take Q8_0 | S-M | maybe | which tensors they are; the indexer projections are BF16 in Unsloth's quants too |
+| Deterministic greedy decode | reproducibility; cheaper quality comparisons (NLL varies ~0.04 between identical runs) | M | hygiene | find the op whose result varies between runs |
 | Prefill DeltaNet | a few % prefill | M | yes | per-kernel profile at 40K |
 | XMX grouped MoE kernel past 20 TFLOP/s | a few seconds per 40K prefill | L | yes | tile and SLM layout profile |
-| GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed vs v3 unknown | M | maybe | NLL through the decode path + decode speed vs v3 |
-| Deterministic greedy decode on v3 | reproducibility | M | hygiene | find the op whose result varies between runs |
-| One graph per token (instead of 48 per-layer graphs) | launch overhead | L | yes | needs the expert residency decided before the token |
-| Patch 17's local-memory table for MXFP4 / IQ4_XS | several-x faster kernels for those types; upstreamable | S-M | no (v3 uses neither) | port the lookup, bench against the CPU with a 64-matmul graph |
+| GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed vs v4 unknown | M | maybe | NLL through the decode path + decode speed vs v4 |
+| MTP draft head, re-check | unknown | L | yes | a verify step cost 2.1-2.4x a plain step before patches 18-21 |
+| One graph per token (instead of 48 per-layer graphs) | small now that decode is GPU-bound | L | small | only if the host is back on the critical path |
+| Patch 17's local-memory table for MXFP4 / IQ4_XS | several-x faster kernels for those types; upstreamable | S-M | no (v4 uses neither) | port the lookup, bench against the CPU with a 64-matmul graph |
