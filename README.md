@@ -12,8 +12,9 @@ and its OpenAI and Anthropic APIs) works as upstream documents it.
 Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsloth UD-Q3_K_XL, no switches):
 **15-16 tok/s warm chat and 222-248 tok/s prefill at 21K**. Now, with the validated run configuration below, at a
 110 W power cap: **29-31 tok/s short-prompt decode, 27 tok/s decode at 40K context, 430-450 tok/s prefill at
-20-40K, ~386 tok/s at 89K**. The [preferred config](#preferred-config) (overlay v4) spends some of that on quality:
-**23-26 tok/s short-prompt decode** at a natural-text NLL of 1.51, against 2.02 for the validated overlay.
+20-40K, ~386 tok/s at 89K**. The [preferred config](#preferred-config) (overlay v4) spends some of that on quality --
+natural-text NLL ~1.5 against 2.02 for the validated overlay -- and with patches 18-21 and `--vram 25` runs at
+**28-33 tok/s short-prompt decode, ~510 / ~600 / ~500-515 tok/s prefill at 20K / 40K / 89K**.
 
 | Change | Where | Measured effect |
 |---|---|---|
@@ -51,14 +52,19 @@ Same build, flags and launcher, a different head. Its IQ4_NL expert down runs th
 v4 is v3 with the hyper-connection mixers' up/down projections at Q8_0 -- the format Unsloth ships them in at every
 tier -- instead of the stock BF16: 0.6 GB less on the GPU, and with patch 21 running each down projection's scale and
 SiLU inside the Q8_0 matvec, decode layer graphs 0.62 ms/token faster than v3 (A-B-B-A); natural-text NLL unchanged.
-The table compares v2 and v3; v4 matches v3's quality and is slightly faster. On the hardware below:
+v4's smaller dense weights also leave room for a bigger expert tier: `--vram 25` (53% of the expert blocks in VRAM),
+checked at the limit -- an image plus a 126K-token document -- with nothing evicted and ~0.7 GB of VRAM still free
+([`docs/B70-config.md`](docs/B70-config.md)). On the hardware below (the v2/v3 columns are older builds; the v3-v4
+comparison on one build is the A-B-B-A above):
 
-| | v2 (validated config) | v3 (preferred) |
-|---|---|---|
-| decode, short prompt, current build (two runs each) | 23-30 tok/s | 23-26 tok/s |
-| prefill at 20K / 40K / 89K, one session before patches 16-17 | 514 / 522 / 416-431 tok/s | 454 / 482 / 401-408 tok/s |
-| expert blocks resident in VRAM | 67% | 51% |
-| 89K needle / 118K prompt, 8 notes recalled | correct / 7 of 8 | correct / 7 of 8 |
+| | v2 (validated config) | v3 | v4 (preferred) |
+|---|---|---|---|
+| build, `--vram` | patches 01-17, 24 | patches 01-17, 24 | patches 01-21, 25 |
+| decode, short prompt (several starts) | 23-30 tok/s | 23-26 tok/s | 28-33 tok/s |
+| prefill at 20K / 40K / 89K | 514 / 522 / 416-431 tok/s (before patches 16-17) | 454 / 482 / 401-408 tok/s (before patches 16-17) | 511 / 604 / 501-516 tok/s |
+| expert blocks resident in VRAM | 67% | 51% | 53% |
+| 89K needle / 118K prompt, 8 notes recalled | correct / 7 of 8 | correct / 7 of 8 | correct / not re-run |
+| image + 126K-token document | -- | -- | correct |
 
 Decode varies with the start as well: how fast missed experts come off the NVMe differs between server starts
 (7-13 ms per token on this drive), which moves decode by up to ~13%.
@@ -67,8 +73,10 @@ Decode varies with the start as well: how fast missed experts come off the NVMe 
 - expert down at IQ4_NL on the 43 layers v2 leaves at Q2_0 (+20.3 GB);
 - the attention, shared-expert gate/up and `ssm_out` tensors at Q8_0 instead of Q5_K/Q6_K (+3.0 GB).
 
-Expert gate/up stay Q2_0; v4 adds the hyper-connection mixers' up/down at Q8_0 (0.7 GB). Vision is the BF16 `mmproj`. That is 96 GB on disk, or 82 GB after pruning the
-14 GB of the stock first shard that v3 shadows (which also retires v1/v2).
+Expert gate/up stay Q2_0; v4 adds the hyper-connection mixers' up/down at Q8_0 (0.7 GB). Vision is the BF16 `mmproj`.
+That is 97 GB on disk. Pruning the stock first shard frees what the head shadows: 14 GB for v3 (v1/v2 heads stop
+working), 15.3 GB for v4 (the stock BF16 mixers too, so v1-v3 heads stop working). Keep the v3-level pruning while you
+may want to roll back to v3.
 
 Quality, as natural-text NLL over 1,024 tokens after an 8K prompt (lower is better):
 
@@ -77,12 +85,16 @@ Quality, as natural-text NLL over 1,024 tokens after an 8K prompt (lower is bett
 | the text through the decode path, token by token (the reference) | 2.02 | **1.51** |
 | prompt prefill, then the 1,024 tokens decoded | 2.00-2.03 | **1.46-1.49** |
 
+v4, same prefill-then-decode measure, 4 runs interleaved with v3 on one build: **1.44-1.47** (v3 1.46-1.50 in that
+session) -- no loss from the Q8_0 mixers.
+
 The two paths agree, which is what the prefill sparse-attention fix (in the table above) is for. Before that fix,
 prefill disagreed with decode and v2's prefill number came out near 1.5.
 
 ```sh
-scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v4
-# optional: drop the shadowed tensors from the stock first shard (v1/v2 heads stop working)
+scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v4     # v3 parts + hcq8.gguf (0.7 GB), head 00001-of-00008
+# optional: drop the shadowed tensors from the stock first shard -- against v4 this also drops the stock BF16 mixers,
+# so v1-v3 heads stop working; prune against <overlay dir>/v3 instead to keep a v3 rollback (14 GB instead of 15.3 GB)
 python3 tools/overlay/shard_prune.py <overlay dir>/v4 <GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf pruned.gguf \
   && mv pruned.gguf <GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
 
@@ -91,7 +103,9 @@ QWFN_B70_HEAD=<overlay dir>/v4/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00008.gg
   scripts/b70/qwfn-b70.sh --mmproj <GSQ-RCO dir>/mmproj-Qwen3.8-Flash-Next-BF16.gguf
 ```
 
-For the fastest decode, use v2 (below).
+`qwfn-b70.sh` sets `--vram 25`, sized for v4. The v2 and v3 heads carry more dense weight: append `--vram 24` (the
+server takes the last value of a repeated flag). Upgrading an existing v3 install: `build-overlay.sh ... v4` fetches
+only `hcq8.gguf` (the other parts are reused) and writes the new head; point `QWFN_B70_HEAD` at it.
 
 ## Validated run configuration
 
@@ -123,12 +137,12 @@ scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v2
 ```sh
 QWFN_B70_LLAMA=~/src/llama-b70 QWFN_B70_GSQ=<GSQ-RCO dir> \
 QWFN_B70_HEAD=<overlay dir>/v2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00006.gguf \
-  scripts/b70/qwfn-b70.sh --mmproj <GSQ-RCO dir>/mmproj-Qwen3.8-Flash-Next-BF16.gguf
+  scripts/b70/qwfn-b70.sh --mmproj <GSQ-RCO dir>/mmproj-Qwen3.8-Flash-Next-BF16.gguf --vram 24
 ```
 
 | Setting | Value |
 |---|---|
-| server flags | `--ctx 131072 --kv q8_0 --vram 25 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3` |
+| server flags | `--ctx 131072 --kv q8_0 --vram 25 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3` (`--vram 24` with the v2/v3 heads) |
 | backend | `QWFN_GGML_BACKENDS=<llama>/build-sycl/bin QWFN_REQUIRE_GPU=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1` |
 | tokenizer | `QWFN_VOCAB_MODEL=<GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` (needed with the overlay head) |
 | prefill | `GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0 QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1 GGML_SYCL_FUSE_IDX=1` |

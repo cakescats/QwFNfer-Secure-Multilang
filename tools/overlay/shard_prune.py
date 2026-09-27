@@ -4,7 +4,8 @@ across the head's parts wins). KV metadata is copied byte for byte except
 split.tensors.count, which drops by the number of tensors removed; kept tensors keep their order and alignment.
   tools/overlay/shard_prune.py OVERLAY_DIR SHARD OUT   writes OUT, then checks every kept tensor's bytes against SHARD.
 With the v3 overlay, 14 GB of the stock first shard is shadowed; replacing the shard with OUT frees it (v1/v2 heads
-then stop working: they read tensors OUT no longer has)."""
+then stop working: they read tensors OUT no longer has). With v4, 15.3 GB: the stock BF16 hyper-connection mixers too,
+so v1-v3 heads stop working; prune against v3 to keep a v3 rollback (v4 runs on either)."""
 import hashlib, os, struct, sys
 
 def rd_str(f): n, = struct.unpack("<Q", f.read(8)); return f.read(n)

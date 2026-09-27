@@ -1,7 +1,7 @@
 # The B70 configuration
 
 Details of `scripts/b70/qwfn-b70.sh` that the README does not carry: the engine defaults, why the flags have their
-values, and the benchmark tools. The configurations (preferred: overlay v3; validated: overlay v2), their switches
+values, and the benchmark tools. The configurations (preferred: overlay v4; validated: overlay v2), their switches
 and measured effects are in the README; the overlays
 are built by `scripts/b70/build-overlay.sh` ([`dense-overlay.md`](dense-overlay.md)); what was tried and rejected
 is [`B70-registry.md`](B70-registry.md).
