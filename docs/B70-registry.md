@@ -39,6 +39,7 @@ patch in detail in [`B70-SYCL.md`](B70-SYCL.md).
 | Hyper-connection mixers at Q8_0 (Unsloth's format for them) | quality unchanged, GPU time -1.8 ms/token, but host launch time +1.8 ms/token: each Q8_0 matvec adds an activation-quantize kernel, the SiLU fusion is lost, and some scales are too small to fold 1/hc exactly | after a Q8_0 matvec that reads f32 activations |
 | Split-K Q8_0 matvec for matrices with few rows | no faster than one sub-group per row | — |
 | One-token Q8_0 matvec on f32 activations (no quantize kernel; SiLU/scale epilogue) | launch time -33 us per layer graph, but GPU time +42 us (f32 converts and FMAs cost more than dp4a): +0.4 ms/token on the preferred config | produce q8_1 activations in the producing op instead |
+| q8_1 reuse alone (patch 19 without 20) | 108 fewer quantize launches per token but only ~-0.1 ms/token: the quantize kernel is cheap, the generic matmul routine around it is not (hence patch 20) | — |
 | Top-k with a row in one sub-group (values in registers, no work-group barriers; patch 13 pays one per selected value) | 2x slower at decode shapes (predictor 8.0 -> 16.9 us, router 6.9 -> 12.2 us); correct | never in this form: patch 13's top-k is 0.70 ms/token in total |
 | Grouped oneMKL `gemm_batch` for the prefill MoE | no faster than per-expert GEMMs; prefill unchanged | — |
 | Grouped XMX MUL_MAT_ID kernel (joint_matrix, one launch over all experts) | correct, +3% prefill at 40K; the kernel plateaus near 20 TFLOP/s | the kernel gets well past that |
@@ -59,7 +60,7 @@ split (`tools/perf/decab.py`):
 
 | part | ms/token | what it is |
 |---|---:|---|
-| layer graphs on the GPU | ~26 | dense matvecs (Q8_0 in overlay v3: ~7.4; ~6.4 with patch 18), bf16 hyper-connection matvecs (~5.5, at bandwidth), GPU experts (IQ4_NL down ~1.5, Q2_0 gate/up ~1.3), attention, DeltaNet, ~5,000 small kernels |
+| layer graphs on the GPU | ~26 | dense matvecs (Q8_0 in overlay v3: ~7.4; ~6.4 with patch 18; patches 19-20 then cut their host-side launch cost), bf16 hyper-connection matvecs (~5.5, at bandwidth), GPU experts (IQ4_NL down ~1.5, Q2_0 gate/up ~1.3), attention, DeltaNet, ~5,000 small kernels |
 | expert I/O | ~7.6 (7-13 between starts) | waiting for missed experts read from the NVMe (~4 misses/token; 51% of expert blocks fit in VRAM) |
 | host | ~6.5 | CPU-computed experts (~7/token), routing readback, promotions |
 
@@ -73,7 +74,6 @@ Effort: S = a kernel or a switch, M = a few days, L = a week or more.
 | Expert residency for overlay v3 | the largest decode lever: expert I/O and most of the host time | M-L | yes | frequency-weighted VRAM tier; misses/token at 20-100K first |
 | Find the start-to-start expert-read variance | up to ~13% decode on some starts; cleaner comparisons | M | yes | identical reads still vary +-9% between starts; ruled out: filesystem compression, the I/O scheduler, drive temperature, CPU clock, page-cache state. Left: background discard, the drive's own state |
 | Prefill upload overlap on a dedicated copy engine | ~8-15% prefill | M | yes | route uploads to a separate copy engine; keep the graph's small copies off that queue |
-| q8_1 activations written by the op that produces them (so the dp4a Q8_0 matvec needs no quantize kernel; the decode graphs are launch-bound) | ~1.6 ms/token of launch time; makes Q8_0 hyper-connection mixers pay off | M | yes | a fused 'write f32 + q8_1' variant of each producer |
 | Prefill DeltaNet | a few % prefill | M | yes | per-kernel profile at 40K |
 | XMX grouped MoE kernel past 20 TFLOP/s | a few seconds per 40K prefill | L | yes | tile and SLM layout profile |
 | GSQ-RCO IQ3_S (3.50 bpw) as a base model | quality/speed vs v3 unknown | M | maybe | NLL through the decode path + decode speed vs v3 |

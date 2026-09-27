@@ -22,6 +22,7 @@ export KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 Q
 export QWFN_Q2_SOA=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1                         # decode (patches 09-11)
 export QWFN_IQ4_SOA=1                                                                                # iq4_nl experts in VRAM as IQ4_NL_SOA (patch 17)
 export GGML_SYCL_Q8W=1                                                                               # one-token Q8_0 matvec, a block per lane (patch 18)
+export GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1                                                    # one-token Q8_0: q8_1 input reused, direct dispatch (patches 19-20)
 export GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1   # decode fusions (patches 12-15)
 exec "$HERE/build/qwfn-server" "$HEAD" \
     --ctx 131072 --kv q8_0 --vram 24 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3 \

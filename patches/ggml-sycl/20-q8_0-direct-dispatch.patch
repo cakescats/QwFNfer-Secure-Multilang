@@ -1,0 +1,97 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -3593,6 +3593,11 @@
+     peer_access_enabled = enable_peer_access;
+ }
+ 
++static bool ggml_sycl_q8_direct_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_Q8_DIRECT"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ static bool ggml_sycl_q8_reuse_on() {
+     static const bool on = [] { const char * e = getenv("GGML_SYCL_Q8_REUSE"); return e && atoi(e) != 0; }();
+     return on;
+@@ -5080,6 +5085,49 @@
+         ggml_sycl_mmvw(ctx, src0, src1, dst);
+         return;
+     }
++    // GGML_SYCL_Q8_DIRECT: one-token Q8_0 matvec without ggml_sycl_op_mul_mat's generic per-call machinery (device
++    // loop, pool allocations, per-column offsets): the reorder, the q8_1 input from patch 21's reuse cache (or one
++    // quantize into it, the call and layout the generic path uses), and the reorder MMVQ kernel. MUL_MAT only: never
++    // MUL_MAT_ID's stack copies.
++    if (!split && dst->op == GGML_OP_MUL_MAT && ggml_sycl_q8_direct_on() && src0->type == GGML_TYPE_Q8_0 &&
++        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
++        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[0] == src0->ne[0] && ggml_is_contiguous(src0) &&
++        ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
++        src1->buffer && !ggml_backend_buffer_is_host(src1->buffer) && dst->buffer && !ggml_backend_buffer_is_host(dst->buffer) &&
++        // exactly when the generic dispatcher below would pick the reordered MMVQ kernel for this shape
++        !g_ggml_sycl_prioritize_dmmv && should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type) &&
++        can_use_mul_mat_vec_q(src0, src1, dst)) {
++        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
++        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++        if (extra && extra->optimized_feature.reorder) {
++            ggml_sycl_set_device(ctx.device);
++            queue_ptr     stream = ctx.stream();
++            const int64_t ne10   = src1->ne[0];
++            const int64_t padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++            const size_t  bytes  = (size_t) padded * sizeof(block_q8_1) / QK8_1;
++            const bool reuse = ggml_sycl_q8_reuse_on();
++            if (!(reuse && ctx.q8r_src1 == src1 && ctx.q8r_data == src1->data && ctx.q8r_ne10 == ne10 && ctx.q8r_kind == 1)) {
++                if (ctx.q8r_cap < bytes) {
++                    if (ctx.q8r_buf) {
++                        stream->wait();   // the in-order queue may still read the old copy
++                        sycl::free(ctx.q8r_buf, *stream);
++                    }
++                    ctx.q8r_cap = std::max<size_t>(bytes, 128 * 1024);
++                    ctx.q8r_buf = (char *) sycl::malloc_device(ctx.q8r_cap, *stream);
++                }
++                quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) src1->data, ctx.q8r_buf, (int) ne10, 1,
++                                                                      (int) padded, stream);
++                if (reuse) {
++                    ctx.q8r_src1 = src1; ctx.q8r_data = src1->data; ctx.q8r_nbytes = ggml_nbytes(src1); ctx.q8r_ne10 = ne10; ctx.q8r_kind = 1;
++                } else {
++                    ctx.q8r_src1 = nullptr;   // the buffer now holds this src1's copy, but nothing may hit on it
++                }
++            }
++            ggml_sycl_q8_0_reorder_mmvq_direct(src0->data, ctx.q8r_buf, (float *) dst->data, (int) src0->ne[0],
++                                               (int) src0->ne[1], stream);
++            return;
++        }
++    }
+     // Small-K F32 matmul (K <= 32: stream means, MoE weighted sums): one work-item per output instead of oneMKL.
+     if (!split && dst->op == GGML_OP_MUL_MAT && ggml_sycl_smallk_enabled() && ggml_sycl_smallk_supported(src0, src1, dst)) {
+         ggml_sycl_smallk(ctx, src0, src1, dst);
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -3500,3 +3500,14 @@
+             return false;
+     }
+ }
++
++// GGML_SYCL_Q8_DIRECT (patch 22): the one-token reorder Q8_0 matvec for a caller that already holds the q8_1
++// activations (quantize_and_reorder_q8_1_soa) -- the kernel ggml_sycl_op_mul_mat_vec_q would pick for this shape.
++void ggml_sycl_q8_0_reorder_mmvq_direct(const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
++                                        dpct::queue_ptr stream) {
++    if (ggml_sycl_q8w_enabled()) {
++        reorder_mul_mat_vec_q8_0_q8_1_wide_sycl(vx, vy, dst, ncols, nrows, stream);
++    } else {
++        reorder_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream);
++    }
++}
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -73,6 +73,10 @@
+     int                stride_col_dst,       // floats between output columns in dst
+     dpct::queue_ptr    stream);
+ 
++// GGML_SYCL_Q8_DIRECT (patch 22): one-token reorder Q8_0 matvec on already-quantized q8_1 (reorder SoA) activations.
++void ggml_sycl_q8_0_reorder_mmvq_direct(const void * vx, const void * vy, float * dst, int ncols, int nrows,
++                                        dpct::queue_ptr stream);
++
+ #endif // GGML_SYCL_MMVQ_HPP
+ 
+ // Fused q2_0 MoE gate + up + SwiGLU at one token (GGML_SYCL_MOE_Q2W=1); see apply_moeglu.py.
