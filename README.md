@@ -12,7 +12,7 @@ and its OpenAI and Anthropic APIs) works as upstream documents it.
 Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsloth UD-Q3_K_XL, no switches):
 **15-16 tok/s warm chat and 222-248 tok/s prefill at 21K**. Now, with the validated run configuration below, at a
 110 W power cap: **29-31 tok/s short-prompt decode, 27 tok/s decode at 40K context, 430-450 tok/s prefill at
-20-40K, ~386 tok/s at 89K**. The [preferred config](#preferred-config) (overlay v3) spends some of that on quality:
+20-40K, ~386 tok/s at 89K**. The [preferred config](#preferred-config) (overlay v4) spends some of that on quality:
 **23-26 tok/s short-prompt decode** at a natural-text NLL of 1.51, against 2.02 for the validated overlay.
 
 | Change | Where | Measured effect |
@@ -26,6 +26,7 @@ Against the first B70 enablement (2026-09-15: stock llama.cpp SYCL backend, Unsl
 | small-kernel fusions: router top-k, hyper-connection mixer, ADD chains, MoE weighted sum, DeltaNet conv | patches 12-15 | decode layer graphs -8% (~300 fewer kernels per token), decode ~+5% |
 | IQ4_NL experts in an aligned layout, decoded through a local-memory table (overlay v3's expert down) | patch 17 + engine (`QWFN_IQ4_SOA`) | one-token IQ4_NL MoE matvec 2.75x; v3 decode graph -12% |
 | one-token Q8_0 matvec with a whole block per lane (16-byte loads of quants and activations) for the dense Q8_0 weights | patch 18 (`GGML_SYCL_Q8W`) | dense Q8_0 matvecs -13% (~405 -> ~467 GB/s), v3 decode graph -1.0 ms/token |
+| overlay v4's hyper-connection mixers at Q8_0, their down projection's scale and SiLU as the Q8_0 matvec's epilogue | overlay v4 + patch 21 (`GGML_SYCL_Q8_EPILOGUE`) | v4 vs v3: decode layer graphs -0.62 ms/token, dense weights -0.6 GB, NLL unchanged |
 | one-token Q8_0 matvecs without the generic matmul routine's per-call host work, and one q8_1 quantization per shared input (q/k/v, qkv/gate, shared-expert gate/up) | patches 19-20 (`GGML_SYCL_Q8_REUSE`, `GGML_SYCL_Q8_DIRECT`) | 108 fewer quantize launches per token, host launch time -20 us per layer graph, v3 decode graph -0.32 ms/token; bit-identical |
 | the prefill sparse-attention indexer's per-head score sum as one kernel | patch 16 (`GGML_SYCL_FUSE_IDX`) | attention -10% at 89K (78 -> 70 s), -1.8 s at 40K; bit-identical |
 | OpenMP pool stops spinning next to the launch thread | `KMP_BLOCKTIME=0` | decode +5% |
@@ -42,10 +43,15 @@ everything tried so far (adopted, rejected, and ideas not yet tried) in [`docs/B
 
 ## Preferred config
 
-**Overlay v3 with vision**: the heaviest overlay this card runs at a usable speed. It is the validated
+**Overlay v4 with vision**: the heaviest overlay this card runs at a usable speed. It is the validated
 configuration below with more bits where the stock quantization is thinnest: expert down and the dense tensors.
 Same build, flags and launcher, a different head. Its IQ4_NL expert down runs through patch 17's kernel
-(`QWFN_IQ4_SOA`), which cuts v3's GPU time per decode token by 12%. On the hardware below:
+(`QWFN_IQ4_SOA`), which cuts the GPU time per decode token by 12%.
+
+v4 is v3 with the hyper-connection mixers' up/down projections at Q8_0 -- the format Unsloth ships them in at every
+tier -- instead of the stock BF16: 0.6 GB less on the GPU, and with patch 21 running each down projection's scale and
+SiLU inside the Q8_0 matvec, decode layer graphs 0.62 ms/token faster than v3 (A-B-B-A); natural-text NLL unchanged.
+The table compares v2 and v3; v4 matches v3's quality and is slightly faster. On the hardware below:
 
 | | v2 (validated config) | v3 (preferred) |
 |---|---|---|
@@ -61,7 +67,7 @@ Decode varies with the start as well: how fast missed experts come off the NVMe 
 - expert down at IQ4_NL on the 43 layers v2 leaves at Q2_0 (+20.3 GB);
 - the attention, shared-expert gate/up and `ssm_out` tensors at Q8_0 instead of Q5_K/Q6_K (+3.0 GB).
 
-Expert gate/up stay Q2_0. Vision is the BF16 `mmproj`. That is 96 GB on disk, or 82 GB after pruning the
+Expert gate/up stay Q2_0; v4 adds the hyper-connection mixers' up/down at Q8_0 (0.7 GB). Vision is the BF16 `mmproj`. That is 96 GB on disk, or 82 GB after pruning the
 14 GB of the stock first shard that v3 shadows (which also retires v1/v2).
 
 Quality, as natural-text NLL over 1,024 tokens after an 8K prompt (lower is better):
@@ -75,13 +81,13 @@ The two paths agree, which is what the prefill sparse-attention fix (in the tabl
 prefill disagreed with decode and v2's prefill number came out near 1.5.
 
 ```sh
-scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v3
+scripts/b70/build-overlay.sh <GSQ-RCO dir> <overlay dir> v4
 # optional: drop the shadowed tensors from the stock first shard (v1/v2 heads stop working)
-python3 tools/overlay/shard_prune.py <overlay dir>/v3 <GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf pruned.gguf \
+python3 tools/overlay/shard_prune.py <overlay dir>/v4 <GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf pruned.gguf \
   && mv pruned.gguf <GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
 
 QWFN_B70_LLAMA=~/src/llama-b70 QWFN_B70_GSQ=<GSQ-RCO dir> \
-QWFN_B70_HEAD=<overlay dir>/v3/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00007.gguf \
+QWFN_B70_HEAD=<overlay dir>/v4/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00008.gguf \
   scripts/b70/qwfn-b70.sh --mmproj <GSQ-RCO dir>/mmproj-Qwen3.8-Flash-Next-BF16.gguf
 ```
 
@@ -102,7 +108,7 @@ Linux 7.1 with the xe driver, oneAPI 2026.0, oneDNN built for SYCL. GPU power ca
 | dense overlay v2 (+5.7 GB) | attention, shared-expert and `ssm_out` tensors at Q5_K/Q6_K/Q8_0, `token_embd` Q8_0, `output` Q6_K, expert down Q8_0 on layers 2, 4, 30, 46, 47, layer-2 expert gate/up IQ3_XXS: fetched by HTTP range from [Unsloth's](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-Q2_K_XL and UD-Q3_K_XL ([`docs/dense-overlay.md`](docs/dense-overlay.md)) |
 | vision (optional) | `mmproj-Qwen3.8-Flash-Next-BF16.gguf` |
 
-**Build.** llama.cpp `bbdd9f2` + `patches/ggml-sycl/01-20`, then the engine against it:
+**Build.** llama.cpp `bbdd9f2` + `patches/ggml-sycl/01-21`, then the engine against it:
 
 ```sh
 scripts/b70/build-llama-sycl.sh ~/src/llama-b70
@@ -122,16 +128,16 @@ QWFN_B70_HEAD=<overlay dir>/v2/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00006.gg
 
 | Setting | Value |
 |---|---|
-| server flags | `--ctx 131072 --kv q8_0 --vram 24 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3` |
+| server flags | `--ctx 131072 --kv q8_0 --vram 25 --ram 8 --batch 16384 --prefill-chunk 6144 --reserve 2048 --prefix-cache 3` |
 | backend | `QWFN_GGML_BACKENDS=<llama>/build-sycl/bin QWFN_REQUIRE_GPU=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1` |
 | tokenizer | `QWFN_VOCAB_MODEL=<GSQ-RCO dir>/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` (needed with the overlay head) |
 | prefill | `GGML_SYCL_FA_ONEDNN=1 GGML_SYCL_ENABLE_MKL_FA=0 QWFN_DEV_MASK=1 QWFN_QSA_PACK=1 QWFN_LOCK_HOST=1 GGML_SYCL_FUSE_IDX=1` |
 | fusions | `GGML_SYCL_FUSE_HC=1 GGML_SYCL_FUSE_HC_DECODE=1 GGML_SYCL_FUSE_HC_GATE=1 GGML_SYCL_FUSE_SPARSE_DECODE=1 GGML_SYCL_TOPK_WG=1 GGML_SYCL_FUSE_HC_MIX=1 GGML_SYCL_FUSE_ADDCHAIN=1 GGML_SYCL_FUSE_MOESUM=1 GGML_SYCL_FUSE_CONV=1` |
-| decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1 QWFN_IQ4_SOA=1 GGML_SYCL_Q8W=1 GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1` |
+| decode | `KMP_BLOCKTIME=0 GGML_SYCL_MMVW=1 GGML_SYCL_SMALLK=1 GGML_SYCL_MOE_Q2W=1 QWFN_PREDICT_CUR2=1 QWFN_Q2_SOA=1 QWFN_IQ4_SOA=1 GGML_SYCL_Q8W=1 GGML_SYCL_Q8_REUSE=1 GGML_SYCL_Q8_DIRECT=1 GGML_SYCL_Q8_EPILOGUE=1` |
 | host | memlock unlimited (`LimitMEMLOCK=infinity` under systemd) for `QWFN_LOCK_HOST`; a writable `$HOME` so the GPU compiler cache persists (the first request after a new build compiles the kernels) |
 | compute runtime | recommended: `NEOReadDebugKeys=1 EnableSharedSystemUsmSupport=0`. By default the runtime may route GPU copies from ordinary host memory through the kernel's shared virtual memory (xe SVM, device-private pages); a process killed in the middle of such a copy can leave the xe driver unable to unbind. Measured at no cost for this engine (interleaved starts, decode and prefill unchanged) |
 
-What not to turn on, and why (`--spec-block`, `--mtp`, `--batch 32768`, `--vram` above 24): see
+What not to turn on, and why (`--spec-block`, `--mtp`, `--batch 32768`, `--vram` above 25): see
 [`docs/B70-SYCL.md`](docs/B70-SYCL.md).
 
 ## Built around the Qwen4 architecture

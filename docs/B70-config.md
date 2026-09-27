@@ -19,8 +19,15 @@ restores), deferred speculative prefetch (`QWFN_PREFETCH_EARLY=1` restores).
 The flag set is in the README's run configuration. Why these values:
 
 - `--ctx 131072` is the per-session cap; the engine runs one sequence at a time.
-- `--vram 24` leaves the ~2 GB this host needs free after a long prompt; `--ram 8` plus the 3 GB prefix
-  cache plus ~4 GB for the system is what a 31 GB machine can give.
+- `--vram 25` with overlay v4 (0.6 GB less dense weight than v3): 53% of the expert blocks in VRAM (51% at 24).
+  Measured at the limit -- an image plus a 126K-token document at `--ctx 131072`, then the 89K needle -- with no
+  GPU memory evicted to system memory and ~0.7 GB still free at the lowest point (1.6 GB at `--vram 24`), on a host
+  where nothing else uses the card. On a desktop sharing the card, or with a bigger head, use 24.
+  `--ram 8` plus the 3 GB prefix cache plus ~4 GB for the system is what a 31 GB machine can give.
+- `--reserve 2048` is not memory held back: the engine only checks, while it sizes the expert tier, that tier plus
+  reserve could be allocated, and shrinks the tier until it can. With `--vram` capping the tier first it changes
+  nothing (2048, 1536 and 1024 give a byte-identical tier); the headroom that matters is what `--vram` leaves, above.
+  (Without the flag the engine's default is 768 MB plus 8 MB per 1K tokens of context beyond 48K, ~1.4 GB at 131K.)
 - `--prefix-cache 3`: host-memory checkpoints of conversations switched away from (~2 at 64K, one at 130K).
 
 ## Benchmarks

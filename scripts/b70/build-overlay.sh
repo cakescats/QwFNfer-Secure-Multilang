@@ -3,7 +3,7 @@
 # model is copied: an overlay is a metadata head with split.count raised, the replacement GGUFs (tensors fetched
 # from Unsloth's published quants by HTTP range), then the stock shards as symlinks. The engine keeps the first
 # tensor of a name across shards, so the replacements win.
-#   scripts/b70/build-overlay.sh GSQ_DIR OUT_DIR [v1|v2|v3]     (default v2; v3 is the preferred config, README)
+#   scripts/b70/build-overlay.sh GSQ_DIR OUT_DIR [v1|v2|v3|v4]  (default v2; v4 is the preferred config, README)
 # GSQ_DIR holds Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-0000{1,2}-of-00002.gguf; needs build/gguf-requant.
 # Run the server with QWFN_VOCAB_MODEL=GSQ_DIR/...-00001-of-00002.gguf (the tokenizer comes from the stock head).
 set -euo pipefail
@@ -23,7 +23,7 @@ fetch_v2() {
   [ -f "$OUT/q3kxl.gguf" ] || $FETCH UD-Q3_K_XL "$OUT/q3kxl.gguf" \
     '^token_embd\.weight$' '^output\.weight$' '^blk\.(2|4|30|46|47)\.ffn_down_exps\.weight$'
 }
-if [ "$VER" = v3 ]; then
+if [ "$VER" = v3 ] || [ "$VER" = v4 ]; then
   # v3: v2 plus, from UD-Q3_K_XL, expert down IQ4_NL on the 43 layers still at Q2_0, and the attention,
   # shared-expert gate/up and ssm_out tensors at Q8_0 (v1/v2 take them at Q5_K/Q6_K, so dense5u.gguf is not
   # used). Expert gate/up stay Q2_0; the hyper-connection mixers stay BF16.
@@ -34,6 +34,13 @@ if [ "$VER" = v3 ]; then
     'attn_qkv\.weight$' 'attn_gate\.weight$' 'attn_q\.weight$' 'attn_k\.weight$' 'attn_v\.weight$' \
     'attn_output\.weight$' 'ffn_gate_shexp\.weight$' 'ffn_up_shexp\.weight$' 'ssm_out\.weight$'
   parts=("$OUT/q3down.gguf" "$OUT/dense8.gguf" "$OUT/q2kxl.gguf" "$OUT/q3kxl.gguf")
+  if [ "$VER" = v4 ]; then
+    # v4: v3 plus the hyper-connection mixers' up/down at Q8_0 as Unsloth ships them at every tier (their inject
+    # weights, F32 there, stay at the stock BF16). Runs best with patch 21 (GGML_SYCL_Q8_EPILOGUE).
+    [ -f "$OUT/hcq8.gguf" ] || $FETCH UD-Q3_K_XL "$OUT/hcq8.gguf" \
+      '^blk\.[0-9]+\.hc_(attn|ffn)_(up|down)\.weight$' '^output_hc_(up|down)\.weight$'
+    parts=("$OUT/hcq8.gguf" "${parts[@]}")
+  fi
 else
   # v1: Unsloth's dense formats (Q5_K attention and shared-expert gate/up, Q6_K ssm_out) from UD-Q2_K_XL
   [ -f "$OUT/dense5u.gguf" ] || $FETCH UD-Q2_K_XL "$OUT/dense5u.gguf" \

@@ -32,11 +32,11 @@ patch in detail in [`B70-SYCL.md`](B70-SYCL.md).
 | `--batch 8192` / `4096` | prefill -19% / -24%; each halving doubles the passes over the expert set | only if VRAM is needed elsewhere |
 | `--batch 24576` | +3-5% prefill with v2, decode unaffected; not adopted yet | re-measure decode after a long prefill with v3 (51% VRAM coverage) |
 | Power cap below 140 W | 140 W -6%, 130 W -13-15% | — |
-| `--vram` above 24 | leaves under 2 GB of VRAM after a long document; the host needs ~1.5 GB free to stay clear of the driver's VRAM-to-RAM eviction | a card with more VRAM |
+| `--vram` above 25 (overlay v4) | 25 leaves ~0.7 GB free at a full context with an image and nothing evicted; 26 was below that already with v2 (1.8 GB free after init, under the engine's reserve check) | a card with more VRAM |
 | Rank-counting argsort (one barrier instead of bitonic stages) | +4% decode graph time | a top-k that reads each value once |
 | A larger locked RAM expert tier (`--ram 11` / `13` vs 8, preferred config) | 15% fewer expert misses but decode unchanged within the between-start I/O spread; 40K prefill 3.7% slower at 11, 7% at 13 | once expert-read speed is stable between starts |
 | Q8_0 matvec with 2 or 4 rows per sub-group (activation loads shared across rows) | no faster than one row (21.6 / 21.6 / 22.6 us per call): the activation re-reads hit the cache | — |
-| Hyper-connection mixers at Q8_0 (Unsloth's format for them) | quality unchanged, GPU time -1.8 ms/token, but host launch time +1.8 ms/token: each Q8_0 matvec adds an activation-quantize kernel, the SiLU fusion is lost, and some scales are too small to fold 1/hc exactly | after a Q8_0 matvec that reads f32 activations |
+| Hyper-connection mixers at Q8_0 without patch 21 | quality unchanged, GPU time -1.8 ms/token, but host launch time +1.8 ms/token (activation quantize, unfused SiLU, the scale not foldable exactly) | adopted with patch 21 (overlay v4) |
 | Split-K Q8_0 matvec for matrices with few rows | no faster than one sub-group per row | — |
 | One-token Q8_0 matvec on f32 activations (no quantize kernel; SiLU/scale epilogue) | launch time -33 us per layer graph, but GPU time +42 us (f32 converts and FMAs cost more than dp4a): +0.4 ms/token on the preferred config | produce q8_1 activations in the producing op instead |
 | q8_1 reuse alone (patch 19 without 20) | 108 fewer quantize launches per token but only ~-0.1 ms/token: the quantize kernel is cheap, the generic matmul routine around it is not (hence patch 20) | — |
