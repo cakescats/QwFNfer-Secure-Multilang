@@ -134,6 +134,28 @@ Open http://127.0.0.1:8090, pick the model and a tier (**Chat** 32K, **Agentic c
 
 The server listens on `http://127.0.0.1:8080`; the API key for clients is on the Access tab (the first visit asks you to create an account, see below).
 
+## As a service (autostart and control)
+
+The console can run as a systemd user service: it starts at boot, brings up the last served model and tier on its own (`--start`), is restarted if it fails, and stops the model server first when it is stopped. Adjust the repository path in the unit (`WorkingDirectory`, `ExecStart`).
+
+```bash
+cp scripts/qwfn-console.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now qwfn-console
+```
+
+To have it start at boot without logging in: `loginctl enable-linger $USER`.
+
+| | |
+|---|---|
+| Status | `systemctl --user status qwfn-console` |
+| Stop (the model server too) | `systemctl --user stop qwfn-console` |
+| Start | `systemctl --user start qwfn-console` |
+| Restart | `systemctl --user restart qwfn-console` |
+| Console log | `journalctl --user -u qwfn-console -f` |
+| Model server log | `tail -f ~/.cache/qwfn-console/server.log` |
+| No autostart | `systemctl --user disable qwfn-console` |
+
+Model, tier and flags are chosen in the web console; the service brings up whatever was served last.
+
 ## Sign-in, access and languages
 
 <p align="center"><img src="docs/img/console-login-en.png" width="45%" alt="Signing in to the console"> <img src="docs/img/console-access-en.png" width="53%" alt="The Access tab"></p>

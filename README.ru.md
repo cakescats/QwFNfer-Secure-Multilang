@@ -136,6 +136,28 @@ scripts/console.sh
 
 Сервер слушает `http://127.0.0.1:8080`; API-ключ для клиентов — на вкладке «Доступ» (при первом открытии консоль попросит создать учётную запись, см. ниже).
 
+## Служба (автозапуск и управление)
+
+Консоль можно держать службой systemd: она стартует при загрузке, сама поднимает последнюю запущенную модель с последним ярусом (`--start`), перезапускается при сбое и при остановке сначала гасит сервер модели. Путь к репозиторию в файле службы поправьте под себя (`WorkingDirectory` и `ExecStart`).
+
+```bash
+cp scripts/qwfn-console.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now qwfn-console
+```
+
+Чтобы служба стартовала при загрузке без входа в систему: `loginctl enable-linger $USER`.
+
+| | |
+|---|---|
+| Состояние | `systemctl --user status qwfn-console` |
+| Остановить (и сервер модели) | `systemctl --user stop qwfn-console` |
+| Запустить | `systemctl --user start qwfn-console` |
+| Перезапустить | `systemctl --user restart qwfn-console` |
+| Журнал консоли | `journalctl --user -u qwfn-console -f` |
+| Журнал сервера модели | `tail -f ~/.cache/qwfn-console/server.log` |
+| Отключить автозапуск | `systemctl --user disable qwfn-console` |
+
+Модель, ярус и флаги меняются в веб-консоли: служба при следующем старте поднимет то, что запускалось последним.
+
 ## Вход, доступ и языки
 
 <p align="center"><img src="docs/img/console-login-ru.png" width="45%" alt="Вход в консоль"> <img src="docs/img/console-access-ru.png" width="53%" alt="Вкладка «Доступ»"></p>

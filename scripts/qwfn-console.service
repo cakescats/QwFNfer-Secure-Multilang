@@ -1,0 +1,18 @@
+# qwfn console + model server. The console starts the last served model and tier (--start);
+# stopping the service stops the server first (SIGINT -> the console's own shutdown).
+[Unit]
+Description=qwfn console and model server (Qwen3.8-Flash-Next)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/QwFNfer
+ExecStart=/usr/bin/python3 %h/QwFNfer/tools/qwfn_console.py --start
+Environment=PYTHONUNBUFFERED=1
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
