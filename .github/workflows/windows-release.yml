@@ -1,0 +1,87 @@
+name: windows-release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. windows-v1); empty = build and test only, no release'
+        required: false
+        default: ''
+
+# Builds the Windows bundle exactly the way BUILD_WINDOWS.md documents:
+# pip CUDA redists (no admin), generated cublas import libs, pinned llama.cpp
+# with the CUDA backend, portable engine, package.ps1. Attaches the zip to the
+# release when a tag is given; otherwise the zip is kept as a workflow artifact.
+# Runs on whichever branch it is dispatched from.
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: write   # publish the release + upload the zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1   # dumpbin/lib/cl/ninja env (also needed by CMake+Ninja below)
+      - name: CUDA from pip wheels (no admin)
+        run: |
+          python -m pip install --extra-index-url https://pypi.ngc.nvidia.com nvidia-cuda-nvcc nvidia-cuda-runtime nvidia-cublas nvidia-cuda-cccl
+          python -c "from importlib.util import find_spec; print('CU13=' + find_spec('nvidia.cu13').submodule_search_locations[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Generate cublas import libs
+        shell: pwsh
+        run: |
+          $cu = $env:CU13
+          "CUDIR=$cu" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          foreach ($d in 'cublas64_13.dll','cublasLt64_13.dll') {
+            $base = $d -replace '\.dll$',''; $lib = ($base -replace '64_13$','') + '.lib'
+            $names = dumpbin /EXPORTS "$cu\bin\x86_64\$d" |
+              Select-String '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)' | ForEach-Object { $_.Matches.Groups[1].Value } |
+              Where-Object { $_ -notmatch '^(ordinal|hint|RVA|name|Summary)' } | Sort-Object -Unique
+            "LIBRARY $base`r`nEXPORTS`r`n" + ($names -join "`r`n") | Out-File -Encoding ascii "$env:RUNNER_TEMP\$base.def"
+            lib /DEF:"$env:RUNNER_TEMP\$base.def" /OUT:"$cu\lib\x64\$lib" /MACHINE:X64
+          }
+      - name: Build llama.cpp (pinned upstream, CUDA backend)
+        shell: pwsh
+        run: |
+          $cu = ($env:CUDIR -replace '\\','/')
+          # Upstream at a commit that knows the qwen4exp architecture (2026-09-25).
+          # Older pins (e.g. the Unsloth b10798 mix) fail every Flash-Next start
+          # with "unknown model architecture: 'qwen4exp'" in the vocab loader.
+          git init $env:RUNNER_TEMP\llama.cpp
+          git -C $env:RUNNER_TEMP\llama.cpp remote add origin https://github.com/ggerganov/llama.cpp
+          git -C $env:RUNNER_TEMP\llama.cpp fetch --depth 1 origin e85e15cf6d810cd1268498c2e5b657bb3ece47bc
+          git -C $env:RUNNER_TEMP\llama.cpp checkout FETCH_HEAD
+          cmake -S $env:RUNNER_TEMP\llama.cpp -B $env:RUNNER_TEMP\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CUDA=ON `
+            "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" "-DCMAKE_CUDA_COMPILER=$cu/bin/nvcc.exe" "-DCUDAToolkit_ROOT=$cu" `
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build $env:RUNNER_TEMP\llama.cpp\build --target ggml-base ggml ggml-cpu ggml-cuda llama
+          "GGML_LIBS=$env:RUNNER_TEMP\llama.cpp\build\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Package bundle
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -LlamaCppRoot "$env:RUNNER_TEMP\llama.cpp" -GgmlLibs $env:GGML_LIBS -CudaLibs "$env:CUDIR\bin\x86_64"
+      - name: Smoke test (engine loads, usage prints)
+        shell: pwsh
+        run: |
+          $env:QWFN_ZIP = "$pwd\dist\qwfnfer-windows-x86_64-cuda.zip"
+          $env:QWFN_HOME = "$env:RUNNER_TEMP\qwfnfer"; $env:QWFN_BIN = "$env:RUNNER_TEMP\qbin"
+          powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwfnfer-windows-x86_64-cuda
+          path: dist/qwfnfer-windows-x86_64-cuda.zip
+      - name: Publish release
+        if: ${{ inputs.tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Windows port prerelease — see SETUP.md to install, BUILD_WINDOWS.md to build.
+            Portable bundle (`/arch:AVX2`, CUDA 13 runtime + ggml backends beside the binaries).
+            Requires 16 GB NVIDIA GPU, driver 580+, ~30 GB RAM, NVMe. Auto-tune measures your machine on first run.
+          files: dist/qwfnfer-windows-x86_64-cuda.zip

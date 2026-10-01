@@ -13,7 +13,7 @@ app and the same list of sessions, and each session chooses.
     python3 tools/qwfn_router.py --print-settings   the settings to merge into ~/.claude/settings.json
     python3 tools/qwfn_router.py --configure        merge them (a backup of the file is kept)
     python3 tools/qwfn_router.py --unconfigure      take them out again
-    python3 tools/qwfn_router.py --install-service  a systemd user service, so the router is always up
+    python3 tools/qwfn_router.py --install-service  always up (systemd user service on Linux, scheduled task on Windows)
     python3 tools/qwfn_router.py --uninstall-service
 
     --port N            listen port (8089)
@@ -185,6 +185,23 @@ def unit_path():
     return os.path.expanduser("~/.config/systemd/user/qwfn-router.service")
 
 def install_service(args):
+    if os.name == "nt":
+        # No systemd/systemctl on Windows: register the same always-up router
+        # as a scheduled task (runs at logon, hidden, restarts on failure).
+        here = os.path.abspath(__file__)
+        task = "qwfn-router"
+        cmd = [
+            "schtasks", "/Create", "/TN", task, "/F",
+            "/TR", '"%s" "%s" --port %d --server "%s" --upstream "%s"' % (
+                sys.executable, here, args.port, args.server, args.upstream),
+            "/SC", "ONLOGON", "/RL", "LIMITED",
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            print("schtasks: " + ((r.stderr or r.stdout) or "failed").strip() + "\n"
+                  "run this instead, once, in an elevated prompt:\n  " + " ".join(cmd)); sys.exit(1)
+        print("installed %s (log on to start it; schtasks /Query /TN %s to check, --uninstall-service removes it)" % (task, task))
+        return
     here = os.path.abspath(__file__)
     unit = "\n".join([
         "[Unit]", "Description=qwfn-router: one Claude Code base URL for Anthropic and the local model", "After=network.target", "",
@@ -201,6 +218,14 @@ def install_service(args):
     print("installed and started %s (systemctl --user status qwfn-router)" % unit_path())
 
 def uninstall_service():
+    if os.name == "nt":
+        q = subprocess.run(["schtasks", "/Query", "/TN", "qwfn-router"], capture_output=True)
+        if q.returncode:
+            print("no scheduled task installed")
+            return
+        r = subprocess.run(["schtasks", "/Delete", "/TN", "qwfn-router", "/F"], capture_output=True, text=True)
+        print("removed qwfn-router" if not r.returncode else "could not remove it: " + ((r.stderr or r.stdout) or "").strip())
+        return
     subprocess.run(["systemctl", "--user", "disable", "--now", "qwfn-router.service"], capture_output=True)
     try: os.remove(unit_path()); print("removed", unit_path())
     except FileNotFoundError: print("no service installed")

@@ -49,6 +49,18 @@ This fork is upstream `v0.2.3` (`f955dbf`) plus the changes below. Every perform
 
 **Proposed upstream:** [#13](https://github.com/Apolog1ze-Dev/QwFNfer/pull/13) pins llama.cpp by commit, [#14](https://github.com/Apolog1ze-Dev/QwFNfer/pull/14) carries the I/O fixes.
 
+## Platforms: Linux, Windows, Intel Arc
+
+This fork merges two community ports of QwFNfer:
+
+| Platform | GPU | Status | How to build and run |
+|---|---|---|---|
+| **Linux** | NVIDIA (CUDA) | the reference: every measurement in this README | [Quick start](#quick-start) |
+| **Windows 10/11** | NVIDIA (CUDA) | from [Rafiekuntest/QwFNfer](https://github.com/Rafiekuntest/QwFNfer): MSVC build, PowerShell installer and bundle, Windows console paths. The engine's file I/O is this fork's platform layer (`src/qwfn_plat_win32.cpp`, thread pool or I/O completion port). **Not yet run on Windows in this merged form** | [SETUP.md](SETUP.md), [BUILD_WINDOWS.md](BUILD_WINDOWS.md); CI: the `windows-release` workflow builds and smoke-tests the bundle |
+| **Linux** | Intel Arc (SYCL), tuned for the Arc Pro B70 | from [ccabrerah/QwFNfer-xpu](https://github.com/ccabrerah/QwFNfer-xpu): the ggml-sycl patch series, the B70 launcher and configuration, prefix cache in RAM, locked host memory. Needs llama.cpp built with the patches; the SOA weight layouts switch on only then | [docs/INTEL-ARC.md](docs/INTEL-ARC.md) |
+
+The Intel fork's engine fixes (stall-probe deadlock, failed-generation reset, QSA prefill selection, direct-I/O alignment) and its prefix cache apply to every platform.
+
 ## Measurements
 
 i9-12900H · RTX 3080 Ti Laptop 16 GB · 30.5 GB RAM · NVMe at 6.2 GB/s · UD-Q4_K_XL. Upstream against this fork, 128 greedy tokens, 3 interleaved runs each:

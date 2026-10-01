@@ -52,9 +52,24 @@ def hf_hubs():
 HF_HUBS = hf_hubs()
 HF = HF_HUBS[0]          # the one the page names; the others are scanned too when they exist
 # The engine: bin/ in the release bundle, build/ in a source checkout, or QWFN_SERVER.
-SERVER_BIN = os.environ.get("QWFN_SERVER") or next((p for p in (os.path.join(ROOT, "bin", "qwfn-server"), os.path.join(ROOT, "build", "qwfn-server")) if os.path.exists(p)), os.path.join(ROOT, "build", "qwfn-server"))
-LOG_DIR = _expand(os.environ.get("QWFN_CONSOLE_DIR") or os.path.join(os.path.expanduser("~/.cache"), "qwfn-console"))
-os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+# On Windows the binaries are qwfn-server.exe (bundle: bin\, checkout: build\Release\).
+def _find_server():
+    if os.environ.get("QWFN_SERVER"): return os.environ["QWFN_SERVER"]
+    cands = [os.path.join(ROOT, "bin", "qwfn-server"), os.path.join(ROOT, "build", "qwfn-server")]
+    if os.name == "nt":
+        cands = ([c + ".exe" for c in cands]
+                 + [os.path.join(ROOT, "build", "Release", "qwfn-server.exe")])
+    for p in cands:
+        if os.path.exists(p): return p
+    return cands[0]
+SERVER_BIN = _find_server()
+def _log_dir():
+    if os.environ.get("QWFN_CONSOLE_DIR"): return _expand(os.environ["QWFN_CONSOLE_DIR"])
+    if os.name == "nt":
+        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "qwfn-console")
+    return os.path.join(os.path.expanduser("~/.cache"), "qwfn-console")
+LOG_DIR = _log_dir()
+os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)   # the mode is ignored on Windows, where the profile folder is private already
 CONFIG_FILE = os.path.join(LOG_DIR, "config.json")
 
 STATE = {"proc": None, "model": None, "settings": None, "started": 0.0, "log": os.path.join(LOG_DIR, "server.log"), "port": 8080, "ext_model": None}
@@ -119,6 +134,111 @@ def shard_stem(base):
     return b
 
 _ARCH_CACHE = {}
+_GGUF_GEOM_CACHE = {}
+
+def _gguf_rd_str(f):
+    n, = struct.unpack("<Q", f.read(8)); return f.read(n).decode("utf-8", "replace")
+
+def _gguf_skip_val(f, t):
+    # Value bytes by GGUF type id (7 is bool). Strings and arrays are walked
+    # (arrays element by element; big tokenizer arrays are seeks, not reads).
+    if t in (0, 1, 7): f.read(1)
+    elif t in (2, 3): f.read(2)
+    elif t in (4, 5, 6): f.read(4)
+    elif t in (10, 11, 12): f.read(8)
+    elif t == 8: _gguf_rd_str(f)
+    elif t == 9:
+        et, = struct.unpack("<I", f.read(4)); n, = struct.unpack("<Q", f.read(8))
+        if et == 8:
+            for _ in range(n):
+                ln, = struct.unpack("<Q", f.read(8)); f.seek(ln, 1)
+        else:
+            f.seek({0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}[et] * n, 1)
+    else: raise ValueError("unknown GGUF type %r" % (t,))
+
+def _gguf_rd_int(f, t):
+    w = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 10: 8, 11: 8}.get(t)
+    if w is None: _gguf_skip_val(f, t); return None
+    return int.from_bytes(f.read(w), "little", signed=t in (1, 3, 5, 11))
+
+def gguf_geom(shard_paths):
+    """Per-checkpoint geometry from the GGUF headers (weights never read): the
+    routed-expert block size, the GPU dense core, layer/expert counts, trained
+    context and KV dims. Lets the planner size tiers for any qwen4exp
+    checkpoint, not just the 125B one the fitted tables describe. Tensor bytes
+    come from offset differences (exact, no quant-type table needed). None when
+    anything is unreadable -- callers fall back to the tables."""
+    try:
+        key = tuple((p, s.st_mtime, s.st_size) for p, s in ((p, os.stat(p)) for p in shard_paths))
+        if key in _GGUF_GEOM_CACHE: return _GGUF_GEOM_CACHE[key]
+        g = _walk_gguf([p for p, _, _ in key])
+        _GGUF_GEOM_CACHE[key] = g
+        return g
+    except Exception:
+        return None
+
+def _walk_gguf(paths):
+    meta, shards = {}, []
+    for p in paths:
+        with open(p, "rb") as f:
+            if f.read(4) != b"GGUF": raise ValueError("magic")
+            ver, = struct.unpack("<I", f.read(4))
+            if ver < 2: raise ValueError("version")
+            n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+            for _ in range(n_kv):
+                k = _gguf_rd_str(f); t, = struct.unpack("<I", f.read(4))
+                v = _gguf_rd_int(f, t)
+                if v is not None: meta[k] = v
+            infos = []
+            for _ in range(n_tensors):
+                name = _gguf_rd_str(f); nd, = struct.unpack("<I", f.read(4))
+                f.seek(8 * nd + 4, 1); off, = struct.unpack("<Q", f.read(8))
+                infos.append((name, off))
+            data_start = (f.tell() + 31) & ~31
+            f.seek(0, 2); size = f.tell()
+            shards.append((infos, data_start, size))
+    arch = None
+    for p in paths:
+        a = gguf_arch(p)
+        if a: arch = a; break
+    if arch != ARCH: raise ValueError("arch " + str(arch))
+    A = arch + "."
+    def I(k):
+        v = meta.get(A + k)
+        return v if isinstance(v, int) else 0
+    n_layer, n_expert, n_used = I("block_count"), I("expert_count"), I("expert_used_count")
+    if not (n_layer and n_expert and n_used): raise ValueError("dims")
+    interval = I("full_attention_interval")
+    # Tensor bytes per shard from offset differences (exact for every quant).
+    names = {}  # name -> nbytes (first shard wins; tensors live in exactly one)
+    for infos, data_start, size in shards:
+        ordered = sorted(infos, key=lambda t: t[1])
+        for i, (name, off) in enumerate(ordered):
+            end = ordered[i + 1][1] if i + 1 < len(ordered) else size - data_start
+            nbytes = end - off
+            if nbytes <= 0 or name in names: continue
+            names[name] = nbytes
+    def is_expert(n): return "_exps.weight" in n   # mirrors weights::declare_dense_core
+    experts = sum(b for n, b in names.items() if is_expert(n))
+    ple = names.get("per_layer_token_embd.weight", 0)
+    tok = names.get("token_embd.weight", 0)
+    total = sum(names.values())
+    # Layer-0 expert block = gate+up+down slices; each expert tensor holds
+    # n_expert equal slices, so one slice is 1/n_expert of the tensor.
+    block = 0
+    for part in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"):
+        b = names.get("blk.0." + part)
+        if not b: raise ValueError("expert tensors")
+        block += b / n_expert
+    dense_gpu = total - experts - ple - tok   # what the engine keeps on the device (token_embd is host-mapped)
+    if dense_gpu <= 0: raise ValueError("dense")
+    n_attn = (n_layer // interval) if interval else 0
+    return {"block_mb": block / 1e6, "core_gb": dense_gpu / 1e9,
+            "n_layer": n_layer, "n_expert": n_expert, "n_expert_used": n_used,
+            "n_ctx_train": I("context_length") or 262144, "n_embd": I("embedding_length"),
+            "n_attn": n_attn, "n_head_kv": I("attention.head_count_kv") or 2,
+            "kv_head_dim": (I("attention.key_length") or 256) + (I("attention.value_length") or 256)}
+
 def gguf_arch(path):
     """general.architecture from the GGUF header (the first keys), None if unreadable."""
     try:
@@ -231,7 +351,9 @@ def scan_models(skipped=None):
             d = os.path.dirname(f); stem = shard_stem(base)
             arch = gguf_arch(f)
             if arch is not None and arch != ARCH:
-                skip(f, f"a {arch} GGUF; this engine runs {ARCH} (Qwen3.8-Flash-Next)"); continue
+                skip(f, f"a {arch} GGUF; this engine serves only the MoE graph {ARCH} (Qwen3.8-Flash-Next). "
+                        "Dense checkpoints such as Qwen3.8-27B (qwen35) are a different, dense graph with no experts "
+                        "to cache -- run those in llama.cpp or Ollama"); continue
             if arch is None and "Qwen3.8-Flash-Next" not in f:
                 skip(f, "the GGUF header could not be read and the name is not Qwen3.8-Flash-Next" if os.path.exists(real)
                         else "a broken symlink: the blob it points at is missing (re-run the hf download)"); continue
@@ -253,8 +375,10 @@ def scan_models(skipped=None):
             mm = find_mmproj(d); mtp = find_mtp(d)
             if mm and not os.path.exists(mm): mm = None
             if mtp and not os.path.exists(mtp): mtp = None
+            shard_files = sorted(shards)
             out.append({"id": len(out), "name": name, "path": f, "dir": d, "location": loc["path"], "repo": repo_label(f, loc),
-                        "size_gb": round(total / 1e9, 1), "shards": len(shards), "probe_file": probe_file, "quant": key or name, "known_quant": bool(key),
+                        "size_gb": round(total / 1e9, 1), "shards": len(shards), "shard_files": shard_files, "probe_file": probe_file, "quant": key or name, "known_quant": bool(key),
+                        "geom": gguf_geom(shard_files),
                         "mmproj": mm, "mmproj_gb": round(os.stat(mm).st_size / 1e9, 2) if mm else 0.0,
                         "mtp": mtp, "mtp_gb": round(os.stat(mtp).st_size / 1e9, 2) if mtp else 0.0})
     return out
@@ -401,6 +525,44 @@ def hardware():
         hw["qwfn_vram_mb"] = sum(int(float(l.split(",")[1])) for l in apps.splitlines() if "qwfn" in l and "," in l)
     except Exception:
         pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            class MS(ctypes.Structure): _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                hw["ram_total_gb"] = round(ms.ullTotalPhys / (1 << 30), 1)
+                hw["ram_available_gb"] = round(ms.ullAvailPhys / (1 << 30), 1)
+        except Exception:
+            pass
+        try:
+            cpu = subprocess.run(["wmic", "cpu", "get", "name", "/value"], capture_output=True, text=True, timeout=5).stdout
+            for line in cpu.splitlines():
+                if line.strip().upper().startswith("NAME="): hw["cpu"] = line.split("=", 1)[1].strip(); break
+        except Exception:
+            pass
+        if not hw["cpu"]:
+            # wmic is deprecated/removed on newer Windows; fall back to the
+            # registry-style identifier every Windows machine has.
+            try:
+                import platform
+                hw["cpu"] = platform.processor() or platform.machine()
+            except Exception:
+                pass
+            if not hw["cpu"]:
+                hw["cpu"] = os.environ.get("PROCESSOR_IDENTIFIER", "").strip()
+        try:
+            cores = subprocess.run(["wmic", "cpu", "get", "NumberOfCores", "/value"], capture_output=True, text=True, timeout=5).stdout
+            n = 0
+            for line in cores.splitlines():
+                if "NUMBEROFCORES" in line.upper():
+                    try: n += int(line.split("=", 1)[1].strip())
+                    except Exception: pass
+            hw["cpu_cores"] = n or hw["cpu_threads"]
+        except Exception:
+            hw["cpu_cores"] = hw["cpu_threads"]
+        hw["smt"] = hw["cpu_threads"] > hw["cpu_cores"]
+        return hw
     try:
         mi = {}
         for line in open("/proc/meminfo"):
@@ -427,6 +589,16 @@ def hardware():
     return hw
 
 def mem_available_gb():
+    if os.name == "nt":
+        try:
+            import ctypes
+            class MS(ctypes.Structure): _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS(); ms.dwLength = ctypes.sizeof(MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return ms.ullAvailPhys / (1 << 30)
+        except Exception:
+            pass
+        return 0.0
     try:
         for line in open("/proc/meminfo"):
             if line.startswith("MemAvailable:"): return int(line.split()[1]) / 1048576
@@ -435,6 +607,19 @@ def mem_available_gb():
     return 0.0
 
 def drive_info(path):
+    if os.name == "nt":
+        # No /proc/self/mountinfo or /sys/class/block on Windows. Report the
+        # drive letter and filesystem type; rotational info is unavailable.
+        info = {"mount": os.path.splitdrive(os.path.abspath(path))[0] + "\\", "device": None, "disk": None, "model": None, "rotational": None, "fstype": None}
+        try:
+            import ctypes
+            root = info["mount"]
+            fstype = ctypes.create_unicode_buffer(32)
+            if ctypes.windll.kernel32.GetVolumeInformationW(root, None, 0, None, None, None, fstype, 32):
+                info["fstype"] = fstype.value or None
+        except Exception:
+            pass
+        return info
     """The block device under a path (through /proc/self/mountinfo, since btrfs hides the
     device behind an anonymous st_dev), its model and whether it spins."""
     info = {"mount": "/", "device": None, "disk": None, "model": None, "rotational": None, "fstype": None}
@@ -464,9 +649,38 @@ def drive_info(path):
 
 def probe_nvme(path, seconds=2.0, nth=8, bs=2 << 20):
     """Random O_DIRECT reads of the model file at the size and depth the engine's expert
-    reads have (2 MiB blocks, 8 in flight): GB/s. The rate the cost model prices a miss at."""
+    reads have (2 MiB blocks, 8 in flight): GB/s. The rate the cost model prices a miss at.
+    On Windows there is no O_DIRECT/preadv; the probe uses buffered positional reads
+    (os.open + os.read with lseek per thread on separate fds), which measures the same
+    random-read ceiling closely enough for the cost model."""
     sz = os.path.getsize(path)
     if sz < bs * 64: return None
+    if os.name == "nt":
+        tot = [0] * nth; err = [None] * nth
+        deadline = time.time() + seconds
+        def w(i):
+            try:
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_SEQUENTIAL", 0) | getattr(os, "O_BINARY", 0))
+                rng = random.Random(1000 + i); n = 0
+                while time.time() < deadline:
+                    off = rng.randrange(0, (sz - bs) // 4096) * 4096
+                    os.lseek(fd, off, os.SEEK_SET)
+                    left = bs
+                    while left > 0:
+                        chunk = os.read(fd, min(left, 1 << 20))
+                        if not chunk: break
+                        n += len(chunk); left -= len(chunk)
+                tot[i] = n; os.close(fd)
+            except Exception as e:
+                err[i] = repr(e)
+        ts = [threading.Thread(target=w, args=(i,)) for i in range(nth)]
+        t0 = time.time()
+        for t in ts: t.start()
+        for t in ts: t.join()
+        dt = time.time() - t0
+        if all(err): return {"error": err[0]}
+        gb = sum(tot) / 1e9
+        return {"gbs": round(gb / dt, 2), "gb_read": round(gb, 2), "seconds": round(dt, 2), "block_kib": bs // 1024, "queue": nth}
     tot = [0] * nth; err = [None] * nth
     deadline = time.time() + seconds
     def w(i):
@@ -520,20 +734,24 @@ LOOKUPS_PER_TOKEN = 480   # 48 layers x 10 routed experts
 STATE_HOST_OPTIONS = ["none", "idx", "kv,idx"]
 KV_TYPES = ["q4_0", "q8_0", "f16"]
 KV_MB_PER_K = {"q4_0": 6.9, "q8_0": 13.1, "f16": 26.2}      # KV MB per 1K tokens
-def state_parts(ctx, kv):
+# Bytes per KV element behind the table above (fitted, incl. row overhead):
+# q4_0 0.576, q8_0 1.09, f16 2.18. Lets the table follow another checkpoint's
+# attention geometry: MB/1K = n_attn * n_head_kv * (key_len + val_len) * BPE.
+KV_BYTES_PER_ELEM = {"q4_0": 0.576, "q8_0": 1.09, "f16": 2.18}
+def state_parts(ctx, kv, _kv=None, _idx=3.1, _pooled=0.8):
     k = ctx / 1024 / 1024
-    return {"kv": KV_MB_PER_K[kv] * k, "idx": 3.1 * k, "pooled": 0.8 * k, "delta": 0.113}
-def state_gb(ctx, kv):
-    return sum(state_parts(ctx, kv).values())
-def state_host_gb(ctx, kv, state_host):
-    p = state_parts(ctx, kv)
+    return {"kv": (_kv or KV_MB_PER_K)[kv] * k, "idx": _idx * k, "pooled": _pooled * k, "delta": 0.113}
+def state_gb(ctx, kv, _kv=None, _idx=3.1, _pooled=0.8):
+    return sum(state_parts(ctx, kv, _kv, _idx, _pooled).values())
+def state_host_gb(ctx, kv, state_host, _kv=None, _idx=3.1, _pooled=0.8):
+    p = state_parts(ctx, kv, _kv, _idx, _pooled)
     return (p["kv"] if "kv" in state_host else 0.0) + (p["idx"] if "idx" in state_host else 0.0)
-def state_vram_gb(ctx, kv, state_host):
-    return state_gb(ctx, kv) - state_host_gb(ctx, kv, state_host)
-def state_host_ms(kv, state_host):
-    return (0.35 if "idx" in state_host else 0.0) + (1.7 * KV_MB_PER_K[kv] / KV_MB_PER_K["q4_0"] if "kv" in state_host else 0.0)
+def state_vram_gb(ctx, kv, state_host, _kv=None, _idx=3.1, _pooled=0.8):
+    return state_gb(ctx, kv, _kv, _idx, _pooled) - state_host_gb(ctx, kv, state_host, _kv, _idx, _pooled)
+def state_host_ms(kv, state_host, _kv=None, _idx_ms=0.35):
+    return (_idx_ms if "idx" in state_host else 0.0) + (1.7 * (_kv or KV_MB_PER_K)[kv] / (_kv or KV_MB_PER_K)["q4_0"] if "kv" in state_host else 0.0)
 
-def predict(quant, tier_gb, ram_gb, long_doc, extra_ms=0.0, nvme_mb_per_ms=None):
+def predict(quant, tier_gb, ram_gb, long_doc, extra_ms=0.0, nvme_mb_per_ms=None, lookups=None, block_mb=None):
     # Per token: graph A, the CPU-served experts, and the blocks read this token. The
     # reads are what the tiers' size buys -- the prefetch turns most of them into "hits"
     # but not into fewer bytes -- so the model is residency, the share of lookups served
@@ -542,13 +760,16 @@ def predict(quant, tier_gb, ram_gb, long_doc, extra_ms=0.0, nvme_mb_per_ms=None)
     # 33 / 26 / 20% on a long document. The other constants were fitted to ten measured
     # points (three RAM sizes x two replays on Q4; Q3 and IQ1_S at 10.5 GB): rms error
     # 2.7%. A GB of RAM tier is worth about 3% of decode at 131K.
-    block = QUANT_BLOCK_MB.get(quant, 2.4)
+    # lookups/block_mb let another checkpoint size itself: layers x top-k lookups,
+    # and that checkpoint's expert block. GPU/CPU ms stay 125B-fitted until the tune
+    # measures the machine -- predictions for other sizes are starting points.
+    block = block_mb or QUANT_BLOCK_MB.get(quant, 2.4)
     nvme = nvme_mb_per_ms or NVME_MB_PER_MS
     vb = max(0.0, tier_gb) * 1024 / block; rb = max(0.0, ram_gb) * 1024 / block
     miss = (0.63 * math.exp(-(vb + rb) / 6400)) if long_doc else (0.46 * math.exp(-(vb + rb) / 5900))
     f_v = max(0.0, 0.85 * (1 - math.exp(-vb / 1500)) - (0.06 if long_doc else 0.0)) if vb > 0 else 0.0
     cpu = max(0.0, 1.0 - f_v - miss)
-    ms = QUANT_GPU_MS.get(quant, 20.0) + extra_ms + LOOKUPS_PER_TOKEN * (cpu * QUANT_CPU_MS.get(quant, 0.09) + miss * block / nvme) + 6.0
+    ms = QUANT_GPU_MS.get(quant, 20.0) + extra_ms + (lookups or LOOKUPS_PER_TOKEN) * (cpu * QUANT_CPU_MS.get(quant, 0.09) + miss * block / nvme) + 6.0
     return {"tok_s": round(1000 / ms, 1), "vram_served": round(f_v, 3), "hit": round(1.0 - miss, 3), "blocks": int(vb)}
 
 def tune_calibration(model):
@@ -567,7 +788,38 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
     drive's rate, a RAM correction); without it the reference machine's constants apply."""
     calib = calib if calib is not None else tune_calibration(model)
     q = model["quant"]
-    core = QUANT_CORE_GB.get(q, 4.7)
+    # Per-checkpoint geometry from the GGUF headers (block/core/layers/context/KV
+    # dims); without it the 125B-fitted tables below stand in and the tune fixes
+    # the rest. Unknown quants keep table behavior bit-for-bit (scale ratio 1).
+    g = model.get("geom") or {}
+    block_mb = g.get("block_mb") or QUANT_BLOCK_MB.get(q, 2.4)
+    core = g.get("core_gb") or QUANT_CORE_GB.get(q, 4.7)
+    n_layer = g.get("n_layer") or 48
+    lookups = n_layer * (g.get("n_expert_used") or 10)
+    n_train = g.get("n_ctx_train") or 262144
+    n_attn = g.get("n_attn", 12)
+    if g.get("n_head_kv") and g.get("kv_head_dim") and n_attn:
+        _per_tok = n_attn * g["n_head_kv"] * g["kv_head_dim"]
+        KV_T = {k: _per_tok * b / 1048576 for k, b in KV_BYTES_PER_ELEM.items()}
+        IDX_MK, POOLED_MK = 3.1 * n_attn / 12, 0.8 * n_attn / 12
+    else:
+        KV_T, IDX_MK, POOLED_MK = None, 3.1, 0.8
+    IDX_MS = 0.35 * IDX_MK / 3.1
+    if g.get("block_mb"):
+        LEND_SCALE = g["block_mb"] / (QUANT_BLOCK_MB.get(q) or g["block_mb"])
+    else:
+        LEND_SCALE = 1.0
+    # Local shadows so every call below prices this checkpoint, not the 125B one.
+    # (Assigned from globals(): a `def` of the same name anywhere in this scope
+    # would otherwise make the module-level name unreadable here.)
+    _G = globals()
+    _svg, _shg, _sg, _shm, _pred = (_G['state_vram_gb'], _G['state_host_gb'], _G['state_gb'], _G['state_host_ms'], _G['predict'])
+    def state_vram_gb(ctx, kv, sh): return _svg(ctx, kv, sh, KV_T, IDX_MK, POOLED_MK)
+    def state_host_gb(ctx, kv, sh): return _shg(ctx, kv, sh, KV_T, IDX_MK, POOLED_MK)
+    def state_gb(ctx, kv): return _sg(ctx, kv, KV_T, IDX_MK, POOLED_MK)
+    def state_host_ms(kv, sh): return _shm(kv, sh, KV_T, IDX_MS)
+    def predict(quant, tier_gb, ram_gb, long_doc, extra_ms=0.0, nvme_mb_per_ms=None):
+        return _pred(quant, tier_gb, ram_gb, long_doc, extra_ms, nvme_mb_per_ms, lookups, block_mb)
     nvme = calib.get("nvme_mb_per_ms") or NVME_MB_PER_MS
     # Vision: the projector runs on the CPU (weights in RAM, ~15 s per 1400x1000
     # screenshot on 8 cores), so it costs no VRAM at all -- nothing reserved, nothing
@@ -601,7 +853,7 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
     BATCH_LEND_GB = {2048: 3.9, 4096: 4.4, 8192: 4.98, 16384: 6.16}
     PREFILL_TPS   = {2048: 240, 4096: 300, 8192: 479, 16384: 722}   # Q4 on the reference NVMe; Q3 reads 36% less per sweep
     q3_adj = 0.27 if q == "Q3_K_XL" else 0.0
-    def lend_for(b): return BATCH_LEND_GB[b] - q3_adj
+    def lend_for(b): return BATCH_LEND_GB[b] * LEND_SCALE - q3_adj
     def batch_for(tier_gb):
         for b in (16384, 8192, 4096, 2048):
             if tier_gb - lend_for(b) >= 1.0: return b
@@ -708,12 +960,19 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
     tune = CONFIG["tune"].get(model["name"]) or {}
     for pid, label, ctx, blurb in PRESETS:
         o = option(ctx, vision); note = ""
-        if o["state_host"] != "none": note = "attention state in RAM (%s): %.1f GB of VRAM for the expert tier" % (o["state_host"], o["state_host_gb"])
+        if ctx > n_train:
+            # A tier cannot outrun the checkpoint's trained context (rope and the
+            # KV sizing assume it); cap the preset, custom stays the user's call.
+            ctx = n_train
+            note = "this checkpoint trained to %dK: tier capped there. " % (n_train // 1024)
+            o = option(ctx, vision)
+        if o["state_host"] != "none": note += "attention state in RAM (%s): %.1f GB of VRAM for the expert tier" % (o["state_host"], o["state_host_gb"])
         if o["tier_gb"] == 0:
-            fallback = [option(c, vision) for c in CTX_STEPS if c < ctx]
+            fallback = [option(c, vision) for c in CTX_STEPS if c < ctx and c <= n_train]
             fallback = [f for f in fallback if f["tier_gb"] > 0]
-            if fallback: o = fallback[-1]; note = "no room for an expert tier at %dK on this GPU: %dK instead" % (ctx // 1024, o["ctx"] // 1024)
-            else: note = "no room for a VRAM expert tier on this GPU: experts come from RAM and the NVMe"
+            if note and not note.endswith(" "): note += " "
+            if fallback: o = fallback[-1]; note += "no room for an expert tier at %dK on this GPU: %dK instead" % (ctx // 1024, o["ctx"] // 1024)
+            else: note += "no room for a VRAM expert tier on this GPU: experts come from RAM and the NVMe"
         t = {"id": pid, "label": label, "blurb": blurb, "ctx": ctx, "fits": o["ctx"] == ctx, "note": note, "ctx_actual": o["ctx"], "kv": o["kv"], "vision": o["vision"],
              "tier_gb": o["tier_gb"], "blocks": o["blocks"], "tok_s_short": o["tok_s_short"], "tok_s_long_doc": o["tok_s_long_doc"], "vram_served": o["vram_served"],
              "batch": o["batch"], "prefill_tps": o["prefill_tps"], "ram": o["ram"], "threads": o["threads"], "state_host": o["state_host"], "saved": True}
@@ -783,6 +1042,17 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
 _ENGINES = {"t": 0.0, "v": []}
 def engines_running(max_age=0.0):
     if max_age and time.time() - _ENGINES["t"] < max_age: return _ENGINES["v"]
+    if os.name == "nt":
+        # No pgrep on Windows; tasklist filtered on the image name.
+        try:
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq qwfn-server.exe", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=5).stdout
+            procs = [l.strip() for l in out.splitlines() if "qwfn-server" in l.lower()]
+            out2 = subprocess.run(["tasklist", "/FI", "IMAGENAME eq qwfn-gen.exe", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=5).stdout
+            procs += [l.strip() for l in out2.splitlines() if "qwfn-gen" in l.lower()]
+        except Exception:
+            procs = []
+        _ENGINES.update(t=time.time(), v=procs)
+        return procs
     try:
         out = subprocess.run(["pgrep", "-a", "-x", "qwfn-server"], capture_output=True, text=True, timeout=3).stdout
         procs = [l for l in out.splitlines() if l.strip()]
@@ -850,6 +1120,18 @@ def start_server(model, s):
             return {"error": "no MTP/mtp-*.gguf in this model's repository: download it into the snapshot directory, or turn the draft head off"}
         if s.get("vision") and not model.get("mmproj"):
             return {"error": "no mmproj-*.gguf next to this model: download mmproj-F16.gguf into its snapshot directory, or turn Vision off"}
+        # Fail fast with a number, not a cudaMalloc in the log: the dense core
+        # plus this tier's attention state are hard allocations (the expert tier
+        # itself backs off on its own). 1 GB of slack for the CUDA context and
+        # graphs; below that the engine cannot load. Skipped when the GPU is
+        # not visible to nvidia-smi (let the engine report it instead).
+        core_gb = ((model.get("geom") or {}).get("core_gb") or QUANT_CORE_GB.get(model.get("quant"), 4.7))
+        hw0 = hardware()
+        if hw0["vram_total_mb"] > 0:
+            need = core_gb + state_vram_gb(int(s["ctx"]), s["kv"], s.get("state_host") or "none") + 1.0
+            if hw0["vram_total_mb"] / 1024.0 < need:
+                return {"error": "this tier needs ~%.1f GB of VRAM (%.1f GB dense core + %.1f GB attention state at %dK %s) but %s has %.1f GB. Pick the Chat tier, a smaller context, or a smaller checkpoint." % (
+                    need, core_gb, need - core_gb - 1.0, int(s["ctx"]) // 1024, s["kv"], hw0["gpu"] or "the GPU", hw0["vram_total_mb"] / 1024.0)}
         # The memory the plan assumed may be gone (a browser, a build): say so before the engine
         # clamps the tier. Read twice: right after a stop the arena's pages are still coming back.
         other = 10.0 if s.get("host_other_gb") is None else float(s["host_other_gb"])
@@ -868,10 +1150,25 @@ def start_server(model, s):
         if s.get("skip_miss") and not s.get("mtp") and model.get("mtp"):
             log.write("[console] draft head left off: a verified pair and skip-miss do not combine (skip-miss is one token at a time)\n")
         log.flush()
-        # The bundle keeps ggml, the CUDA and C++ runtimes and liburing next to the engine; the
-        # loader needs the directory for the libraries the CUDA backend dlopens.
+        # The bundle keeps ggml, the CUDA and C++ runtimes (and liburing on
+        # Linux) next to the engine; the loader needs the directory for the
+        # libraries the CUDA backend dlopens. On Windows that means PATH, and
+        # the files are .dlls; on Linux LD_LIBRARY_PATH and .so files.
         env = dict(os.environ); bindir = os.path.dirname(SERVER_BIN)
-        if os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
+        if os.name == "nt":
+            have_dll = any(n.lower().startswith(("ggml", "llama", "cudart", "cublas")) for n in (os.listdir(bindir) if os.path.isdir(bindir) else []))
+            if have_dll or os.path.exists(os.path.join(bindir, "ggml-base.dll")):
+                env["PATH"] = bindir + (";" + env["PATH"] if env.get("PATH") else "")
+            else:
+                # Source checkout: the ggml/llama DLLs live in the llama.cpp
+                # build tree (build/bin), not next to qwfn-server. Put that on
+                # PATH too, or the engine dies with missing-DLL popups.
+                for cand in (os.path.join(os.environ.get("USERPROFILE") or os.path.expanduser("~"), ".unsloth", "llama.cpp", "build", "bin"),
+                             os.environ.get("LLAMA_CPP_BUILD") or ""):
+                    if cand and os.path.exists(os.path.join(cand, "ggml-base.dll")):
+                        env["PATH"] = cand + (";" + env.get("PATH", ""))
+                        break
+        elif os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
             env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         try:
             proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
@@ -887,12 +1184,21 @@ def stop_server():
         if not p or p.poll() is not None:
             # A server started outside this console (serve.sh, or a console that has since
             # exited) still answers on the port: stop it too, it is the one engine there is.
+            if os.name == "nt":
+                try:
+                    subprocess.run(["taskkill", "/F", "/IM", "qwfn-server.exe"], capture_output=True, timeout=10)
+                except Exception:
+                    pass
+                return {"ok": True}
             pids = [l.split()[0] for l in engines_running() if "qwfn-server" in l]
             for pid in pids:
                 try: os.kill(int(pid), signal.SIGTERM)
                 except Exception: pass
             return {"ok": True, "note": "stopped the server running outside the console" if pids else "no server running"}
-        p.send_signal(signal.SIGTERM)
+        if os.name == "nt":
+            p.terminate()
+        else:
+            p.send_signal(signal.SIGTERM)
         for _ in range(50):
             if p.poll() is not None: break
             time.sleep(0.1)
@@ -1604,8 +1910,16 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="address to listen on: 127.0.0.1 (default), or 0.0.0.0 for the local network")
     ap.add_argument("--tls-cert", help="PEM certificate: serve HTTPS (scripts/gen-cert.sh makes a self-signed one)"); ap.add_argument("--tls-key", help="PEM private key for --tls-cert")
     ap.add_argument("--start", action="store_true", help="start the last served model and tier right away")
-    ap.add_argument("--model", help="with --start: a model path or name instead of the last one"); ap.add_argument("--preset", help="with --start: chat | coding | coding_plus | custom")
+    ap.add_argument("--model", help="with --start: a model path or name instead of the last one. A path to a .gguf shard (or the folder holding the shards) also works when it lives outside every scanned location: its folder is added to the saved locations and rescanned"); ap.add_argument("--preset", help="with --start: chat | coding | coding_plus | custom")
     a = ap.parse_args(); STATE["port"] = a.server_port
+    if a.model and os.path.exists(a.model):
+        # A direct path (hf download --local-dir, a USB drive, ...): the scan only
+        # covers the Hugging Face caches plus saved locations, so adopt this folder
+        # or the shard's own folder and persist it -- then --start finds it by path.
+        d = os.path.abspath(a.model)
+        if not os.path.isdir(d): d = os.path.dirname(d)
+        if d != HF and d not in CONFIG["locations"]:
+            CONFIG["locations"].append(d); save_config()
     scheme = "http"
     if a.tls_cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.minimum_version = ssl.TLSVersion.TLSv1_2

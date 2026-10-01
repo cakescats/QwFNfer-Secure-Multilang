@@ -32,7 +32,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <io.h>
+#define qwfn_isatty(fd) _isatty(fd)
+#define qwfn_fileno(f) _fileno(f)
+#else
 #include <unistd.h>
+#define qwfn_isatty(fd) isatty(fd)
+#define qwfn_fileno(f) fileno(f)
+#endif
 #include <iostream>
 #include <random>
 #include <string>
@@ -146,6 +154,9 @@ static std::string expand_path(std::string p) {
     }
     if (p == "~" || p.rfind("~/", 0) == 0) {
         const char * home = getenv("HOME");
+#ifdef _WIN32
+        if (!home || !*home) home = getenv("USERPROFILE");
+#endif
         if (home) p = std::string(home) + p.substr(1);
     }
     return p;
@@ -284,7 +295,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "--think must be xhigh, medium, low or off\n"); return 1;
     }
     const bool thinking = effort != "off";
-    const bool color = isatty(fileno(stdout));
+    const bool color = qwfn_isatty(qwfn_fileno(stdout));
 
     auto dim   = [&]() { if (color) printf("\033[2m"); };
     auto undim = [&]() { if (color) printf("\033[0m"); };
@@ -301,7 +312,11 @@ int main(int argc, char ** argv) {
     if (!mi.load(argv[1], err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
 
     engine eng;
-    if (!eng.init(&mi, nullptr, cfg, std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin", err)) {
+    const char * home = getenv("HOME");
+#ifdef _WIN32
+    if (!home || !*home) home = getenv("USERPROFILE");
+#endif
+    if (!eng.init(&mi, nullptr, cfg, std::string(home ? home : ".") + "/.unsloth/llama.cpp/build/bin", err)) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     fprintf(stderr, "%s\n", eng.memory_summary().c_str());
@@ -582,7 +597,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    const bool stdin_tty = isatty(fileno(stdin));
+    const bool stdin_tty = qwfn_isatty(qwfn_fileno(stdin));
     printf("\nqwfn-chat ready. /file PATH attaches a file, /reset clears, /quit exits.\n");
     if (!stdin_tty) printf("(reading piped input)\n");
     std::string line;

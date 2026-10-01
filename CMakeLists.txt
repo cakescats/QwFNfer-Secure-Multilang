@@ -19,7 +19,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Where llama.cpp/ggml lives. Override with -DLLAMA_CPP_ROOT=...
 if(WIN32)
-  set(LLAMA_CPP_ROOT "$ENV{USERPROFILE}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
+  # %USERPROFILE%, unless a HOME is set (Git Bash, MSYS)
+  if("$ENV{HOME}" STREQUAL "")
+    set(LLAMA_CPP_ROOT "$ENV{USERPROFILE}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
+  else()
+    set(LLAMA_CPP_ROOT "$ENV{HOME}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
+  endif()
 else()
   set(LLAMA_CPP_ROOT "$ENV{HOME}/.unsloth/llama.cpp" CACHE PATH "llama.cpp source root")
 endif()
@@ -109,6 +114,10 @@ function(qwfn_import_shared target basename)
       PATHS "${LLAMA_CPP_BUILD}" "${LLAMA_CPP_BUILD}/Release"
             "${LLAMA_CPP_ROOT}/build/lib" "${LLAMA_CPP_ROOT}/build/lib/Release"
             "${LLAMA_CPP_ROOT}/build/${basename}" "${LLAMA_CPP_ROOT}/build"
+            # where a Ninja / MSVC build of llama.cpp leaves the import libraries
+            # (found on a real Windows build by the Rafiekuntest port)
+            "${LLAMA_CPP_BUILD}/../ggml/src" "${LLAMA_CPP_BUILD}/../ggml/src/Release"
+            "${LLAMA_CPP_BUILD}/../src" "${LLAMA_CPP_BUILD}/../src/Release"
       NO_DEFAULT_PATH)
     find_file(${target}_DLL
       NAMES ${basename}.dll
@@ -300,7 +309,7 @@ if(QWFN_BUILD_SERVER)
     LIBS     qwfn_core llama_ref
     OPT      ${QWFN_OPT_FLAGS})
   if(WIN32)
-    target_link_libraries(qwfn-server PRIVATE ws2_32)   # cpp-httplib's sockets
+    target_link_libraries(qwfn-server PRIVATE ws2_32 crypt32)   # cpp-httplib: sockets; crypt32 as in the tested Windows port
   endif()
 elseif(WIN32)
   message(STATUS "qwfn-server: skipped (the stall watchdog has no Win32 implementation yet; -DQWFN_BUILD_SERVER=ON to try anyway)")

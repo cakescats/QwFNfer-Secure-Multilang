@@ -111,7 +111,9 @@ std::string shard_path_for(const std::string & any_shard, int n, int total) {
 bool model_index::read_metadata(gguf_context * c, std::string & err) {
     arch = get_str(c, "general.architecture", "");
     if (arch != "qwen4exp") {
-        err = "unexpected architecture '" + arch + "' (this engine only implements qwen4exp / Qwen3.8-Flash-Next)";
+        err = "unexpected architecture '" + arch + "' (this engine implements only the MoE graph qwen4exp / Qwen3.8-Flash-Next: "
+              "routed experts, DeltaNet, sparse attention, PLE table. Dense checkpoints such as Qwen3.8-27B (qwen35) are a "
+              "different, dense graph with no experts to cache -- run those in a general engine like llama.cpp or Ollama)";
         return false;
     }
     const std::string A = arch + ".";

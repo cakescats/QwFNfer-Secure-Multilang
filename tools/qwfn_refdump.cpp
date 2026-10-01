@@ -94,6 +94,7 @@ int main(int argc, char ** argv) {
     // The backend .so files live next to libllama; load them before any model.
     {
         const char * home = getenv("HOME");
+        if (!home || !*home) home = getenv("USERPROFILE");
         std::string dir = std::string(home ? home : ".") + "/.unsloth/llama.cpp/build/bin";
         if (const char * bd = getenv("QWFN_GGML_BACKENDS")) dir = bd;
         ggml_backend_load_all_from_path(dir.c_str());
@@ -112,7 +113,9 @@ int main(int argc, char ** argv) {
     }
     mp.n_gpu_layers = ngl;            // 0 = CPU, matching our validation path
     mp.load_mode    = LLAMA_LOAD_MODE_MMAP;
-    mp.lazy_mode    = LLAMA_LAZY_MODE_AUTO;
+    // NOTE: no lazy_mode here: the pinned llama.cpp mix (Unsloth
+    // b10798-mix-659e406) has no llama_model_params::lazy_mode, so this tool
+    // loads via plain MMAP like every other vocab_only-except-here consumer.
     llama_model * model = llama_model_load_from_file(argv[1], mp);
     if (!model) { fprintf(stderr, "failed to load model\n"); return 1; }
 

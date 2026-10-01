@@ -95,7 +95,7 @@ int main(int argc, char ** argv) {
     const int64_t hc = hp.hc_count, n_embd = hp.n_embd;
     const int64_t n_used = hp.n_expert_used;
 
-    const std::string bedir = std::string(getenv("HOME")) + "/.unsloth/llama.cpp/build/bin";
+    const std::string bedir = std::string((getenv("HOME") ? getenv("HOME") : (getenv("USERPROFILE") ? getenv("USERPROFILE") : "."))) + "/.unsloth/llama.cpp/build/bin";
 
     // Dense core -> GPU. It is 4.29B of the 6.65B active parameters, so this is
     // the difference between ~30 GB/s and 736 GB/s on most of the work.
