@@ -111,6 +111,11 @@ uint64_t plat_mem_available() {
     return found ? kb * 1024ull : 0;
 }
 
+uint64_t plat_mem_total() {
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+    return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
+}
+
 } // namespace qwfn
 
 #endif // !_WIN32

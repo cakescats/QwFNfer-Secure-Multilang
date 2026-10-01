@@ -75,6 +75,8 @@ void        plat_unmap(void * base, size_t size);
 // exact equivalent, so this is ullAvailPhys -- free plus the standby list --
 // which is the nearest thing and errs in the same direction.
 uint64_t    plat_mem_available();
+// Installed physical memory; 0 when unknown.
+uint64_t    plat_mem_total();
 
 // The last failure on this thread, as text, for error messages. The pointer is
 // valid until the next platform call on the same thread.

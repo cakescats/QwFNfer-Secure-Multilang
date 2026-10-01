@@ -241,6 +241,13 @@ uint64_t plat_mem_available() {
     return (uint64_t) ms.ullAvailPhys;
 }
 
+uint64_t plat_mem_total() {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) { set_err("GlobalMemoryStatusEx failed"); return 0; }
+    return (uint64_t) ms.ullTotalPhys;
+}
+
 } // namespace qwfn
 
 #endif // _WIN32

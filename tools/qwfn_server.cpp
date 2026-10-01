@@ -15,6 +15,7 @@
 // re-prefills, because the recurrent layers cannot be rewound: unlike a KV cache
 // you cannot simply forget the tail of a scan.
 
+#include "qwfn_plat.h"
 #include "qwfn_engine.h"
 #include "qwfn_model.h"
 #include "qwfn_vocab.h"
@@ -1107,7 +1108,7 @@ int main(int argc, char ** argv) {
         if (!cfg.mtp_path.empty()) { fprintf(stderr, "--prefix-cache: not supported with --mtp (the draft head's state is not checkpointed)\n"); return 1; }
         // The pool is ordinary host memory next to the pinned RAM tier; leave the
         // system some room rather than find out under the OOM killer.
-        const double phys = (double) sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
+        const double phys = (double) plat_mem_total();
         const double want = (double) cfg.ram_bytes + prefix_cache_gb * 1e9 + 4e9;
         if (want > phys) {
             fprintf(stderr, "--prefix-cache %.1f: with --ram %.1f it leaves less than 4 GB of the %.1f GB of RAM\n",
