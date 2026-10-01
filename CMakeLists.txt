@@ -171,6 +171,7 @@ endif()
 # new source from being added to one build and forgotten in the other.
 add_library(qwfn_core STATIC
   src/qwfn_model.cpp
+  src/qwfn_pack.cpp
   src/qwfn_plat_posix.cpp
   src/qwfn_plat_win32.cpp
   src/qwfn_io.cpp
@@ -250,6 +251,9 @@ function(qwfn_tool name)
 endfunction()
 
 qwfn_tool(qwfn-iobench  SOURCES tools/qwfn_iobench.cpp        LIBS qwfn_core)
+if(NOT WIN32)   # POSIX file calls; the pack format itself (src/qwfn_pack.cpp) is portable
+  qwfn_tool(qwfn-pack   SOURCES tools/qwfn_pack.cpp           LIBS qwfn_core)
+endif()
 qwfn_tool(qwfn-inspect  SOURCES tools/qwfn_inspect.cpp        LIBS qwfn_core)
 qwfn_tool(qwfn-test-hc  SOURCES tools/qwfn_test_hc.cpp        LIBS qwfn_core)
 qwfn_tool(qwfn-logits   SOURCES tools/qwfn_logits.cpp         LIBS qwfn_core)
