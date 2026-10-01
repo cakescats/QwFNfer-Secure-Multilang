@@ -81,6 +81,24 @@ foreach ($pat in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
 $crt = Get-ChildItem -Path "$env:VCToolsRedistDir\x64" -Directory -Filter 'Microsoft.VC*.CRT' -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $crt) { throw 'the Visual C++ runtime (VCToolsRedistDir\x64\Microsoft.VC*.CRT) was not found: run from a Developer PowerShell' }
 foreach ($dll in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') { Copy-Item (Join-Path $crt.FullName $dll) "$Out\bin\" }
+# ggml-base and ggml-cpu use OpenMP: MSVC's vcomp140.dll ships in its own redist folder.
+$omp = Get-ChildItem -Path "$env:VCToolsRedistDir\x64" -Directory -Filter 'Microsoft.VC*.OpenMP' -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $omp) { throw 'vcomp140.dll (VCToolsRedistDir\x64\Microsoft.VC*.OpenMP) was not found' }
+Copy-Item (Join-Path $omp.FullName 'vcomp140.dll') "$Out\bin\"
+# Every DLL a binary of the bundle imports must be in bin\ or be part of Windows itself
+# (or the NVIDIA driver's nvcuda.dll). The build machine has the VC++ redist installed,
+# so a missing runtime would otherwise only show on a user's clean Windows.
+$os = '^(kernel32|user32|advapi32|ws2_32|crypt32|shell32|ole32|oleaut32|ntdll|bcrypt|secur32|dbghelp|version|shlwapi|psapi|iphlpapi|userenv|rpcrt4|winmm|gdi32|comdlg32|setupapi|cfgmgr32|powrprof|mswsock|normaliz|wldap32|ucrtbase|nvcuda|api-ms-win-.*|ext-ms-win-.*)\.dll$'
+$have = @{}; Get-ChildItem "$Out\bin" -Filter *.dll | ForEach-Object { $have[$_.Name.ToLower()] = $true }
+$bad = @()
+foreach ($f in Get-ChildItem "$Out\bin" -Include *.exe, *.dll -Recurse) {
+  foreach ($line in (& dumpbin /nologo /dependents $f.FullName)) {
+    $d = $line.Trim().ToLower()
+    if ($d -match '\.dll$' -and $d -notmatch $os -and -not $have[$d]) { $bad += "$($f.Name) needs $d" }
+  }
+}
+if ($bad) { $bad | ForEach-Object { Write-Host $_ }; throw 'the bundle misses DLLs (above)' }
+Write-Host 'every imported DLL is in bin\ or part of Windows'
 # The console with its sign-in, translations and images, as scripts/package.sh ships it.
 Copy-Item 'tools\qwfn_console.py', 'tools\qwfn_auth.py', 'tools\qwfn_i18n.py', 'tools\qwfn_router.py' "$Out\tools\"
 Copy-Item 'tools\console\index.html', 'tools\console\login.html', 'tools\console\console.css' "$Out\tools\console\"
