@@ -1,5 +1,7 @@
 name: windows-release
 on:
+  push:
+    branches: [ 'merge/**' ]   # a test build of a merge branch: one CUDA arch, no release
   workflow_dispatch:
     inputs:
       tag:
@@ -12,6 +14,9 @@ on:
 # with the CUDA backend, portable engine, package.ps1. Attaches the zip to the
 # release when a tag is given; otherwise the zip is kept as a workflow artifact.
 # Runs on whichever branch it is dispatched from.
+env:
+  # A release covers every supported GPU; a test build only the one it is tested on (RTX 30, sm_86).
+  CUDA_ARCHS: ${{ github.event_name == 'push' && '86' || '75;80;86;89;90;120' }}
 jobs:
   build:
     runs-on: windows-2022
@@ -53,7 +58,7 @@ jobs:
           git -C $env:RUNNER_TEMP\llama.cpp checkout FETCH_HEAD
           cmake -S $env:RUNNER_TEMP\llama.cpp -B $env:RUNNER_TEMP\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CUDA=ON `
-            "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" "-DCMAKE_CUDA_COMPILER=$cu/bin/nvcc.exe" "-DCUDAToolkit_ROOT=$cu" `
+            "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" "-DCMAKE_CUDA_COMPILER=$cu/bin/nvcc.exe" "-DCUDAToolkit_ROOT=$cu" `
             -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
           cmake --build $env:RUNNER_TEMP\llama.cpp\build --target ggml-base ggml ggml-cpu ggml-cuda llama
@@ -74,7 +79,7 @@ jobs:
           name: qwfnfer-windows-x86_64-cuda
           path: dist/qwfnfer-windows-x86_64-cuda.zip
       - name: Publish release
-        if: ${{ inputs.tag != '' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
