@@ -75,6 +75,12 @@ Get-ChildItem -Path $GgmlLibs -Filter 'ggml-cpu*.dll' -ErrorAction SilentlyConti
 foreach ($pat in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
   Get-ChildItem -Path $CudaDir -Filter $pat | ForEach-Object { Copy-Item $_.FullName "$Out\bin\" }
 }
+# The Visual C++ runtime, app-local next to the binaries (Microsoft allows this for
+# vcruntime/msvcp): a clean Windows has none, and the server then dies with
+# 0xC0000135 before printing a line. Taken from the MSVC that built the engine.
+$crt = Get-ChildItem -Path "$env:VCToolsRedistDir\x64" -Directory -Filter 'Microsoft.VC*.CRT' -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $crt) { throw 'the Visual C++ runtime (VCToolsRedistDir\x64\Microsoft.VC*.CRT) was not found: run from a Developer PowerShell' }
+foreach ($dll in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') { Copy-Item (Join-Path $crt.FullName $dll) "$Out\bin\" }
 # The console with its sign-in, translations and images, as scripts/package.sh ships it.
 Copy-Item 'tools\qwfn_console.py', 'tools\qwfn_auth.py', 'tools\qwfn_i18n.py', 'tools\qwfn_router.py' "$Out\tools\"
 Copy-Item 'tools\console\index.html', 'tools\console\login.html', 'tools\console\console.css' "$Out\tools\console\"
