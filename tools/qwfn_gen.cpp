@@ -17,6 +17,131 @@
 
 using namespace qwfn;
 
+// --ckpt-test: a prefix checkpoint must continue exactly like the sequence it was
+// taken from. Three runs over the same prompt:
+//   base   prefill prompt[:-1], save, then feed the last token and decode greedily
+//   fresh  reset, the same prefill without saving, then replay base's tokens
+//   ckpt   reset, prefill and decode another prompt (with a different image
+//          override at the same position), restore, then replay base's tokens
+// GPU decode is not bit-reproducible (experts move between tiers), so fresh sets
+// the noise floor: per replayed step, the largest logit difference from base and
+// the NLL of base's tokens. ckpt must sit inside that floor; a checkpoint that
+// missed a field lands near the other prompt's distance instead.
+// The other prompt carries a synthetic embedding override just past the checkpoint,
+// where the replay will evaluate: a restore must drop it (QWFN_CKPT_BREAK=ov puts
+// it back after the restore, a negative control that must fail).
+static int ckpt_test(engine & eng, const engine_config & cfg, const std::vector<int32_t> & prompt,
+                     const std::vector<int32_t> & other, int n_gen) {
+    std::string err;
+    if (prompt.size() < 16 || other.size() < 16) { fprintf(stderr, "ckpt-test: prompts need 16+ tokens\n"); return 1; }
+    const int64_t V = eng.n_vocab();
+    const int32_t d = 2560;
+    auto override_at = [&](int32_t pos) {
+        std::vector<float> e(d);
+        for (int32_t k = 0; k < d; k++) e[k] = 0.5f * std::sin(0.37f * k);
+        eng.set_embeddings(pos, e.data(), 4);
+    };
+    auto prefill = [&](std::vector<int32_t> & hist, int32_t n) {
+        for (int32_t done = eng.n_past(); done < n; ) {
+            const int32_t take = std::min<int32_t>(cfg.n_batch, n - done);
+            if (!eng.eval(hist.data(), done + take, take, err)) { fprintf(stderr, "ckpt-test: prefill failed: %s\n", err.c_str()); exit(1); }
+            done += take;
+        }
+    };
+    auto argmax = [&](const float * l) { int b = 0; for (int64_t v = 1; v < V; v++) if (l[v] > l[b]) b = (int) v; return b; };
+    auto nll = [&](const float * l, int32_t tok) {
+        float mx = l[0]; for (int64_t v = 1; v < V; v++) mx = std::max(mx, l[v]);
+        double z = 0.0; for (int64_t v = 0; v < V; v++) z += std::exp((double) l[v] - mx);
+        return -((double) l[tok] - mx - std::log(z));
+    };
+    std::vector<std::vector<float>> base_l;   // base's logits at every step
+    std::vector<int32_t> base_t;
+    struct cmp { double max_d = 0, mean_d = 0, nll = 0; int agree = 0; };
+    // Feed the prompt's last token, then n_gen more: greedy when base_t is empty
+    // (recording base), otherwise base's tokens, compared step by step.
+    auto run = [&](std::vector<int32_t> & hist, int steps) {
+        cmp c; bool agreeing = true;
+        const bool record = base_t.empty();
+        const float * lg = eng.eval(hist.data(), (int32_t) hist.size(), 1, err);
+        for (int i = 0; lg && i < steps; i++) {
+            if (record) { base_l.emplace_back(lg, lg + V); base_t.push_back(argmax(lg)); }
+            else {
+                double m = 0; for (int64_t v = 0; v < V; v++) m = std::max(m, (double) std::fabs(lg[v] - base_l[i][v]));
+                c.max_d = std::max(c.max_d, m); c.mean_d += m / steps;
+                c.nll += nll(lg, base_t[i]) / steps;
+                if (agreeing && argmax(lg) == base_t[i]) c.agree++; else agreeing = false;
+            }
+            hist.push_back(base_t[i]);
+            lg = eng.eval(hist.data(), (int32_t) hist.size(), 1, err);
+        }
+        if (!lg) { fprintf(stderr, "ckpt-test: eval failed: %s\n", err.c_str()); exit(1); }
+        return c;
+    };
+    const int32_t np = (int32_t) prompt.size() - 1;
+
+    std::vector<int32_t> h = prompt;
+    eng.reset(); eng.clear_embeddings();
+    prefill(h, np);
+    engine::checkpoint ck;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!eng.checkpoint_save(ck, err)) { fprintf(stderr, "ckpt-test: %s\n", err.c_str()); return 1; }
+    const double t_save = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    run(h, n_gen);
+    double base_nll = 0; for (int i = 0; i < n_gen; i++) base_nll += nll(base_l[i].data(), base_t[i]) / n_gen;
+
+    h = prompt;
+    eng.reset(); eng.clear_embeddings();
+    prefill(h, np);
+    const cmp fresh = run(h, n_gen);
+
+    std::vector<int32_t> ho = other;
+    eng.reset(); eng.clear_embeddings(); override_at(np + 2);
+    prefill(ho, (int32_t) other.size() - 1);
+    ho.resize(other.size() - 1);
+    ho.push_back(prompt.back());   // same last token, different history: the "missed everything" distance
+    const cmp wrong = run(ho, 1);
+    for (int i = 0; i < 8; i++) {   // move the other sequence along a little before switching back
+        ho.push_back(base_t[i]);
+        if (!eng.eval(ho.data(), (int32_t) ho.size(), 1, err)) { fprintf(stderr, "ckpt-test: %s\n", err.c_str()); return 1; }
+    }
+    // QWFN_CKPT_BREAK: negative controls, the gate must FAIL on these.
+    //   ov  keep the other prompt's override   state  zero a stretch in the middle of the state bytes
+    const char * br = getenv("QWFN_CKPT_BREAK");
+    if (br && *br) {
+        if (!strcmp(br, "state")) std::fill(ck.st.begin() + ck.st.size() / 2, ck.st.begin() + ck.st.size() / 2 + ck.st.size() / 20, 0);
+        printf("ckpt-test: negative control: %s\n", br);
+    }
+    h = prompt;
+    t0 = std::chrono::steady_clock::now();
+    if (!eng.checkpoint_restore(ck, err)) { fprintf(stderr, "ckpt-test: %s\n", err.c_str()); return 1; }
+    const double t_restore = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // Round trip: what the restore wrote must read back byte for byte.
+    engine::checkpoint ck2;
+    if (!eng.checkpoint_save(ck2, err)) { fprintf(stderr, "ckpt-test: %s\n", err.c_str()); return 1; }
+    const bool exact = ck2.n_past == ck.n_past && ck2.st == ck.st;
+    if (br && !strcmp(br, "ov")) override_at(np + 2);
+    const cmp ckpt = run(h, n_gen);
+
+    printf("ckpt-test: prompt %d tokens, other %zu, checkpoint %.1f MB (%d positions)\n",
+           np, other.size() - 1, ck.bytes() / 1e6, ck.n_past);
+    printf("ckpt-test: save %.1f ms, restore %.1f ms, round trip %s\n", t_save * 1e3, t_restore * 1e3, exact ? "byte-exact" : "DIFFERS");
+    printf("ckpt-test: base  NLL %.4f over %d greedy tokens\n", base_nll, n_gen);
+    auto show = [&](const char * name, const cmp & c) {
+        printf("ckpt-test: %-5s max|dlogit| %.3f, mean per step %.3f, NLL %.4f, greedy agrees for %d/%d\n",
+               name, c.max_d, c.mean_d, c.nll, c.agree, n_gen);
+    };
+    show("fresh", fresh); show("ckpt", ckpt);
+    printf("ckpt-test: other first-step max|dlogit| %.3f (must be far above both)\n", wrong.max_d);
+    // Inside the floor, with room for its own run-to-run spread (measured ~1.2 logits
+    // per step at 4K on the B70, so a small loss hides in it: the round trip and the
+    // negative controls carry the rest).
+    const bool pass = exact && ckpt.mean_d <= 1.5 * fresh.mean_d + 0.05 &&
+                      std::fabs(ckpt.nll - base_nll) <= std::max(0.02, 1.5 * std::fabs(fresh.nll - base_nll)) &&
+                      wrong.max_d > ckpt.max_d;
+    printf("ckpt-test: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 2;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -24,7 +149,7 @@ int main(int argc, char ** argv) {
             "                [--ram GB] [--vram GB] [--batch N] [--threads N] [--cpu] [--no-qsa]\n");
         return 1;
     }
-    std::vector<int32_t> prompt, replay;
+    std::vector<int32_t> prompt, replay, other;
     std::string cold_path, save_replay;   // --save-replay FILE: the generated ids, one per line, for a later --replay-file
     bool want_ppl = false;   // with --replay-file: mean NLL of the replayed tokens (a quality number)
     bool pair_test = false, rollback_test = false;   // exercise the multi-token decode step without the head
@@ -103,6 +228,13 @@ int main(int argc, char ** argv) {
         if (a == "--ubatch-kv" && i + 1 < argc) { cfg.ubatch_kv_product = (uint64_t)(atof(next()) * 1e6); continue; }
         if (a == "--indexer-top-k" && i + 1 < argc) { cfg.indexer_top_k = (uint32_t) atoi(next()); continue; }
         if (a == "--cold" && i + 1 < argc) { cold_path = next(); cfg.use_cold_tier = true; continue; }
+        if (a == "--ckpt-test" && i + 1 < argc) {   // a second prompt file to interpose between save and restore
+            FILE * f = fopen(next(), "rb");
+            if (!f) { fprintf(stderr, "error: cannot open checkpoint test prompt\n"); return 1; }
+            int v; while (fscanf(f, "%d%*[ ,\n\t\r]", &v) == 1) other.push_back(v);
+            fclose(f);
+            continue;
+        }
         if (a == "--prompt-file" && i + 1 < argc) {
             // Long contexts blow past ARG_MAX on the command line.
             FILE * f = fopen(next(), "rb");
@@ -138,6 +270,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "engine init: %s\n", err.c_str()); return 1;
     }
     printf("%s\n\n", eng.memory_summary().c_str());
+
+    if (!other.empty()) return ckpt_test(eng, cfg, prompt, other, n_gen);
 
     std::vector<int32_t> hist = prompt;
     const float * lg = nullptr;

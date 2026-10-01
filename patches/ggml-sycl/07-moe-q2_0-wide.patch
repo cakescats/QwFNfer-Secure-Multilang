@@ -1,0 +1,117 @@
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2771,6 +2771,102 @@
+     });
+ }
+ 
++
++// ---- wide q2_0 MoE matvec (GGML_SYCL_MOE_Q2W=1), see scripts/box/moeq2w/apply_moeq2w.py ----
++// byte k of a q2_0 block holds elements 4k..4k+3 in bits 0-1, 2-3, 4-5, 6-7
++static __dpct_inline__ int q2_0_expand_byte(const uint32_t q) {
++    return (int) ((q & 0x3u) | (((q >> 2) & 0x3u) << 8) | (((q >> 4) & 0x3u) << 16) | (((q >> 6) & 0x3u) << 24));
++}
++
++template <int LPR>   // lanes per row: 16, or 8 for two rows per subgroup
++static void mul_mat_vec_q2_0_moe_wide(
++    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
++    const int ncols, const int nrows,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride,
++    const sycl::nd_item<3> & it) {
++    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++    const int expert_idx = it.get_group(1);
++    const int i02        = ids_dev[expert_idx];
++    const int lane       = it.get_local_id(2);                  // 0..WARP_SIZE-1
++    const int row        = (it.get_group(2) * it.get_local_range(1) + it.get_local_id(1)) * ROWS_PER_SG + lane / LPR;
++    const int t          = lane % LPR;
++
++    const char *       vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
++    const block_q8_1 * y  = (const block_q8_1 *) ((const char *) vy_base + (size_t) expert_idx * src1_row_stride);
++    float *            dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
++
++    const int blocks_per_row = ncols / QK2_0;
++    float acc = 0.0f;
++    if (row < nrows) {
++        const block_q2_0 * x = (const block_q2_0 *) vx + (size_t) row * blocks_per_row;
++        for (int b = t; b < blocks_per_row; b += LPR) {
++            const block_q2_0 * bx = x + b;
++            // 16 quant bytes at a 2-byte aligned offset: eight 16-bit loads
++            const uint16_t * q16 = (const uint16_t *) bx->qs;
++            uint32_t w[4];
++#pragma unroll
++            for (int k = 0; k < 4; k++) w[k] = (uint32_t) q16[2 * k] | ((uint32_t) q16[2 * k + 1] << 16);
++            const block_q8_1 * y0 = y + 2 * b;
++            const block_q8_1 * y1 = y0 + 1;
++            const int * u0 = (const int *) y0->qs;
++            const int * u1 = (const int *) y1->qs;
++            int s0 = 0, s1 = 0;
++#pragma unroll
++            for (int k = 0; k < 8; k++) {   // bytes 0..7: elements 0..31, against y0
++                s0 = dpct::dp4a(q2_0_expand_byte((w[k / 4] >> (8 * (k % 4))) & 0xFFu), u0[k], s0);
++            }
++#pragma unroll
++            for (int k = 0; k < 8; k++) {   // bytes 8..15: elements 32..63, against y1
++                s1 = dpct::dp4a(q2_0_expand_byte((w[2 + k / 4] >> (8 * (k % 4))) & 0xFFu), u1[k], s1);
++            }
++            const sycl::float2 ds0 = y0->ds.convert<float, sycl::rounding_mode::automatic>();
++            const sycl::float2 ds1 = y1->ds.convert<float, sycl::rounding_mode::automatic>();
++            const float d = (float) bx->d;
++            acc += d * ((s0 * ds0.x() - ds0.y()) + (s1 * ds1.x() - ds1.y()));
++        }
++    }
++    // reduce over the LPR lanes of this row (xor masks below LPR stay inside the row's lanes)
++#pragma unroll
++    for (int mask = LPR / 2; mask > 0; mask >>= 1) {
++        acc += dpct::permute_sub_group_by_xor(it.get_sub_group(), acc, mask);
++    }
++    if (row < nrows && t == 0) {
++        dst[row] = acc;
++    }
++}
++
++static void launch_mul_mat_vec_q2_0_moe_wide(
++    const void * vx_base, const void * vy, const int32_t * ids_dev,
++    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride, dpct::queue_ptr stream) {
++    const int blocks_per_row = ncols / QK2_0;
++    constexpr int SG_PER_WG = 4;   // subgroups per work-group
++    auto go = [&](auto lpr_tag) {
++        constexpr int LPR = decltype(lpr_tag)::value;
++        constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++        const int n_sg = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
++        const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
++        const sycl::range<3> block_dims(1, SG_PER_WG, WARP_SIZE);
++        stream->submit([&](sycl::handler & cgh) {
++            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    mul_mat_vec_q2_0_moe_wide<LPR>(vx_base, vy, dst_base, ids_dev, ncols, nrows,
++                        expert_weight_stride, dst_row_stride, src1_row_stride, item);
++                });
++        });
++    };
++    if (blocks_per_row >= WARP_SIZE) go(std::integral_constant<int, WARP_SIZE>{});
++    else                             go(std::integral_constant<int, WARP_SIZE / 2>{});
++}
++
++static bool ggml_sycl_moe_q2w_enabled() {
++    static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
++    return v;
++}
++
+ bool ggml_sycl_mul_mat_vec_q_id(
+     enum ggml_type     src0_type,
+     const void *       vx_base,
+@@ -2811,6 +2907,11 @@
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
+         case GGML_TYPE_Q2_0:
++            if (ggml_sycl_moe_q2w_enabled() && ncols % QK2_0 == 0) {
++                launch_mul_mat_vec_q2_0_moe_wide(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                    expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++                return true;
++            }
+             launch_mul_mat_vec_q_moe<QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1>(
+                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);

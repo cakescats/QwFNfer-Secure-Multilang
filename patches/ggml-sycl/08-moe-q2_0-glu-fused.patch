@@ -1,0 +1,169 @@
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2867,6 +2867,85 @@
+     return v;
+ }
+ 
++
++// ---- fused gate + up + SwiGLU, q2_0 MoE, one token (see apply_moeglu.py) ----
++static __dpct_inline__ float q2_0_block_dot(const block_q2_0 * bx, const block_q8_1 * y0) {
++    const uint16_t * q16 = (const uint16_t *) bx->qs;
++    uint32_t w[4];
++#pragma unroll
++    for (int k = 0; k < 4; k++) w[k] = (uint32_t) q16[2 * k] | ((uint32_t) q16[2 * k + 1] << 16);
++    const block_q8_1 * y1 = y0 + 1;
++    const int * u0 = (const int *) y0->qs;
++    const int * u1 = (const int *) y1->qs;
++    int s0 = 0, s1 = 0;
++#pragma unroll
++    for (int k = 0; k < 8; k++) s0 = dpct::dp4a(q2_0_expand_byte((w[k / 4] >> (8 * (k % 4))) & 0xFFu), u0[k], s0);
++#pragma unroll
++    for (int k = 0; k < 8; k++) s1 = dpct::dp4a(q2_0_expand_byte((w[2 + k / 4] >> (8 * (k % 4))) & 0xFFu), u1[k], s1);
++    const sycl::float2 ds0 = y0->ds.convert<float, sycl::rounding_mode::automatic>();
++    const sycl::float2 ds1 = y1->ds.convert<float, sycl::rounding_mode::automatic>();
++    return (float) bx->d * ((s0 * ds0.x() - ds0.y()) + (s1 * ds1.x() - ds1.y()));
++}
++
++template <int LPR>
++static void mul_mat_vec_q2_0_moe_glu_wide(
++    const void * __restrict__ vx_gate, const void * __restrict__ vx_up, const void * __restrict__ vy,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev, const int ncols, const int nrows,
++    const size_t stride_gate, const size_t stride_up, const size_t dst_row_stride, const sycl::nd_item<3> & it) {
++    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++    const int expert_idx = it.get_group(1);
++    const int i02        = ids_dev[expert_idx];
++    const int lane       = it.get_local_id(2);
++    const int row        = (it.get_group(2) * it.get_local_range(1) + it.get_local_id(1)) * ROWS_PER_SG + lane / LPR;
++    const int t          = lane % LPR;
++    const block_q8_1 * y = (const block_q8_1 *) vy;              // one input, shared by every expert
++    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
++
++    const int blocks_per_row = ncols / QK2_0;
++    float g = 0.0f, u = 0.0f;
++    if (row < nrows) {
++        const block_q2_0 * xg = (const block_q2_0 *) ((const char *) vx_gate + (size_t) i02 * stride_gate) + (size_t) row * blocks_per_row;
++        const block_q2_0 * xu = (const block_q2_0 *) ((const char *) vx_up   + (size_t) i02 * stride_up)   + (size_t) row * blocks_per_row;
++        for (int b = t; b < blocks_per_row; b += LPR) {
++            g += q2_0_block_dot(xg + b, y + 2 * b);
++            u += q2_0_block_dot(xu + b, y + 2 * b);
++        }
++    }
++#pragma unroll
++    for (int mask = LPR / 2; mask > 0; mask >>= 1) {
++        g += dpct::permute_sub_group_by_xor(it.get_sub_group(), g, mask);
++        u += dpct::permute_sub_group_by_xor(it.get_sub_group(), u, mask);
++    }
++    if (row < nrows && t == 0) {
++        dst[row] = g / (1.0f + sycl::exp(-g)) * u;   // op_silu(g) * u
++    }
++}
++
++bool ggml_sycl_moe_q2w_on() { return ggml_sycl_moe_q2w_enabled(); }
++
++void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
++                                        float * dst_base, int ncols, int nrows, int n_experts_used,
++                                        size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream) {
++    const int blocks_per_row = ncols / QK2_0;
++    constexpr int SG_PER_WG = 4;
++    auto go = [&](auto lpr_tag) {
++        constexpr int LPR = decltype(lpr_tag)::value;
++        constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++        const int n_sg = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
++        const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
++        const sycl::range<3> block_dims(1, SG_PER_WG, WARP_SIZE);
++        stream->submit([&](sycl::handler & cgh) {
++            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    mul_mat_vec_q2_0_moe_glu_wide<LPR>(vx_gate, vx_up, vy, dst_base, ids_dev, ncols, nrows,
++                        stride_gate, stride_up, dst_row_stride, item);
++                });
++        });
++    };
++    if (blocks_per_row >= WARP_SIZE) go(std::integral_constant<int, WARP_SIZE>{});
++    else                             go(std::integral_constant<int, WARP_SIZE / 2>{});
++}
++
+ bool ggml_sycl_mul_mat_vec_q_id(
+     enum ggml_type     src0_type,
+     const void *       vx_base,
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -74,3 +74,9 @@
+     dpct::queue_ptr    stream);
+ 
+ #endif // GGML_SYCL_MMVQ_HPP
++
++// Fused q2_0 MoE gate + up + SwiGLU at one token (GGML_SYCL_MOE_Q2W=1); see apply_moeglu.py.
++bool ggml_sycl_moe_q2w_on();
++void ggml_sycl_mul_mat_vec_q2_0_moe_glu(const void * vx_gate, const void * vx_up, const void * vy, const int32_t * ids_dev,
++                                        float * dst_base, int ncols, int nrows, int n_experts_used,
++                                        size_t stride_gate, size_t stride_up, size_t dst_row_stride, dpct::queue_ptr stream);
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -4836,6 +4836,54 @@
+     }
+ }
+ 
++// Fused {MUL_MAT_ID(gate), MUL_MAT_ID(up), GLU(swiglu)} for q2_0 experts at one token (GGML_SYCL_MOE_Q2W=1).
++// One q8_1 quantization of the shared input and one kernel writing the GLU's output; declines (returns
++// false, the three nodes then run as before) on anything but that exact shape.
++static bool ggml_sycl_mmid_glu_q2w_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
++    static const bool glu_off = getenv("GGML_SYCL_MOE_GLU_OFF") != nullptr;   // A/B hook: the unfused wide kernels
++    if (glu_off || !ggml_sycl_moe_q2w_on()) return false;
++    if (node_idx + 2 >= cgraph->n_nodes) return false;
++    ggml_tensor * glu = cgraph->nodes[node_idx + 2];
++    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) return false;
++    if (ggml_get_op_params_i32(glu, 1) != 0) return false;                       // swapped halves
++    ggml_tensor * gate = glu->src[0];
++    ggml_tensor * up   = glu->src[1];
++    ggml_tensor * n0 = cgraph->nodes[node_idx], * n1 = cgraph->nodes[node_idx + 1];
++    if (!gate || !up || gate == up) return false;
++    if (!((gate == n0 && up == n1) || (gate == n1 && up == n0))) return false;
++    // gate and up are siblings, not a chain: ggml_sycl_can_fuse's chain test always declines them, so use
++    // the subgraph form with the GLU as the only materialised output (as the dense GLU fusion does)
++    if (!g_ggml_sycl_enable_fusion ||
++        !ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { node_idx + 2 })) return false;
++
++    const ggml_tensor * wg = gate->src[0], * wu = up->src[0];
++    const ggml_tensor * x  = gate->src[1], * ids = gate->src[2];
++    if (up->src[1] != x || up->src[2] != ids) return false;                      // same input, same routing
++    if (wg->type != GGML_TYPE_Q2_0 || wu->type != GGML_TYPE_Q2_0) return false;
++    if (ggml_backend_buffer_is_sycl_split(wg->buffer) || ggml_backend_buffer_is_sycl_split(wu->buffer)) return false;
++    const ggml_tensor_extra_gpu * eg = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
++    const ggml_tensor_extra_gpu * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
++    if ((eg && eg->optimized_feature.reorder) || (eu && eu->optimized_feature.reorder)) return false;
++    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) return false;
++    // one token, one input row shared by every expert: x [K, 1, 1], ids [n, 1]
++    if (x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || ids->ne[1] != 1) return false;
++    const int64_t K = x->ne[0];
++    if (wg->ne[0] != K || wu->ne[0] != K || K % QK2_0 != 0 || K % QK8_1 != 0) return false;
++    if (wg->ne[1] != wu->ne[1] || wg->ne[2] != wu->ne[2]) return false;
++    if (wg->nb[1] != (size_t) (K / QK2_0) * sizeof(block_q2_0) || wu->nb[1] != wg->nb[1]) return false;   // packed rows
++    if (glu->type != GGML_TYPE_F32 || glu->ne[0] != wg->ne[1] || glu->ne[1] != ids->ne[0] || glu->ne[2] != 1) return false;
++    if (glu->nb[0] != sizeof(float)) return false;
++
++    scope_op_debug_print scope_dbg_print(__func__, glu, /*num_src=*/2, " : q2_0 MoE gate + up + swiglu");
++    const queue_ptr stream = ctx.stream();
++    const int padded = GGML_PAD((int) K, MATRIX_ROW_PADDING);
++    ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) padded * sizeof(block_q8_1) / QK8_1);
++    quantize_row_q8_1_sycl<quantize_q8_1>((const float *) x->data, q8.get(), (int) K, 1, padded, stream);
++    ggml_sycl_mul_mat_vec_q2_0_moe_glu(wg->data, wu->data, q8.get(), (const int32_t *) ids->data, (float *) glu->data,
++                                       (int) K, (int) wg->ne[1], (int) ids->ne[0], wg->nb[2], wu->nb[2], glu->nb[1], stream);
++    return true;
++}
++
+ // Fused dense-FFN mat-vec for the {mul_mat(gate), mul_mat(up), GLU} subgraph at node_idx.
+ // Returns false if it declined, in which case the caller runs the three nodes normally.
+ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+@@ -6079,6 +6127,11 @@
+             i += 2;
+             continue;
+         }
++
++        if (node->op == GGML_OP_MUL_MAT_ID && ggml_sycl_mmid_glu_q2w_fused(*sycl_ctx, cgraph, i)) {
++            i += 2;
++            continue;
++        }
+ 
+         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+         if (!ok) {

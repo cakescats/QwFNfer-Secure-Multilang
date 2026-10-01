@@ -158,6 +158,21 @@ private:
 void * dio_alloc(size_t bytes);
 void   dio_free(void * p);
 
+// Host memory the kernel cannot reclaim, for the RAM expert tier and the prefill staging
+// (QWFN_LOCK_HOST=1). The device backends' own "pinned" host buffers are, on xe, mappings of
+// the DRM render node whose backing pages the driver may swap out under host memory pressure
+// (and mlock silently skips such mappings). This is anonymous memory, mlock'd, and registered
+// with the Level Zero driver when one is loaded, so device copies from it stay direct.
+struct host_block {
+    void * p        = nullptr;
+    size_t bytes    = 0;       // mapped size (rounded up)
+    bool   locked   = false;   // mlock succeeded (and VmLck grew)
+    bool   imported = false;   // registered with the Level Zero driver
+};
+bool host_lock_requested();
+bool host_block_alloc(host_block & b, size_t bytes, const char * what, bool huge_pages);
+void host_block_free(host_block & b);
+
 // --- memory safety -------------------------------------------------------
 // This engine's RAM tier is one large anonymous arena, and the target machine
 // has 30 GB of RAM behind 30 GB of zram swap at vm.swappiness=150. Asking for

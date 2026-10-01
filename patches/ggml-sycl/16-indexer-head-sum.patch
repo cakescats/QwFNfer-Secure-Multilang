@@ -1,0 +1,75 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -260,6 +260,55 @@
+     }
+     return j;
+ }
++static bool ggml_sycl_fuse_idx_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_FUSE_IDX"); return e && atoi(e) != 0; }();
++    return on;
++}
++// UNARY(RELU) at i -> PERMUTE(1, 0, 2, 3) -> CONT -> SUM_ROWS, the QSA indexer's per-head score sum: true when the
++// four nodes are consecutive, each intermediate has one reader and is no graph output, and the relu reads a
++// contiguous F32 [B, H, T] with H <= 16.
++static bool ggml_sycl_match_idx_sum(const ggml_cgraph * cgraph, int i) {
++    if (i + 3 >= cgraph->n_nodes) return false;
++    const ggml_tensor * u = cgraph->nodes[i], * p = cgraph->nodes[i + 1], * c = cgraph->nodes[i + 2], * s = cgraph->nodes[i + 3];
++    if (p->op != GGML_OP_PERMUTE || p->src[0] != u || c->op != GGML_OP_CONT || c->src[0] != p ||
++        s->op != GGML_OP_SUM_ROWS || s->src[0] != c) return false;
++    const int32_t * ax = (const int32_t *) p->op_params;
++    if (ax[0] != 1 || ax[1] != 0 || ax[2] != 2 || ax[3] != 3) return false;
++    const ggml_tensor * x = u->src[0];
++    if (x->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || c->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32) return false;
++    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(u) || !ggml_is_contiguous(s) || !ggml_are_same_shape(x, u)) return false;
++    if (u->ne[3] != 1 || u->ne[1] < 1 || u->ne[1] > 16) return false;
++    if (s->ne[0] != 1 || s->ne[1] != u->ne[0] || s->ne[2] != u->ne[2] || s->ne[3] != 1) return false;
++    for (int k = i; k < i + 3; k++) {
++        const ggml_tensor * n = cgraph->nodes[k];
++        if ((n->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, k) != 1) return false;
++    }
++    return true;
++}
++// out[b + t*B] = sum_h max(x[b + h*B + t*B*H], 0), summed in k_sum_rows_f32's order: lane h holds head h, the rest
++// hold 0, and the sub-group butterfly (xor masks 16..1) meets at lane 0. Lanes >= 16 never reach lane 0 before the
++// mask-16 step, where they add an exact 0, so emulating lanes 0..15 with masks 8..1 is bit-identical.
++static void ggml_sycl_idx_sum(dpct::queue_ptr stream, const float * x, float * out, int64_t B, int H, int64_t T) {
++    const int64_t n = B * T, wg = 256;
++    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n + wg - 1) / wg) * wg), sycl::range<1>(wg)),
++        [=](sycl::nd_item<1> it) {
++            const int64_t i = it.get_global_id(0);
++            if (i >= n) return;
++            const int64_t b = i % B, t = i / B;
++            float a[16];
++#pragma unroll
++            for (int h = 0; h < 16; h++) a[h] = h < H ? sycl::fmax(x[b + (int64_t) h * B + t * B * H], 0.0f) : 0.0f;
++#pragma unroll
++            for (int m = 8; m > 0; m >>= 1) {
++                float nb[16];
++#pragma unroll
++                for (int l = 0; l < 16; l++) nb[l] = a[l] + a[l ^ m];
++#pragma unroll
++                for (int l = 0; l < 16; l++) a[l] = nb[l];
++            }
++            out[i] = a[0];
++        });
++}
+ #include "ggml-sycl/presets.hpp"
+ #include "ggml-sycl/quantize.hpp"
+ #include "ggml-sycl/repeat_back.hpp"
+@@ -6478,6 +6527,15 @@
+                 continue;
+             }
+         }
++        // GGML_SYCL_FUSE_IDX: the QSA indexer's relu -> permute -> cont -> sum_rows as one kernel into the sum's tensor
++        if (node->op == GGML_OP_UNARY && ggml_sycl_fuse_idx_on() && ggml_get_unary_op(node) == GGML_UNARY_OP_RELU &&
++            ggml_sycl_match_idx_sum(cgraph, i)) {
++            ggml_tensor * sr = cgraph->nodes[i + 3];
++            ggml_sycl_idx_sum(sycl_ctx->stream(), (const float *) node->src[0]->data, (float *) sr->data,
++                              node->ne[0], (int) node->ne[1], node->ne[2]);
++            i += 3;
++            continue;
++        }
+         if (node->op == GGML_OP_UNARY &&
+             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
+             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);

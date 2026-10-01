@@ -1,0 +1,53 @@
+diff --git a/ggml/src/ggml-sycl/outprod.cpp b/ggml/src/ggml-sycl/outprod.cpp
+index 8d10dad..257fc8f 100644
+--- a/ggml/src/ggml-sycl/outprod.cpp
++++ b/ggml/src/ggml-sycl/outprod.cpp
+@@ -47,6 +47,48 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
+         src0_nb03 = ne00 * ne01 * ne02 * (int64_t) sizeof(float);
+     }
+ 
++    // Small inner dimension (e.g. a rank-1 outer product, ne01 == 1): one native kernel over the whole
++    // destination instead of one oneMKL GEMM call per (i2, i3) plane. Each GEMM call pays oneMKL's kernel
++    // launch on the host, which dominates for tiny matrices issued once per token (hyper-connection
++    // combines issue two per layer). Same arithmetic: dst[i0,i1,i2,i3] = sum_k a[i0,k,i02,i03] * b[i1,k,i2,i3].
++    // GGML_SYCL_OUTPROD_NATIVE_MAX_K=0 keeps GEMM for every shape.
++    static const int64_t native_max_k = [] {
++        const char * e = getenv("GGML_SYCL_OUTPROD_NATIVE_MAX_K");
++        return e ? (int64_t) atoi(e) : (int64_t) 8;
++    }();
++    if (src0->type == GGML_TYPE_F32 && ne01 <= native_max_k) {
++        const int64_t n   = ne0 * ne1 * ne2 * ne3;
++        const int64_t r2n = ne2 / ne02, r3n = ne3 / ne03;
++        const int64_t k_n = ne01;
++        const int64_t a_nb1 = ne00, a_nb2 = ne00 * ne01, a_nb3 = ne00 * ne01 * ne02;   // src0 contiguous, in elements
++        const int64_t b_nb0 = nb10 / (int64_t) sizeof(float), b_nb1 = nb11 / (int64_t) sizeof(float);
++        const int64_t b_nb2 = nb12 / (int64_t) sizeof(float), b_nb3 = nb13 / (int64_t) sizeof(float);
++        const int64_t d0 = ne0, d01 = ne0 * ne1, d012 = ne0 * ne1 * ne2;
++        const float * a = src0_d;
++        const float * bb = src1_d;
++        float * out = dst_d;
++        const size_t wg = WARP_SIZE;
++        const size_t global = ((size_t) n + wg - 1) / wg * wg;
++        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(wg)),
++            [=](sycl::nd_item<1> it) {
++                const int64_t idx = (int64_t) it.get_global_id(0);
++                if (idx >= n) {
++                    return;
++                }
++                const int64_t i3 = idx / d012;
++                const int64_t i2 = (idx - i3 * d012) / d01;
++                const int64_t i1 = (idx - i3 * d012 - i2 * d01) / d0;
++                const int64_t i0 = idx - i3 * d012 - i2 * d01 - i1 * d0;
++                const int64_t i02 = i2 / r2n, i03 = i3 / r3n;
++                float acc = 0.0f;
++                for (int64_t k = 0; k < k_n; k++) {
++                    acc += a[i0 + k * a_nb1 + i02 * a_nb2 + i03 * a_nb3] * bb[i1 * b_nb0 + k * b_nb1 + i2 * b_nb2 + i3 * b_nb3];
++                }
++                out[idx] = acc;
++            });
++        return;
++    }
++
+     // GEMM parameters
+     const float alpha = 1.0f;
+     const float beta = 0.0f;

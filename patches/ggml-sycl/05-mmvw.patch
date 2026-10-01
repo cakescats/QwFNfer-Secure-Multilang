@@ -1,0 +1,226 @@
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -64,6 +64,7 @@
+ #include "ggml-sycl/getrows.hpp"
+ #include "ggml-sycl/mem.hpp"
+ #include "ggml-sycl/norm.hpp"
++#include "ggml-sycl/mmvw.hpp"
+ #include "ggml-sycl/presets.hpp"
+ #include "ggml-sycl/quantize.hpp"
+ #include "ggml-sycl/repeat_back.hpp"
+@@ -4736,6 +4737,17 @@
+     }
+ 
+     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
++    // One-token BF16/F16 matvec: wide loads, f32 input and sum, more lanes per row when rows are few (mmvw.cpp).
++    // MUL_MAT only: MUL_MAT_ID reaches this function too, with a stack copy of its dst.
++    if (!split && dst->op == GGML_OP_MUL_MAT && ggml_sycl_mmvw_enabled() && ggml_sycl_mmvw_supported(src0, src1, dst)) {
++        ggml_sycl_mmvw(ctx, src0, src1, dst);
++        return;
++    }
++    // Small-K F32 matmul (K <= 32: stream means, MoE weighted sums): one work-item per output instead of oneMKL.
++    if (!split && dst->op == GGML_OP_MUL_MAT && ggml_sycl_smallk_enabled() && ggml_sycl_smallk_supported(src0, src1, dst)) {
++        ggml_sycl_smallk(ctx, src0, src1, dst);
++        return;
++    }
+     int64_t min_compute_capability = INT_MAX;
+ 
+     if (split) {
+diff --git a/ggml/src/ggml-sycl/mmvw.cpp b/ggml/src/ggml-sycl/mmvw.cpp
+new file mode 100644
+index 0000000..1ef15cb
+--- /dev/null
++++ b/ggml/src/ggml-sycl/mmvw.cpp
+@@ -0,0 +1,173 @@
++// Wide-load matrix-vector product for 16-bit float weights at one token (decode).
++//
++// The generic path for BF16/F16 at T = 1 is DMMV: one 16-lane subgroup per output row, 8 bytes per
++// lane per step, plus (with GGML_SYCL_F16) a separate kernel converting the vector to half and a
++// half2 accumulator. For this model's decode matvecs that shape is the problem: the hyper-connection
++// mixers read 10240-long rows (160 dependent steps per subgroup), and several matvecs have 1-96 rows,
++// so almost the whole GPU idles for the length of one row.
++//
++// Here each row gets TPR lanes (16, 64 or 256, more when there are few rows), every lane loads
++// 16 bytes (8 weights) per step, the vector is read as f32 directly and the sum is f32. Lanes of a
++// row reduce within their subgroup, then across subgroups through local memory.
++#include "mmvw.hpp"
++
++namespace {
++
++constexpr int MMVW_WG = 256;
++
++template <typename T> inline float mmvw_to_f32(T v);
++template <> inline float mmvw_to_f32<sycl::half>(sycl::half v) { return (float) v; }
++template <> inline float mmvw_to_f32<sycl::ext::oneapi::bfloat16>(sycl::ext::oneapi::bfloat16 v) { return (float) v; }
++
++template <typename T, int TPR>
++void mmvw_kernel(const T * __restrict__ W, const float * __restrict__ x, float * __restrict__ y,
++                 const int64_t ncols, const int64_t nrows, const int64_t row_stride,
++                 const sycl::nd_item<1> & it, float * slm) {
++    constexpr int RPW = MMVW_WG / TPR;            // rows per work-group
++    constexpr int SG_PER_ROW = TPR / WARP_SIZE;
++    const int lid = (int) it.get_local_id(0);
++    const int r_local = lid / TPR;
++    const int t = lid % TPR;
++    const int64_t row = (int64_t) it.get_group(0) * RPW + r_local;
++
++    float acc = 0.0f;
++    if (row < nrows) {
++        const T * wr = W + row * row_stride;
++        for (int64_t k = (int64_t) t * 8; k < ncols; k += (int64_t) TPR * 8) {
++            const sycl::vec<uint16_t, 8> wv = *reinterpret_cast<const sycl::vec<uint16_t, 8> *>(wr + k);
++            const sycl::float4 x0 = *reinterpret_cast<const sycl::float4 *>(x + k);
++            const sycl::float4 x1 = *reinterpret_cast<const sycl::float4 *>(x + k + 4);
++            T w8[8];
++#pragma unroll
++            for (int j = 0; j < 8; j++) w8[j] = sycl::bit_cast<T>(wv[j]);
++            acc += mmvw_to_f32(w8[0]) * x0.x() + mmvw_to_f32(w8[1]) * x0.y() + mmvw_to_f32(w8[2]) * x0.z() + mmvw_to_f32(w8[3]) * x0.w()
++                 + mmvw_to_f32(w8[4]) * x1.x() + mmvw_to_f32(w8[5]) * x1.y() + mmvw_to_f32(w8[6]) * x1.z() + mmvw_to_f32(w8[7]) * x1.w();
++        }
++    }
++    // A subgroup never straddles two rows: TPR is a multiple of the subgroup size.
++    auto sg = it.get_sub_group();
++    acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
++    if constexpr (SG_PER_ROW == 1) {
++        if (row < nrows && sg.get_local_linear_id() == 0) y[row] = acc;
++    } else {
++        // Every lane reaches the barrier, including those past the last row.
++        const int sg_id = lid / WARP_SIZE;
++        if (sg.get_local_linear_id() == 0) slm[sg_id] = acc;
++        sycl::group_barrier(it.get_group());
++        if (t == 0 && row < nrows) {
++            float s = 0.0f;
++#pragma unroll
++            for (int i = 0; i < SG_PER_ROW; i++) s += slm[r_local * SG_PER_ROW + i];
++            y[row] = s;
++        }
++    }
++}
++
++template <typename T, int TPR>
++void mmvw_launch(const void * W, const float * x, float * y, int64_t ncols, int64_t nrows, int64_t row_stride,
++                 dpct::queue_ptr stream) {
++    constexpr int RPW = MMVW_WG / TPR;
++    const int64_t n_wg = (nrows + RPW - 1) / RPW;
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> slm(sycl::range<1>(MMVW_WG / WARP_SIZE), cgh);
++        const T * Wt = (const T *) W;
++        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_wg * MMVW_WG), sycl::range<1>(MMVW_WG)),
++                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                             mmvw_kernel<T, TPR>(Wt, x, y, ncols, nrows, row_stride, it,
++                                                 slm.get_multi_ptr<sycl::access::decorated::no>().get());
++                         });
++    });
++}
++
++template <typename T>
++void mmvw_dispatch(const void * W, const float * x, float * y, int64_t ncols, int64_t nrows, int64_t row_stride,
++                   dpct::queue_ptr stream) {
++    // More lanes per row when there are few rows, so the GPU has work for its width.
++    if (nrows <= 64 && ncols >= 256 * 8) {
++        mmvw_launch<T, 256>(W, x, y, ncols, nrows, row_stride, stream);
++    } else if (nrows <= 1024 && ncols >= 64 * 8) {
++        mmvw_launch<T, 64>(W, x, y, ncols, nrows, row_stride, stream);
++    } else {
++        mmvw_launch<T, 16>(W, x, y, ncols, nrows, row_stride, stream);
++    }
++}
++
++}  // namespace
++
++bool ggml_sycl_mmvw_enabled() {
++    static const int v = [] { const char * e = getenv("GGML_SYCL_MMVW"); return e ? atoi(e) : 0; }();
++    return v != 0;
++}
++
++bool ggml_sycl_mmvw_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16) return false;
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    // one token, no batch dimensions: the decode shape
++    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
++    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
++    const int64_t ncols = src0->ne[0];
++    if (ncols % 8 != 0 || src1->ne[0] != ncols) return false;
++    // rows contiguous, 16-byte loads: element-contiguous rows, 16-byte row stride and base
++    if (src0->nb[0] != ggml_type_size(src0->type) || src0->nb[1] % 16 != 0) return false;
++    if (((uintptr_t) src0->data) % 16 != 0) return false;
++    if (!ggml_is_contiguous(src1) || ((uintptr_t) src1->data) % 16 != 0) return false;
++    if (!ggml_is_contiguous(dst)) return false;
++    return true;
++}
++
++void ggml_sycl_mmvw(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
++    dpct::queue_ptr stream = ctx.stream();
++    const int64_t ncols = src0->ne[0], nrows = src0->ne[1];
++    const int64_t row_stride = src0->nb[1] / ggml_type_size(src0->type);
++    if (src0->type == GGML_TYPE_BF16) {
++        mmvw_dispatch<sycl::ext::oneapi::bfloat16>(src0->data, (const float *) src1->data, (float *) dst->data, ncols, nrows, row_stride, stream);
++    } else {
++        mmvw_dispatch<sycl::half>(src0->data, (const float *) src1->data, (float *) dst->data, ncols, nrows, row_stride, stream);
++    }
++}
++
++// ---- small-K f32 matmul (GGML_SYCL_SMALLK=1) ----
++// dst[n, m] = sum_k src0[m, k] * src1[n, k] for K = src0->ne[0] <= 32, one work-item per output, k in order.
++// The engine's decode graphs build two of these per hyper-connection mixer and MoE: the stream mean
++// ((1/hc)[4] against [4, 2560]) and the MoE weighted sum (expert rows [n, 2560] against weights [n]).
++// oneMKL's GEMM runs them at 3-8 us each for a few thousand multiply-adds.
++bool ggml_sycl_smallk_enabled() {
++    static const int v = [] { const char * e = getenv("GGML_SYCL_SMALLK"); return e ? atoi(e) : 0; }();
++    return v != 0;
++}
++
++bool ggml_sycl_smallk_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    const int64_t K = src0->ne[0];
++    if (K < 1 || K > 32 || src1->ne[0] != K) return false;
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
++    // element-contiguous rows; any row strides
++    if (src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float)) return false;
++    if (!ggml_is_contiguous(dst)) return false;
++    return src0->ne[1] * src1->ne[1] <= (int64_t) 1 << 24;
++}
++
++void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
++    dpct::queue_ptr stream = ctx.stream();
++    const int     K   = (int) src0->ne[0];
++    const int64_t M   = src0->ne[1], N = src1->ne[1];
++    const int64_t s0  = src0->nb[1] / sizeof(float), s1 = src1->nb[1] / sizeof(float);
++    const float * a   = (const float *) src0->data;
++    const float * b   = (const float *) src1->data;
++    float *       d   = (float *) dst->data;
++    const int64_t n_out = M * N;
++    const int64_t wg = 256;
++    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n_out + wg - 1) / wg) * wg), sycl::range<1>(wg)),
++        [=](sycl::nd_item<1> it) {
++            const int64_t i = it.get_global_id(0);
++            if (i >= n_out) return;
++            const int64_t m = i % M, n = i / M;          // dst is [M, N]: m fastest
++            const float * ar = a + m * s0;
++            const float * br = b + n * s1;
++            float acc = 0.0f;
++            for (int k = 0; k < K; k++) acc += ar[k] * br[k];
++            d[i] = acc;
++        });
++}
+diff --git a/ggml/src/ggml-sycl/mmvw.hpp b/ggml/src/ggml-sycl/mmvw.hpp
+new file mode 100644
+index 0000000..f204e37
+--- /dev/null
++++ b/ggml/src/ggml-sycl/mmvw.hpp
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include "common.hpp"
++
++// Wide-load BF16/F16 matrix-vector product at one token (see mmvw.cpp). Opt-in: GGML_SYCL_MMVW=1.
++bool ggml_sycl_mmvw_enabled();
++bool ggml_sycl_mmvw_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++void ggml_sycl_mmvw(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++
++// Small-K (<= 32) F32 matmul, one work-item per output (see mmvw.cpp). Opt-in: GGML_SYCL_SMALLK=1.
++bool ggml_sycl_smallk_enabled();
++bool ggml_sycl_smallk_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
++void ggml_sycl_smallk(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

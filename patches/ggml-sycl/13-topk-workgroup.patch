@@ -1,0 +1,237 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index d1eb003..00006b3 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -66,6 +66,7 @@
+ #include "ggml-sycl/norm.hpp"
+ #include "ggml-sycl/mmvw.hpp"
+ #include "ggml-sycl/sdattn.hpp"
++#include "ggml-sycl/topkwg.hpp"
+ #include "ggml-sycl/presets.hpp"
+ #include "ggml-sycl/quantize.hpp"
+ #include "ggml-sycl/repeat_back.hpp"
+@@ -6133,6 +6134,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             i += nodes_to_skip;
+             continue;
+         }
++        // GGML_SYCL_TOPK_WG: a descending ARGSORT that is only read through views of its first k columns
++        if (node->op == GGML_OP_ARGSORT && ggml_sycl_topkwg_enabled()) {
++            const ggml_tensor * src = node->src[0];
++            int k = 0, found = 0;
++            bool ok = src->type == GGML_TYPE_F32 && node->type == GGML_TYPE_I32 && src->nb[0] == sizeof(float) &&
++                      src->ne[2] == 1 && src->ne[3] == 1 && ggml_is_contiguous(node) &&
++                      ggml_get_op_params_i32(node, 0) == GGML_SORT_ORDER_DESC && ggml_sycl_topkwg_row_ok(src->ne[0]) &&
++                      !(node->flags & GGML_TENSOR_FLAG_OUTPUT);
++            for (int j = i + 1; ok && j < cgraph->n_nodes; j++) {
++                const ggml_tensor * n2 = cgraph->nodes[j];
++                for (int s = 0; s < GGML_MAX_SRC; s++) {
++                    if (n2->src[s] != node) continue;
++                    found++;
++                    if (n2->op != GGML_OP_VIEW || n2->view_offs != 0 || n2->ne[0] > 32 || n2->ne[0] < 1 ||
++                        n2->nb[1] != node->nb[1] || n2->ne[2] != 1 || n2->ne[3] != 1) { ok = false; break; }
++                    k = std::max<int>(k, (int) n2->ne[0]);
++                }
++            }
++            if (ok && k > 0 && found == ggml_node_get_use_count(cgraph, i)) {
++                ggml_sycl_topkwg_argsort(sycl_ctx->stream(), (const float *) src->data, (int32_t *) node->data,
++                                         src->ne[0], src->ne[1], src->nb[1] / sizeof(float), k);
++                continue;
++            }
++        }
+         // K/V gathers from the q8_0 cache + F16 casts + one-token FLASH_ATTN_EXT (GGML_SYCL_FUSE_SPARSE_DECODE=1)
+         if (node->op == GGML_OP_GET_ROWS && ggml_sycl_sparse_decode_attn_fused(*sycl_ctx, cgraph, i)) {
+             i += 8;
+diff --git a/ggml/src/ggml-sycl/topk-moe.cpp b/ggml/src/ggml-sycl/topk-moe.cpp
+index 7b0c946..1f3946f 100644
+--- a/ggml/src/ggml-sycl/topk-moe.cpp
++++ b/ggml/src/ggml-sycl/topk-moe.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ #include "topk-moe.hpp"
++#include "topkwg.hpp"
+ 
+ // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
+ // path of topk_moe_cuda; the fusion-detection helpers below are ported near-verbatim from
+@@ -253,6 +254,12 @@ static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
+     queue_ptr stream = ctx.stream();
+     ggml_sycl_set_device(ctx.device);
+ 
++    if (ggml_sycl_topkwg_enabled() && !args.delayed_softmax && !args.sigmoid && ggml_sycl_topkwg_row_ok(n_experts) &&
++        n_expert_used >= 1 && n_expert_used <= 32) {
++        ggml_sycl_topkwg_moe(stream, logits_d, weights_d, ids_d, n_experts, n_rows, n_expert_used, with_norm, clamp_val, scale_val);
++        return;
++    }
++
+     switch (n_experts) {
+         case 1:
+             launch_topk_moe<1>(stream, logits_d, weights_d, ids_d, n_rows, n_expert_used, clamp_val, scale_val,
+diff --git a/ggml/src/ggml-sycl/topkwg.cpp b/ggml/src/ggml-sycl/topkwg.cpp
+new file mode 100644
+index 0000000..c86ab4c
+--- /dev/null
++++ b/ggml/src/ggml-sycl/topkwg.cpp
+@@ -0,0 +1,146 @@
++// Work-group-wide top-k for rows of up to 1024 values (the MoE router and the next-layer predictor at decode).
++//
++// ggml-sycl's argsort sorts a whole row in one work-group with a bitonic network (45 barrier stages for 512
++// values, ~11 us on the B70), and its fused router kernel (topk-moe.cpp) gives a 512-expert row to a single
++// 16-lane sub-group (32 experts per lane, ten serial arg-max rounds). Here a row is one work-group with one
++// lane per value: the softmax's max and sum are group reductions, and each of the k rounds is one sub-group
++// arg-max, a write of the 32 sub-group winners to local memory (two buffers, alternating), one barrier, and
++// the same 32-way reduction in every sub-group. Ties go to the lower index.
++#include "topkwg.hpp"
++
++#include <cfloat>
++
++namespace {
++
++constexpr int TOPKWG_MAX_SG = 1024 / WARP_SIZE;
++
++struct vi { float v; int i; };
++
++inline vi better(vi a, vi b) { return (b.v > a.v || (b.v == a.v && b.i < a.i)) ? b : a; }
++
++inline vi sg_argmax(const sycl::sub_group & sg, vi x) {
++#pragma unroll
++    for (int m = WARP_SIZE / 2; m > 0; m >>= 1) {
++        vi o{ dpct::permute_sub_group_by_xor(sg, x.v, m), dpct::permute_sub_group_by_xor(sg, x.i, m) };
++        x = better(x, o);
++    }
++    return x;
++}
++
++// the k best of `v` (one per lane) over the work-group; every lane gets the winners in `ids`/`vals` (local).
++template <bool WANT_VALS>
++inline void wg_topk(const sycl::nd_item<1> & it, float v, const int k, int * ids_out, float * vals_out,
++                    float * sv, int * si /* [2][n_sg] */) {
++    const sycl::sub_group sg = it.get_sub_group();
++    const int lane = it.get_local_id(0);
++    const int n_sg = it.get_local_range(0) / WARP_SIZE;
++    const int sgid = lane / WARP_SIZE, sl = lane % WARP_SIZE;
++    for (int r = 0; r < k; r++) {
++        const int b = r & 1;
++        vi w = sg_argmax(sg, vi{ v, lane });
++        if (sl == 0) { sv[b * TOPKWG_MAX_SG + sgid] = w.v; si[b * TOPKWG_MAX_SG + sgid] = w.i; }
++        sycl::group_barrier(it.get_group());
++        // every sub-group reduces the same n_sg candidates
++        vi c{ -INFINITY, INT32_MAX };
++        for (int j = sl; j < n_sg; j += WARP_SIZE) c = better(c, vi{ sv[b * TOPKWG_MAX_SG + j], si[b * TOPKWG_MAX_SG + j] });
++        c = sg_argmax(sg, c);
++        if (lane == c.i) v = -INFINITY;
++        if (lane == 0) { ids_out[r] = c.i; if (WANT_VALS) vals_out[r] = c.v; }
++    }
++}
++
++inline float wg_reduce_max(const sycl::nd_item<1> & it, float x, float * s) {
++    const sycl::sub_group sg = it.get_sub_group();
++    const int lane = it.get_local_id(0), n_sg = it.get_local_range(0) / WARP_SIZE;
++    x = sycl::reduce_over_group(sg, x, sycl::maximum<float>());
++    if (lane % WARP_SIZE == 0) s[lane / WARP_SIZE] = x;
++    sycl::group_barrier(it.get_group());
++    float m = -INFINITY;
++    for (int j = lane % WARP_SIZE; j < n_sg; j += WARP_SIZE) m = sycl::fmax(m, s[j]);
++    m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
++    sycl::group_barrier(it.get_group());   // s is reused by the caller
++    return m;
++}
++
++inline float wg_reduce_sum(const sycl::nd_item<1> & it, float x, float * s) {
++    const sycl::sub_group sg = it.get_sub_group();
++    const int lane = it.get_local_id(0), n_sg = it.get_local_range(0) / WARP_SIZE;
++    x = sycl::reduce_over_group(sg, x, sycl::plus<float>());
++    if (lane % WARP_SIZE == 0) s[lane / WARP_SIZE] = x;
++    sycl::group_barrier(it.get_group());
++    float t = 0.0f;
++    for (int j = lane % WARP_SIZE; j < n_sg; j += WARP_SIZE) t += s[j];
++    t = sycl::reduce_over_group(sg, t, sycl::plus<float>());
++    sycl::group_barrier(it.get_group());
++    return t;
++}
++
++}  // namespace
++
++bool ggml_sycl_topkwg_enabled() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_TOPK_WG"); return e && atoi(e) != 0; }();
++    return on;
++}
++
++bool ggml_sycl_topkwg_row_ok(int64_t ncols) {
++    return ncols >= WARP_SIZE && ncols <= 1024 && ncols % WARP_SIZE == 0;
++}
++
++// ARGSORT (descending) whose only reader is a view of its first k columns: write those k indices per row.
++void ggml_sycl_topkwg_argsort(dpct::queue_ptr stream, const float * x, int32_t * dst, int64_t ncols, int64_t nrows,
++                              int64_t x_row_stride, int k) {
++    const int wg = (int) ncols;
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> sv(sycl::range<1>(2 * TOPKWG_MAX_SG), cgh);
++        sycl::local_accessor<int, 1>   si(sycl::range<1>(2 * TOPKWG_MAX_SG), cgh);
++        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) nrows * wg), sycl::range<1>(wg)),
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                const int64_t row = it.get_group(0);
++                const int lane = it.get_local_id(0);
++                float v = x[row * x_row_stride + lane];
++                if (sycl::isnan(v)) v = -FLT_MAX;
++                wg_topk<false>(it, v, k, dst + row * ncols, nullptr,
++                               sv.get_multi_ptr<sycl::access::decorated::no>().get(),
++                               si.get_multi_ptr<sycl::access::decorated::no>().get());
++            });
++    });
++}
++
++// The router: softmax over the row, the k best (ids, row stride ncols as the argsort tensor), their
++// probabilities normalised by max(sum, clamp) when with_norm, times scale.
++void ggml_sycl_topkwg_moe(dpct::queue_ptr stream, const float * logits, float * weights, int32_t * ids,
++                          int64_t n_experts, int64_t n_rows, int k, bool with_norm, float clamp_val, float scale_val) {
++    const int wg = (int) n_experts;
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> sv(sycl::range<1>(2 * TOPKWG_MAX_SG), cgh);
++        sycl::local_accessor<int, 1>   si(sycl::range<1>(2 * TOPKWG_MAX_SG), cgh);
++        sycl::local_accessor<float, 1> kv(sycl::range<1>(32), cgh);
++        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) n_rows * wg), sycl::range<1>(wg)),
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                const int64_t row = it.get_group(0);
++                const int lane = it.get_local_id(0);
++                float * s = sv.get_multi_ptr<sycl::access::decorated::no>().get();
++                int *   t = si.get_multi_ptr<sycl::access::decorated::no>().get();
++                float * kvals = kv.get_multi_ptr<sycl::access::decorated::no>().get();
++                const float x = logits[row * n_experts + lane];
++                // softmax as ggml's soft_max: max, exp(x - max), sum, times 1/sum
++                const float mx = wg_reduce_max(it, x, s);
++                const float e  = sycl::native::exp(x - mx);
++                const float sm = wg_reduce_sum(it, e, s);
++                float p = e * (1.0f / sm);
++                if (sycl::isnan(p)) p = -FLT_MAX;
++                int32_t * id_row = ids + row * n_experts;
++                wg_topk<true>(it, p, k, id_row, kvals, s, t);
++                sycl::group_barrier(it.get_group());   // kvals written by lane 0
++                if (lane == 0) {
++                    float inv = 1.0f;
++                    if (with_norm) {
++                        float tot = 0.0f;
++                        for (int j = 0; j < k; j++) tot += kvals[j];
++                        inv = 1.0f / sycl::fmax(tot, clamp_val);
++                    }
++                    for (int j = 0; j < k; j++) weights[row * k + j] = kvals[j] * inv * scale_val;
++                }
++            });
++    });
++}
+diff --git a/ggml/src/ggml-sycl/topkwg.hpp b/ggml/src/ggml-sycl/topkwg.hpp
+new file mode 100644
+index 0000000..4b07fe2
+--- /dev/null
++++ b/ggml/src/ggml-sycl/topkwg.hpp
+@@ -0,0 +1,11 @@
++#ifndef GGML_SYCL_TOPKWG_HPP
++#define GGML_SYCL_TOPKWG_HPP
++#include "common.hpp"
++// GGML_SYCL_TOPK_WG=1: work-group-wide top-k (topkwg.cpp) for the MoE router fusion and ARGSORT -> first-k views.
++bool ggml_sycl_topkwg_enabled();
++bool ggml_sycl_topkwg_row_ok(int64_t ncols);
++void ggml_sycl_topkwg_argsort(dpct::queue_ptr stream, const float * x, int32_t * dst, int64_t ncols, int64_t nrows,
++                              int64_t x_row_stride, int k);
++void ggml_sycl_topkwg_moe(dpct::queue_ptr stream, const float * logits, float * weights, int32_t * ids,
++                          int64_t n_experts, int64_t n_rows, int k, bool with_norm, float clamp_val, float scale_val);
++#endif

@@ -18,6 +18,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <vector>
+#if !defined(_WIN32)
+#  include <dlfcn.h>
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
 
 namespace qwfn {
 
@@ -33,6 +41,112 @@ void * dio_alloc(size_t bytes) {
 }
 
 void dio_free(void * p) { plat_free_aligned(p); }
+
+#if !defined(_WIN32)
+bool host_lock_requested() {
+    static const bool on = [] { const char * e = getenv("QWFN_LOCK_HOST"); return e && *e && strcmp(e, "0") != 0; }();
+    return on;
+}
+
+namespace {
+long vmlck_kb() {
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256]; long kb = -1;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "VmLck: %ld kB", &kb) == 1) break;
+    fclose(f);
+    return kb;
+}
+
+// The Level Zero import calls, looked up through the loader SYCL has already loaded, so the
+// engine carries no build dependency on Level Zero. Experimental functions are not exported
+// symbols: the driver hands them out by name.
+struct ze_import {
+    void * drv = nullptr;
+    int (*import_fn)(void *, void *, size_t) = nullptr;
+    int (*release_fn)(void *, void *)        = nullptr;
+};
+ze_import & ze() {
+    static ze_import z;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        void * lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+        if (!lib) return;   // no Level Zero in this process (CPU or CUDA build): lock only
+        auto get = (int (*)(uint32_t *, void **)) dlsym(lib, "zeDriverGet");
+        auto ext = (int (*)(void *, const char *, void **)) dlsym(lib, "zeDriverGetExtensionFunctionAddress");
+        if (!get || !ext) return;
+        uint32_t n = 0;
+        if (get(&n, nullptr) != 0 || n == 0) return;
+        std::vector<void *> h(n);
+        if (get(&n, h.data()) != 0) return;
+        for (void * d : h) {
+            void * fi = nullptr, * fr = nullptr;
+            if (ext(d, "zexDriverImportExternalPointer", &fi) == 0 && fi &&
+                ext(d, "zexDriverReleaseImportedPointer", &fr) == 0 && fr) {
+                z.drv = d;
+                z.import_fn  = (int (*)(void *, void *, size_t)) fi;
+                z.release_fn = (int (*)(void *, void *)) fr;
+                return;
+            }
+        }
+    });
+    return z;
+}
+}
+
+bool host_block_alloc(host_block & b, size_t bytes, const char * what, bool huge_pages) {
+    const size_t align = huge_pages ? (2u << 20) : 4096u;
+    const size_t sz = (bytes + align - 1) / align * align;
+    void * p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "[qwfn] %s: %.2f GB of host memory unavailable (%s)\n", what, sz / 1e9, strerror(errno));
+        return false;
+    }
+    if (huge_pages) madvise(p, sz, MADV_HUGEPAGE);
+    madvise(p, sz, MADV_DONTFORK);   // a child's copy-on-write would move pages under the driver's import
+    b = host_block{};
+    b.p = p; b.bytes = sz;
+    // mlock faults every page in: the whole block is committed now, at startup, rather than
+    // during the first long prefill. Success is measured, not assumed from the return code.
+    const long before = vmlck_kb();
+    const int  rc = mlock(p, sz);
+    const int  lerr = errno;
+    const long after = vmlck_kb();
+    b.locked = rc == 0 && after - before >= (long) (sz / 1024) - 4096;
+    ze_import & z = ze();
+    int irc = -1;
+    if (z.import_fn) {
+        irc = z.import_fn(z.drv, p, sz);
+        b.imported = irc == 0;
+    }
+    char lock_note[160];
+    if (b.locked) snprintf(lock_note, sizeof lock_note, "locked (VmLck +%ld MB)", (after - before) / 1024);
+    else if (rc != 0) snprintf(lock_note, sizeof lock_note, "NOT locked: mlock %s (raise RLIMIT_MEMLOCK / LimitMEMLOCK)", strerror(lerr));
+    else snprintf(lock_note, sizeof lock_note, "NOT locked: mlock returned 0 but VmLck grew only %ld MB", (after - before) / 1024);
+    char imp_note[96];
+    if (!z.import_fn) snprintf(imp_note, sizeof imp_note, "no Level Zero import available, not used");
+    else if (b.imported) snprintf(imp_note, sizeof imp_note, "registered with the GPU driver");
+    else snprintf(imp_note, sizeof imp_note, "GPU driver import FAILED (0x%x), not used", (unsigned) irc);
+    fprintf(stderr, "[qwfn] %s: %.2f GB anonymous host memory, %s, %s%s\n", what, sz / 1e9, lock_note, imp_note,
+            huge_pages ? ", transparent huge pages requested" : "");
+    return true;
+}
+
+void host_block_free(host_block & b) {
+    if (!b.p) return;
+    if (b.imported) { ze_import & z = ze(); if (z.release_fn) z.release_fn(z.drv, b.p); }
+    munmap(b.p, b.bytes);   // also drops the lock
+    b = host_block{};
+}
+
+#else
+// Locked host memory (QWFN_LOCK_HOST) is the Linux + Level Zero path: mlock and the
+// driver import. On Windows it is not requested, so the callers keep their pageable
+// or ggml-pinned buffers.
+bool host_lock_requested() { return false; }
+bool host_block_alloc(host_block &, size_t, const char *, bool) { return false; }
+void host_block_free(host_block & b) { b = host_block{}; }
+#endif
 
 uint64_t mem_available_bytes() { return plat_mem_available(); }
 

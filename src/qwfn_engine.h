@@ -289,6 +289,25 @@ public:
     bool    mtp_loaded() const { return mtp_on_; }     // the head is resident (not with --skip-miss)
 
     void    reset();                       // clear state, rewind to position 0
+
+    // A whole-sequence checkpoint in host memory: the per-sequence caches for the
+    // first n_past positions and the position. Derived structures (pooled block
+    // keys, the decode bias) are rebuilt after a restore, as after a prefill. Image
+    // embedding overrides are not kept: one is read only while its position is
+    // evaluated, so below n_past its effect is already in the caches; a restore
+    // drops them all, since another sequence's could land in the new tail. Not
+    // supported with the draft head, whose own state is not captured.
+    struct checkpoint {
+        int32_t              n_past = 0;
+        uint32_t             n_ctx = 0;
+        ggml_type            type_k = GGML_TYPE_COUNT, type_v = GGML_TYPE_COUNT;
+        bool                 kv_host = false, idx_host = false;
+        std::vector<uint8_t> st;
+        size_t bytes() const { return st.size(); }
+    };
+    size_t  checkpoint_bytes() const;      // what checkpoint_save() would hold now
+    bool    checkpoint_save(checkpoint & out, std::string & err);
+    bool    checkpoint_restore(const checkpoint & in, std::string & err);
     // Lend the expert tier's dynamic VRAM buffer to a client -- the server,
     // before it stages the vision projector for an image -- and take it back.
     // A streamed prefill lends it anyway and returns it; eval() re-syncs the
@@ -334,6 +353,10 @@ public:
     // Instrument: time layer `il`'s cached decode graph truncated after each node
     // (min of `reps` replays) and print the per-node deltas >= 8 us. Ends the session.
     void profile_layer_graph(uint32_t il, int reps = 10);
+    // Same prefix-timing applied to a live PREFILL chunk graph (QWFN_PF_PROFILE).
+    // Executes the graph O(n) times, so it corrupts engine state: measurement only.
+    void profile_prefill_graph(ggml_cgraph * gf, uint32_t il, int64_t Tc, int reps = 5);
+    bool pf_profiled_ = false;
     void profile_all_graphs();   // every cached decode graph replayed standalone (min of 10): the step's device time without the loop
     double t_replay_alloc = 0, t_replay_launch = 0, t_replay_wait = 0; uint64_t n_replay = 0;   // the cached decode graphs' replays, split
     uint64_t prefill_bytes_read()     const { return pf_.bytes_read; }       // expert bytes the streamed sweeps read
@@ -344,7 +367,17 @@ public:
 
     double t_prefill = 0, t_decode = 0, t_io = 0, t_warm = 0;
     double t_pf_graphA = 0, t_pf_moe = 0, t_pf_read = 0;   // where a layer-major prefill's time goes
+    double t_pf_zero = 0, t_pf_readback = 0, t_pf_sync = 0, t_pf_prefetch = 0, t_pf_head = 0;   // previously untimed prefill phases
+    double t_pf_attn_in = 0, t_pf_pos = 0;   // mask/indexer build and position upload, per chunk
+    double t_qsa_cellblk = 0, t_qsa_blkidx = 0, t_qsa_bias = 0, t_qsa_upload = 0;   // inside t_pf_attn_in
+    // graphA decomposition: build/run/free, and run split by layer type.
+    // gA_attn + gA_dn == gA_run (disjoint, covering). gA_ple OVERLAPS both.
+    double t_pf_gA_build = 0, t_pf_gA_run = 0, t_pf_gA_free = 0;
+    double t_pf_gA_attn = 0, t_pf_gA_dn = 0, t_pf_gA_ple = 0;
+    uint64_t n_pf_gA_attn = 0, n_pf_gA_dn = 0;
     double t_moe_gpu = 0, t_moe_cpu = 0, t_layerA = 0;   // where decode time goes
+    double t_readback = 0, t_prefetch = 0, t_settle_promo = 0, t_uploads = 0, t_head = 0;   // decode host work between the graphs
+    uint64_t n_upload_skip = 0;   // decode copies skipped because the device already held the zeros
     // The GPU MoE runs asynchronously, overlapped with the expert I/O wait and
     // the CPU MoE. t_moe_gpu then counts launch cost plus whatever the final
     // sync still had to wait -- t_moe_gpu_sync is that wait alone, and ~0 means
@@ -513,6 +546,11 @@ private:
     ggml_tensor *         p_vslot_ = nullptr, * p_vmask_ = nullptr;
     std::vector<uint64_t> vslot_ver_;
     int                   n_late_ = 0;   // slots of the late fold (experts promoted this token)
+    int                   n_late_per_pos_ = 0; // fold rows the graph reads per position of the step (see late_rows)
+    int late_rows(int64_t T) const { return (int) std::min<int64_t>(n_late_, (int64_t) n_late_per_pos_ * T); }
+    int64_t               late_zero_rows_ = 0;         // leading rows of t_gids_/t_gw_ known zero on the device
+    const ggml_tensor *   pc_zero_t_ = nullptr;        // t_pc_ whose leading pc_zero_rows_ rows are known zero
+    int64_t               pc_zero_rows_ = 0;
     // Learned routing predictor: per layer an F16 [n_embd, n_expert] head and an
     // F32 bias, used in place of that layer's router when predicting its routing.
     ggml_context *        predctx_ = nullptr; ggml_backend_buffer_t predbuf_ = nullptr;
@@ -656,6 +694,9 @@ private:
     bool     have_expert_map_ = false;
 
     std::vector<float>   logits_, xfer_, zeros_;
+    std::vector<int32_t>  cb_scratch_, bc_scratch_, bp_scratch_;   // QSA index arrays, reused across chunks
+    std::vector<uint16_t> mask_scratch_;   // reused across chunks: the causal mask is ~95 GB/prefill
+    std::vector<float>    bias_scratch_;   // reused across chunks: QSA per-block bias
     std::vector<int32_t> sel_, ids_;
     std::vector<float>   wgt_;
     std::vector<int32_t> pred_;   // last layer's prediction for this one

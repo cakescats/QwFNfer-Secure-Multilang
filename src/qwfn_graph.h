@@ -84,6 +84,11 @@ public:
 
     // 12 of 48 layers. Lightning indexer picks 2051 cells, then GQA over them.
     // `qsa` may be null, in which case attention is dense over the whole cache.
+    // Build the causal mask on the device (see qwfn_graph.cpp). Used when the
+    // engine passes a null kq_mask, i.e. when it skipped the host-side build.
+    ggml_tensor * causal_mask_dev(int64_t n_kv, int64_t T);
+    ggml_tensor * qsa_bias_dev(int64_t n_blocks, int64_t r, int64_t T);
+
     ggml_tensor * sparse_attn(ggml_tensor * cur, ggml_tensor * inp_pos,
                               ggml_tensor * kq_mask, const int sections[4], int il,
                               const qsa_inputs * qsa = nullptr);
@@ -140,6 +145,9 @@ public:
     // `k` may exceed n_expert_used: the extra, lower-ranked candidates are the
     // experts most likely to be swapped in by the true routing, and reading
     // them costs bandwidth the decode loop is not using. Sorted, best first.
+    // Router ranking for an already-mixed input (moe_route_predict's second half).
+    ggml_tensor * moe_route_predict_x(ggml_tensor * x, int il_next, int k, ggml_tensor * head_w, ggml_tensor * head_b,
+                                      ggml_tensor ** x_out = nullptr, ggml_tensor ** scores_out = nullptr);
     ggml_tensor * moe_route_predict(ggml_tensor * res_hc, int il_next, int k,
                                     ggml_tensor * head_w = nullptr, ggml_tensor * head_b = nullptr,
                                     ggml_tensor ** x_out = nullptr,        // the head's input, for the dump

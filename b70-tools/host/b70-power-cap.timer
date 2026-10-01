@@ -1,0 +1,9 @@
+[Unit]
+Description=Re-apply the B70 power cap every 10 minutes
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

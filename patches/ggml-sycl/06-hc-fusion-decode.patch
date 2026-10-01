@@ -1,0 +1,17 @@
+--- a/ggml/src/ggml-sycl/fusion.cpp
++++ b/ggml/src/ggml-sycl/fusion.cpp
+@@ -91,9 +91,11 @@
+         if (t->type != GGML_TYPE_F32) return "not F32";
+         if (t->ne[3] != 1) return "4-D";
+     }
+-    // Prefill only. At decode sizes (T=1: 4 rows, 40 KB) there is nothing to save and the
+-    // fused kernel runs just H work-groups; keeping decode on its old path by construction.
+-    if (cgraph->nodes[i + 1]->ne[2] < 32) return "decode-sized (T < 32)";
++    // Prefill by default. At decode sizes (T=1: 4 rows, 40 KB) the fused kernel runs just H
++    // work-groups, the shape the stock rms_norm runs too; what it saves there is launches, not
++    // bytes, which matters once decode is launch-bound. GGML_SYCL_FUSE_HC_DECODE=1 opts in.
++    static const bool hc_decode = [] { const char * e = getenv("GGML_SYCL_FUSE_HC_DECODE"); return e && atoi(e) != 0; }();
++    if (!hc_decode && cgraph->nodes[i + 1]->ne[2] < 32) return "decode-sized (T < 32)";
+     // OUT_PROD inner dimension 1: one product per element, y[e,t] * w[c,t]
+     if (y->ne[1] != 1 || w->ne[1] != 1) return "out_prod inner dim != 1";
+     if (op->ne[0] != y->ne[0] || op->ne[1] != w->ne[0] || op->ne[2] != y->ne[2] || w->ne[2] != y->ne[2]) return "out_prod shape";

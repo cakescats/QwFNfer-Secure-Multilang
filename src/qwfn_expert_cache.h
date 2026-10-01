@@ -85,6 +85,7 @@ struct expert_cache_stats {
     double   t_submit   = 0;    // building + submitting the reads
     double   t_promote  = 0;    // host->device copies warming the VRAM tier
     double   t_wait     = 0;    // blocked on completions
+    double   t_wait_spec = 0, t_wait_demand = 0;   // of t_wait: on in-flight speculative reads a fetch needs, on its demand reads
     uint64_t n_bursts   = 0;    // fetch_begin calls that issued at least one read
     uint64_t n_reads    = 0;    // individual io_uring reads issued
     uint64_t bytes_read = 0;
@@ -115,6 +116,12 @@ public:
         // settle_promotions() is where the RAM slots are finally released.
         ggml_backend_t vram_backend = nullptr;
         bool async_promote = true;
+        // Hand the VRAM tier's q2_0 parts to the kernels as GGML_TYPE_Q2_0_SOA (codes and scales in separate
+        // aligned arrays; the backend reorders on upload). Taken only when the backend supports it.
+        bool q2_soa = false;
+        // The same for the iq4_nl parts (GGML_TYPE_IQ4_NL_SOA, ggml-sycl patch 17): an iq4_nl block has q2_0's byte
+        // structure, so it takes the same layout. Taken only when the backend supports it.
+        bool iq4_soa = false;
         // Extra device bytes appended to the tier that the prefill streamer
         // borrows as its staging. During decode they hold expert slots like
         // the rest of the tier (the layers whose slots fall in that tail are
@@ -350,6 +357,24 @@ private:
     // Copy one host block into a device slot, evicting the coldest if needed.
     bool promote(layer_pool & lp, uint32_t expert_id, const uint8_t * host_block);
     void fill_gpu_handle(const layer_pool & lp, uint32_t gslot, expert_handle & h) const;
+    // The type the VRAM tier presents a part as: Q2_0_SOA for q2_0 when q2_soa is on, IQ4_NL_SOA for iq4_nl when
+    // iq4_soa is on.
+    ggml_type gpu_type(ggml_type t) const {
+#if QWFN_HAVE_GGML_SOA
+        if (q2_soa_  && t == GGML_TYPE_Q2_0)   return GGML_TYPE_Q2_0_SOA;
+        if (iq4_soa_ && t == GGML_TYPE_IQ4_NL) return GGML_TYPE_IQ4_NL_SOA;
+#endif
+        return t;
+    }
+    // The SOA types exist only in a ggml carrying the ggml-sycl patches (patches/ggml-sycl,
+    // 09 and 17); against a stock ggml -- the CUDA build -- the switches stay off.
+#if QWFN_HAVE_GGML_SOA
+    static bool is_soa(ggml_type t) { return t == GGML_TYPE_Q2_0_SOA || t == GGML_TYPE_IQ4_NL_SOA; }
+#else
+    static bool is_soa(ggml_type) { return false; }
+#endif
+    bool      q2_soa_ = false;
+    bool      iq4_soa_ = false;
 
     int32_t  find_slot(layer_pool & lp, uint32_t expert_id) const;
     // Slots referenced by the fetch() call in progress. Every handle it has
@@ -405,6 +430,7 @@ private:
     size_t                 arena_bytes_ = 0;
     ggml_backend_buffer_t  arena_buf_ = nullptr;
     ggml_backend_buffer_t  arena_hostbuf_ = nullptr;   // owns arena_ when pinned
+    host_block             arena_block_;               // owns arena_ when QWFN_LOCK_HOST
     bool                   arena_pinned_ = false;
     bool                   last_promote_async_ = false;
     struct pending_rel { uint32_t layer, expert; int32_t slot; };

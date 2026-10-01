@@ -26,6 +26,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +44,7 @@
 #include <csignal>
 #include <atomic>
 #include <pthread.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace qwfn;
@@ -583,6 +587,15 @@ struct live_stats {
     long long n_prompt_total = 0, n_gen_total = 0, n_requests = 0, n_input_total = 0, n_cached_total = 0;
     long long n_pairs_total = 0, n_accepted_total = 0, n_drafted_total = 0;   // the draft head's verify steps, drafts accepted, drafts proposed
     int    n_past = 0;
+    // Prefix cache: switches that restored a checkpoint, switches that found none,
+    // checkpoints taken and evicted, seconds spent, tokens not re-prefilled; the pool now.
+    // skipped_short: switches whose departing sequence was below --prefix-cache-min and not saved.
+    long long pc_hits = 0, pc_misses = 0, pc_saves = 0, pc_evictions = 0, pc_tokens_restored = 0, pc_skipped_short = 0;
+    double    pc_t_save = 0, pc_t_restore = 0;
+    // Prompt-boundary checkpoints taken, restores that used one, seconds spent saving them.
+    long long pc_boundary_saves = 0, pc_boundary_hits = 0;
+    double    pc_t_boundary_save = 0;
+    long long pc_entries = 0, pc_bytes = 0;
     // The last request that completed, kept apart from the live counters so a monitor
     // can show it while the next one runs.
     struct snapshot {
@@ -644,11 +657,40 @@ struct server {
     // differently ("<think>\n" + "\n</think>" vs "<think>\n\n</think>"). Without
     // this, a replayed conversation never matches and every turn re-prefills the
     // whole history.
-    std::vector<int32_t> last_gen;      // tokens generated last time
-    std::vector<int32_t> last_prompt;   // the prompt those tokens continued
-    json                 last_msgs;     // the message list that produced it
-    std::string          last_content, last_reasoning, last_tool_key;
-    bool                 last_thinking = true;
+    struct reply_state {
+        std::vector<int32_t> gen;      // tokens generated last time
+        std::vector<int32_t> prompt;   // the prompt those tokens continued
+        json                 msgs;     // the message list that produced it
+        std::string          content, reasoning, tool_key;
+        bool                 thinking = true;
+    };
+    reply_state last;
+
+    // Prefix cache (--prefix-cache GB): whole-sequence checkpoints of conversations
+    // the engine switched away from, least recently used evicted first. Each keeps
+    // its conversation's last reply too, so a returning conversation rebuilds the
+    // exact tokens it had consumed (see `last`) and matches its checkpoint.
+    struct prefix_entry {
+        std::vector<int32_t>                  tok;   // what the engine had consumed
+        std::unordered_map<int32_t, uint64_t> img;   // image hashes by position within tok
+        reply_state                           last;
+        engine::checkpoint                    ck;
+        uint64_t                              id = 0, used = 0;
+        bool                                  boundary = false;   // taken at the end of a prompt's history, not at a switch
+        // Host bytes besides the checkpoint: the token vectors, the image hashes and the
+        // reply, whose message list can carry base64 images (approximated by its dump).
+        static size_t meta_bytes(const std::vector<int32_t> & tok, const std::unordered_map<int32_t, uint64_t> & img, const reply_state & r) {
+            return (tok.size() + r.gen.size() + r.prompt.size()) * sizeof(int32_t) + img.size() * 32 +
+                   (r.msgs.is_null() ? 0 : r.msgs.dump().size()) + r.content.size() + r.reasoning.size() + r.tool_key.size();
+        }
+        size_t meta = 0;   // meta_bytes() when the entry was last written
+        size_t bytes() const { return ck.bytes() + meta; }
+    };
+    std::vector<prefix_entry> pool;
+    size_t   pool_budget = 0, pool_bytes = 0;
+    int32_t  pool_min = 1024;   // --prefix-cache-min: shorter sequences are not saved
+    int32_t  pool_boundary = 4096;   // --prefix-cache-boundary: checkpoint histories at least this long (0: off)
+    uint64_t pool_clock = 0, pool_next_id = 1;
     std::string          model_id = "qwen3.8-flash-next";
     std::string          model_file;   // the shard the server was started with, for /props
     uint32_t             n_ctx = 0, n_batch = 0;
@@ -666,6 +708,14 @@ struct server {
     struct prompt {
         std::vector<int32_t> tok;
         std::vector<std::pair<int32_t, std::vector<float>>> splices;  // offset, emb
+        // Built by continuing this prefix-cache entry's last request (0: none). Such a
+        // prompt carries no splices for the images inside that request, so only this
+        // entry may vouch for them.
+        uint64_t via = 0;
+        // End of the conversation history, where the assistant opener starts (-1: none).
+        // The prefix cache checkpoints here: the opener is rendered differently as the open
+        // end of a prompt and as a past turn, so a checkpoint after it is never a prefix.
+        int32_t boundary = -1;
     };
 
 };
@@ -897,6 +947,14 @@ int main(int argc, char ** argv) {
           "      --ram GB        --vram GB   --threads N   --cpu   --kv f16|q8_0\n"
           "      --reserve MB    VRAM kept free after the expert tier is sized (default 768; raise it on a desktop GPU)\n"
           "      --ram-frac F    MemAvailable share the RAM tier may take (default 0.75)\n"
+          "      --prefix-cache GB  host memory for checkpoints of conversations switched away from (default 0 = off), so\n"
+          "                      alternating clients do not re-prefill; least recently used first out. ~16 KB per token at\n"
+          "                      --kv q8_0 plus ~118 MB per entry: a 21K-token conversation is ~460 MB. Not with --mtp\n"
+          "      --prefix-cache-min N  sequences shorter than N tokens are not saved (default 1024; 0 saves all): one-off\n"
+          "                      requests would otherwise take ~118 MB each. Lower it for clients that alternate below it\n"
+          "      --prefix-cache-boundary N  also checkpoint a chat prompt at the end of its history, before the assistant\n"
+          "                      opener, when that is at least N tokens (default 4096; 0 = off): a next request whose\n"
+          "                      re-rendered reply differs then restores it instead of re-prefilling everything\n"
           "      --spec-ahead N  predict 1 or 2 layers ahead (default 2)\n"
           "      --no-prefill-overlap   single prefill staging buffer, saves ~1.8 GB RAM\n"
           "\n"
@@ -912,6 +970,9 @@ int main(int argc, char ** argv) {
 
     std::string host = "127.0.0.1", mmproj_path, alias, def_effort = "xhigh";
     std::string api_key = getenv("QWFN_API_KEY") ? getenv("QWFN_API_KEY") : "";
+    double prefix_cache_gb = 0;
+    long   prefix_cache_min = 1024; bool prefix_cache_min_set = false;
+    long   prefix_cache_boundary = 4096;
     int vision_threads = 0;
     int def_reasoning_budget = 0;
     int port = 8080;
@@ -943,11 +1004,32 @@ int main(int argc, char ** argv) {
         if (a == "--ctx"    && i + 1 < argc) { cfg.n_ctx = (uint32_t) atoi(next()); continue; }
         if (a == "--batch"  && i + 1 < argc) { cfg.n_batch = (uint32_t) atoi(next()); continue; }
         if (a == "--ubatch-kv" && i + 1 < argc) { cfg.ubatch_kv_product = (uint64_t)(atof(next()) * 1e6); continue; }
+        if (a == "--prefill-chunk" && i + 1 < argc) { cfg.prefill_chunk = (uint32_t) atoi(next()); continue; }
         if (a == "--indexer-top-k" && i + 1 < argc) { cfg.indexer_top_k = (uint32_t) atoi(next()); continue; }
         if (a == "--ram"    && i + 1 < argc) { cfg.ram_bytes = (size_t)(atof(next()) * 1e9); continue; }
         if (a == "--vram"   && i + 1 < argc) { cfg.vram_bytes = (size_t)(atof(next()) * 1e9); continue; }
         if (a == "--threads"&& i + 1 < argc) { cfg.n_threads = atoi(next()); continue; }
         if (a == "--ram-frac" && i + 1 < argc) { cfg.ram_frac = atof(next()); continue; }
+        if (a == "--prefix-cache" && i + 1 < argc) { prefix_cache_gb = atof(next()); continue; }
+        if (a == "--prefix-cache-min" && i + 1 < argc) {   // strict: atoi would turn garbage into 0, "save everything"
+            const char * v = next(); char * end = nullptr;
+            errno = 0;
+            prefix_cache_min = strtol(v, &end, 10);
+            if (errno || end == v || *end || prefix_cache_min < 0 || prefix_cache_min > INT32_MAX) {
+                fprintf(stderr, "--prefix-cache-min: expected a token count >= 0, got '%s'\n", v); return 1;
+            }
+            prefix_cache_min_set = true;
+            continue;
+        }
+        if (a == "--prefix-cache-boundary" && i + 1 < argc) {
+            const char * v = next(); char * end = nullptr;
+            errno = 0;
+            prefix_cache_boundary = strtol(v, &end, 10);
+            if (errno || end == v || *end || prefix_cache_boundary < 0 || prefix_cache_boundary > INT32_MAX) {
+                fprintf(stderr, "--prefix-cache-boundary: expected a token count >= 0, got '%s'\n", v); return 1;
+            }
+            continue;
+        }
         if (a == "--spec-ahead" && i + 1 < argc) { cfg.speculate_ahead = (uint32_t) atoi(next()); continue; }
         if (a == "--no-prefill-overlap") { cfg.prefill_overlap = false; continue; }
         if (a == "--cpu")   { cfg.use_gpu = false; continue; }
@@ -986,10 +1068,37 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!effort_valid(def_effort)) { fprintf(stderr, "--think must be xhigh|medium|low|off\n"); return 1; }
+    if (prefix_cache_min_set && !(prefix_cache_gb > 0))
+        fprintf(stderr, "warning: --prefix-cache-min has no effect without --prefix-cache\n");
+    if (prefix_cache_gb > 0) {
+        if (prefix_cache_min >= (long) cfg.n_ctx) {
+            // Asked for explicitly: refuse. The default only: a small --ctx must not stop the
+            // server over a flag nobody passed, so halve the context instead.
+            if (prefix_cache_min_set) {
+                fprintf(stderr, "--prefix-cache-min %ld: not below --ctx %u, nothing could ever be saved\n", prefix_cache_min, cfg.n_ctx);
+                return 1;
+            }
+            prefix_cache_min = cfg.n_ctx / 2;
+            fprintf(stderr, "note: --prefix-cache-min defaults to %ld at --ctx %u\n", prefix_cache_min, cfg.n_ctx);
+        }
+        if (!cfg.mtp_path.empty()) { fprintf(stderr, "--prefix-cache: not supported with --mtp (the draft head's state is not checkpointed)\n"); return 1; }
+        // The pool is ordinary host memory next to the pinned RAM tier; leave the
+        // system some room rather than find out under the OOM killer.
+        const double phys = (double) sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
+        const double want = (double) cfg.ram_bytes + prefix_cache_gb * 1e9 + 4e9;
+        if (want > phys) {
+            fprintf(stderr, "--prefix-cache %.1f: with --ram %.1f it leaves less than 4 GB of the %.1f GB of RAM\n",
+                    prefix_cache_gb, cfg.ram_bytes / 1e9, phys / 1e9);
+            return 1;
+        }
+    }
 
     server S;
     S.n_ctx = cfg.n_ctx; S.n_batch = cfg.n_batch; S.mtp_drafts = cfg.mtp_drafts; S.def_effort = def_effort; S.def_reasoning_budget = def_reasoning_budget;
     S.model_file = argv[1];
+    S.pool_budget = (size_t) (prefix_cache_gb * 1e9);
+    S.pool_min = (int32_t) prefix_cache_min;
+    S.pool_boundary = (int32_t) prefix_cache_boundary;
     std::string err;
 
     fprintf(stderr, "loading tokenizer...\n");
@@ -1036,11 +1145,12 @@ int main(int argc, char ** argv) {
 
     auto build_prompt = [&](const json & messages, const std::string & effort,
                             bool thinking, const std::string & tools_block, const std::string & forced,
-                            server::prompt & P, std::string & e) -> bool {
+                            const json & tools, server::prompt & P, std::string & e) -> bool {
         auto enc_sp = [&](const std::string & s) { return S.vb.encode(s, false, true); };
         auto enc_pl = [&](const std::string & s) { return S.vb.encode(s, false, false); };
         auto app    = [&](const std::vector<int32_t> & v) { P.tok.insert(P.tok.end(), v.begin(), v.end()); };
         auto open_assistant = [&]() {
+            P.boundary = (int32_t) P.tok.size();
             app(enc_sp("<|im_start|>assistant\n"));
             app(enc_sp(thinking && forced.empty() ? "<think>\n" : "<think>\n\n</think>\n\n"));
             // A forced call opening: <tool_call> is one of the model's own tokens
@@ -1113,34 +1223,109 @@ int main(int argc, char ** argv) {
         // the previous one plus (our reply, a new user turn), the prompt is the
         // previous prompt plus the exact tokens we generated plus the new turn --
         // no re-tokenising, so the engine can continue from where it stopped.
-        const size_t nprev = S.last_msgs.is_array() ? S.last_msgs.size() : 0;
-        if (nprev > 0 && !S.last_gen.empty() && messages.size() >= nprev + 2) {
+        // With the prefix cache on, the previous request may be any cached
+        // conversation's: try the live one first, then the cached ones, newest first.
+        // For the live one, a miss is named, so the cause can be found.
+        auto continue_from = [&](const server::reply_state & L, bool live) -> int {   // 1 built, 0 not this one, -1 error
+            const size_t nprev = L.msgs.is_array() ? L.msgs.size() : 0;
+            if (!(nprev > 0 && !L.gen.empty() && messages.size() >= nprev + 2)) return 0;
             size_t diff = 0;
-            while (diff < nprev && S.last_msgs[diff] == messages[diff]) diff++;
+            while (diff < nprev && L.msgs[diff] == messages[diff]) diff++;
             const json & reply = messages[nprev];
-            const bool text_same  = content_of(reply).is_string() && same_reply_text(content_of(reply).get<std::string>(), S.last_content);
-            const bool calls_same = tool_calls_key(reply.value("tool_calls", json::array())) == S.last_tool_key;
-            if (diff == nprev && reply.value("role", "") == "assistant" && text_same && calls_same) {
-                P.tok = S.last_prompt;
-                P.tok.insert(P.tok.end(), S.last_gen.begin(), S.last_gen.end());
-                for (size_t m = nprev + 1; m < messages.size(); m++) {
-                    const std::string role = messages[m].value("role", "user");
-                    if (role == "assistant") { P.tok.clear(); break; }   // not a clean extension
-                    if (!render_user_or_tool(messages[m], role_at(m - 1), role_at(m + 1), e)) return false;
+            const bool text_same  = content_of(reply).is_string() && same_reply_text(content_of(reply).get<std::string>(), L.content);
+            const bool calls_same = tool_calls_key(reply.value("tool_calls", json::array())) == L.tool_key;
+            if (!(diff == nprev && reply.value("role", "") == "assistant" && text_same && calls_same)) {
+                if (!live) return 0;
+                if (diff < nprev) {
+                    // The harness changed something it had already sent, and the
+                    // recurrent state cannot be rewound to the change: the whole
+                    // history is re-prefilled.
+                    fprintf(stderr, "[qwfn-server] prefix lost: message %zu of %zu (%s) is not what the previous request sent (%zu -> %zu bytes)\n",
+                            diff, messages.size(), messages[diff].value("role", "?").c_str(), L.msgs[diff].dump().size(), messages[diff].dump().size());
+                } else {
+                    fprintf(stderr, "[qwfn-server] prefix lost: the reply at message %zu came back different from what was generated (role %s, text %s, tool calls %s)\n",
+                            nprev, reply.value("role", "?").c_str(), text_same ? "same" : "differs", calls_same ? "same" : "differ");
                 }
-                if (!P.tok.empty()) { open_assistant(); return true; }
-                P.splices.clear();   // fall through to a full rebuild
-            } else if (diff < nprev) {
-                // The harness changed something it had already sent, and the
-                // recurrent state cannot be rewound to the change: the whole
-                // history is re-prefilled. Named, so the cause can be found.
-                fprintf(stderr, "[qwfn-server] prefix lost: message %zu of %zu (%s) is not what the previous request sent (%zu -> %zu bytes)\n",
-                        diff, messages.size(), messages[diff].value("role", "?").c_str(), S.last_msgs[diff].dump().size(), messages[diff].dump().size());
-            } else {
-                fprintf(stderr, "[qwfn-server] prefix lost: the reply at message %zu came back different from what was generated (role %s, text %s, tool calls %s)\n",
-                        nprev, reply.value("role", "?").c_str(), text_same ? "same" : "differs", calls_same ? "same" : "differ");
+                return 0;
+            }
+            P.tok = L.prompt;
+            P.tok.insert(P.tok.end(), L.gen.begin(), L.gen.end());
+            for (size_t m = nprev + 1; m < messages.size(); m++) {
+                const std::string role = messages[m].value("role", "user");
+                if (role == "assistant") { P.tok.clear(); break; }   // not a clean extension
+                if (!render_user_or_tool(messages[m], role_at(m - 1), role_at(m + 1), e)) return -1;
+            }
+            if (!P.tok.empty()) { open_assistant(); return 1; }
+            P.splices.clear();   // fall through to a full rebuild
+            return 0;
+        };
+        {
+            const int r = continue_from(S.last, true);
+            if (r != 0) return r > 0;
+            std::vector<const server::prefix_entry *> order;
+            for (const auto & pe : S.pool) order.push_back(&pe);
+            std::sort(order.begin(), order.end(), [](auto a, auto b) { return a->used > b->used; });
+            for (const auto * pe : order) {
+                const int rp = continue_from(pe->last, false);
+                if (rp < 0) return false;
+                if (rp > 0) { P.via = pe->id; return true; }
             }
         }
+        // A cached reply that appears verbatim mid-conversation (full rebuild below).
+        auto known_reply = [&](const std::string & text, const json & tcs, const std::string & rc) -> const server::reply_state * {
+            auto ok = [&](const server::reply_state & L) {
+                return !L.gen.empty() && same_reply_text(text, L.content) && tool_calls_key(tcs) == L.tool_key && (rc.empty() || rc == L.reasoning);
+            };
+            if (ok(S.last)) return &S.last;
+            for (const auto & pe : S.pool) if (ok(pe.last)) return &pe.last;
+            return nullptr;
+        };
+        // Every earlier reply the engine consumed through a continuation went in as the tokens
+        // it generated, and re-tokenizing its text almost never reproduces them: a rebuilt prompt
+        // would leave the consumed sequence at the first assistant turn of the conversation, and
+        // no checkpoint of a later point could match it. So take the turn's tokens from a sequence
+        // the engine consumed (live, then cached) when that sequence matches the prompt so far and
+        // its turn decodes to an equivalent reply - by the same rules as known_reply.
+        const std::vector<int32_t> hdr = enc_sp("<|im_start|>assistant\n");
+        const std::vector<int32_t> eot = enc_sp("<|im_end|>\n");
+        auto trim_ws = [](const std::string & x) {
+            size_t a = 0, b = x.size();
+            while (a < b && std::isspace((unsigned char) x[a])) a++;
+            while (b > a && std::isspace((unsigned char) x[b - 1])) b--;
+            return x.substr(a, b - a);
+        };
+        auto consumed_reply = [&](const std::string & text, const json & tcs, const std::string & rc) -> bool {
+            const size_t pos = P.tok.size();
+            std::vector<const std::vector<int32_t> *> refs{&S.consumed};
+            for (const auto & pe : S.pool) refs.push_back(&pe.tok);
+            for (const auto * ref : refs) {
+                const auto & r = *ref;
+                if (r.size() < pos + hdr.size() + eot.size() || !std::equal(P.tok.begin(), P.tok.end(), r.begin()) ||
+                    !std::equal(hdr.begin(), hdr.end(), r.begin() + pos)) continue;
+                // The turn ends at its <|im_end|>\n before the next <|im_start|>; a reply cut off by
+                // max_tokens has none, and must not be matched against the turns after it.
+                const auto next_turn = std::find(r.begin() + pos + hdr.size(), r.end(), hdr.front());
+                const auto it = std::search(r.begin() + pos + hdr.size(), next_turn, eot.begin(), eot.end());
+                if (it == next_turn) continue;
+                std::string body = S.vb.decode(std::vector<int32_t>(r.begin() + pos + hdr.size(), it), true);
+                std::string reasoning, content = body;
+                if (body.rfind("<think>", 0) == 0) {
+                    const size_t c = body.find("</think>");
+                    if (c == std::string::npos) continue;
+                    reasoning = trim_ws(body.substr(7, c - 7));
+                    content = body.substr(c + 8);
+                }
+                size_t lead = 0; while (lead < content.size() && content[lead] == '\n') lead++;
+                content = content.substr(lead);
+                json calls; const std::string before = parse_tool_calls(content, tools, calls);
+                const std::string ctext = calls.empty() ? content : before;
+                if (!same_reply_text(ctext, text) || tool_calls_key(calls) != tool_calls_key(tcs) ||
+                    (!rc.empty() && trim_ws(rc) != reasoning)) continue;
+                P.tok.insert(P.tok.end(), r.begin() + pos, it + eot.size());
+                return true;
+            }
+            return false;
+        };
 
         std::string system_msg;
         size_t first = 0;
@@ -1161,13 +1346,13 @@ int main(int argc, char ** argv) {
                 const json tcs = messages[m].value("tool_calls", json::array());
                 // If this is verbatim the reply we just produced, replay the
                 // exact tokens so the engine can continue instead of re-prefilling.
-                if (!S.last_gen.empty() && same_reply_text(text, S.last_content) && tool_calls_key(tcs) == S.last_tool_key &&
-                    (rc.empty() || rc == S.last_reasoning)) {
+                if (const server::reply_state * L = known_reply(text, tcs, rc)) {
                     app(enc_sp("<|im_start|>assistant\n"));
-                    app(enc_sp(S.last_thinking ? "<think>\n" : "<think>\n\n</think>\n\n"));
-                    P.tok.insert(P.tok.end(), S.last_gen.begin(), S.last_gen.end());
+                    app(enc_sp(L->thinking ? "<think>\n" : "<think>\n\n</think>\n\n"));
+                    P.tok.insert(P.tok.end(), L->gen.begin(), L->gen.end());
                     continue;
                 }
+                if (imgs.empty() && consumed_reply(text, tcs, rc)) continue;
                 app(enc_sp("<|im_start|>assistant\n<think>\n"));
                 if (!rc.empty()) app(enc_pl(rc));
                 app(enc_sp("\n</think>\n\n"));
@@ -1194,9 +1379,10 @@ int main(int argc, char ** argv) {
 
     // The prefix the engine can continue from: everything it holds, when the
     // prompt strictly extends it (images included: the pads match any image of
-    // the same size, so each one's embedding is compared by hash); else 0.
+    // the same size, so each one's embedding is compared by hash); else 0. A prompt
+    // equal to it has no tail to produce logits from, so it re-prefills.
     auto prefix_reuse = [&](const server::prompt & P) -> int32_t {
-        if (S.consumed.empty() || P.tok.size() < S.consumed.size() ||
+        if (S.consumed.empty() || P.tok.size() <= S.consumed.size() ||
             !std::equal(S.consumed.begin(), S.consumed.end(), P.tok.begin())) return 0;
         for (const auto & sp : P.splices)
             if (sp.first < (int32_t) S.consumed.size()) {
@@ -1205,6 +1391,197 @@ int main(int argc, char ** argv) {
                     it->second != hash_bytes(sp.second.data(), sp.second.size() * sizeof(float))) return 0;
             }
         return (int32_t) S.consumed.size();
+    };
+
+    // ---- prefix cache ----------------------------------------------------------
+    // Called where a request does not extend the live sequence. The longest cached
+    // prefix of the new prompt is found first, then the live sequence is saved (it
+    // is exactly S.consumed: every path that leaves it in doubt resets it) with
+    // S.last, the reply that belongs to it, and the entry found is restored. The
+    // save never evicts or supersedes that entry. All of it runs under S.mu.
+    auto pool_stats = [&]() {   // S.live.mu held
+        S.live.pc_entries = (long long) S.pool.size(); S.live.pc_bytes = (long long) S.pool_bytes;
+    };
+    auto pool_erase = [&](size_t i) {
+        S.pool_bytes -= S.pool[i].bytes();
+        S.pool.erase(S.pool.begin() + (std::ptrdiff_t) i);
+    };
+    auto pool_find = [&](uint64_t id) -> server::prefix_entry * {
+        for (auto & pe : S.pool) if (pe.id == id) return &pe;
+        return nullptr;
+    };
+    // Room for `need` bytes, least recently used out, never the entry `keep`.
+    auto pool_evict_to = [&](size_t need, uint64_t keep) -> bool {
+        while (S.pool_bytes + need > S.pool_budget) {
+            size_t lru = S.pool.size();
+            for (size_t i = 0; i < S.pool.size(); i++)
+                if (S.pool[i].id != keep && (lru == S.pool.size() || S.pool[i].used < S.pool[lru].used)) lru = i;
+            if (lru == S.pool.size()) return false;
+            pool_erase(lru);
+            std::lock_guard<std::mutex> lk(S.live.mu); S.live.pc_evictions++; pool_stats();
+        }
+        return true;
+    };
+    auto pool_save = [&](uint64_t keep) {
+        const int32_t n = S.eng.n_past();
+        if (n <= 0 || n != (int32_t) S.consumed.size()) return;
+        // A one-off request (a title, a summary, a raw completion) would cost the ~118 MB
+        // of constant recurrent state for almost nothing. Checked before the size, which
+        // serializes the message list.
+        if (n < S.pool_min) {
+            std::lock_guard<std::mutex> lk(S.live.mu); S.live.pc_skipped_short++;
+            fprintf(stderr, "[prefix-cache] not saved: %d tokens, below --prefix-cache-min %d\n", n, S.pool_min);
+            return;
+        }
+        // A reply cleared by a failed request is not this sequence's any more.
+        const bool reply_ok = S.last.msgs.is_array();
+        const size_t need = S.eng.checkpoint_bytes() + server::prefix_entry::meta_bytes(S.consumed, S.consumed_img, S.last);
+        if (need > S.pool_budget) return;
+        // One entry per conversation: a cached prefix of this one is superseded (unless
+        // it is the entry about to be restored, or a prompt-boundary checkpoint, which is
+        // the fallback when this sequence's reply is not echoed back exactly); an identical
+        // one only needs touching.
+        bool covered_by_boundary = false;
+        for (size_t i = 0; i < S.pool.size(); ) {
+            auto & pe = S.pool[i];
+            if (pe.tok.size() <= S.consumed.size() && std::equal(pe.tok.begin(), pe.tok.end(), S.consumed.begin())) {
+                if (pe.boundary && pe.tok.size() < S.consumed.size()) { covered_by_boundary = true; i++; continue; }
+                if (pe.tok.size() == S.consumed.size()) {
+                    pe.used = ++S.pool_clock;
+                    if (reply_ok) {
+                        S.pool_bytes -= pe.bytes();
+                        pe.last = S.last; pe.meta = server::prefix_entry::meta_bytes(pe.tok, pe.img, pe.last);
+                        S.pool_bytes += pe.bytes();
+                    }
+                    std::lock_guard<std::mutex> lk(S.live.mu); pool_stats();
+                    return;
+                }
+                if (pe.id != keep) { pool_erase(i); continue; }
+            }
+            i++;
+        }
+        // Next to a boundary checkpoint of this same sequence the full one only saves re-prefilling
+        // the reply, so it may not push anything out.
+        if (covered_by_boundary && S.pool_bytes + need > S.pool_budget) {
+            fprintf(stderr, "[prefix-cache] not saved: %zu tokens, a boundary checkpoint covers them and there is no free room\n", S.consumed.size());
+            return;
+        }
+        if (!pool_evict_to(need, keep)) return;
+        const auto t0 = clk::now();
+        server::prefix_entry pe;
+        std::string err;
+        try {
+            if (!S.eng.checkpoint_save(pe.ck, err)) { fprintf(stderr, "[prefix-cache] save failed: %s\n", err.c_str()); return; }
+            pe.tok = S.consumed; pe.img = S.consumed_img;
+            if (reply_ok) pe.last = S.last;
+        } catch (const std::bad_alloc &) {
+            fprintf(stderr, "[prefix-cache] save skipped: out of host memory for %.1f MB\n", need / 1e6);
+            return;
+        }
+        pe.meta = server::prefix_entry::meta_bytes(pe.tok, pe.img, pe.last);
+        pe.id = S.pool_next_id++; pe.used = ++S.pool_clock;
+        S.pool_bytes += pe.bytes();
+        S.pool.push_back(std::move(pe));
+        std::lock_guard<std::mutex> lk(S.live.mu);
+        S.live.pc_saves++; S.live.pc_t_save += since(t0); pool_stats();
+        fprintf(stderr, "[prefix-cache] saved %zu tokens, %.1f MB in %.0f ms; pool %zu entries, %.2f of %.2f GB\n",
+                S.consumed.size(), S.pool.back().bytes() / 1e6, since(t0) * 1e3, S.pool.size(), S.pool_bytes / 1e9, S.pool_budget / 1e9);
+    };
+    // A checkpoint of the prompt's history, taken inside the prefill once the engine has
+    // consumed exactly `n` tokens of `hist`. It supersedes this conversation's older checkpoints
+    // of either kind and reuses the buffer of the one it replaces, so the host peak is one
+    // checkpoint, not two.
+    auto pool_boundary_save = [&](const std::vector<int32_t> & hist, int32_t n) {
+        if (S.eng.n_past() != n) return;
+        std::unordered_map<int32_t, uint64_t> img;
+        for (const auto & kv : S.consumed_img) if (kv.first < n) img.insert(kv);
+        std::vector<int32_t> tok(hist.begin(), hist.begin() + n);
+        const server::reply_state none;
+        const size_t need = S.eng.checkpoint_bytes() + server::prefix_entry::meta_bytes(tok, img, none);
+        if (need > S.pool_budget) {
+            fprintf(stderr, "[prefix-cache] boundary not saved: %d tokens need %.2f GB, over the %.2f GB pool\n", n, need / 1e9, S.pool_budget / 1e9);
+            return;
+        }
+        engine::checkpoint reuse;
+        int superseded = 0;
+        for (size_t i = 0; i < S.pool.size(); ) {
+            auto & pe = S.pool[i];
+            if (pe.tok.size() <= tok.size() && std::equal(pe.tok.begin(), pe.tok.end(), tok.begin())) {
+                if (pe.tok.size() == tok.size()) {   // already have exactly this
+                    pe.used = ++S.pool_clock;
+                    return;
+                }
+                if (++superseded == 1) {   // keep one buffer for the new checkpoint; count its bytes out first
+                    S.pool_bytes -= pe.bytes();
+                    reuse = std::move(pe.ck);
+                    S.pool.erase(S.pool.begin() + (std::ptrdiff_t) i);
+                } else {
+                    pool_erase(i);
+                }
+                continue;
+            }
+            i++;
+        }
+        if (!pool_evict_to(need, 0)) return;
+        const auto t0 = clk::now();
+        server::prefix_entry pe;
+        pe.ck = std::move(reuse);
+        std::string err;
+        try {
+            if (!S.eng.checkpoint_save(pe.ck, err)) { fprintf(stderr, "[prefix-cache] boundary save failed: %s\n", err.c_str()); return; }
+        } catch (const std::bad_alloc &) {
+            fprintf(stderr, "[prefix-cache] boundary save skipped: out of host memory for %.1f MB\n", need / 1e6);
+            return;
+        }
+        pe.tok = std::move(tok); pe.img = std::move(img); pe.boundary = true;
+        pe.meta = server::prefix_entry::meta_bytes(pe.tok, pe.img, pe.last);
+        pe.id = S.pool_next_id++; pe.used = ++S.pool_clock;
+        S.pool_bytes += pe.bytes();
+        S.pool.push_back(std::move(pe));
+        std::lock_guard<std::mutex> lk(S.live.mu);
+        S.live.pc_boundary_saves++; S.live.pc_t_boundary_save += since(t0); pool_stats();
+        fprintf(stderr, "[prefix-cache] boundary saved at %d tokens, %.1f MB in %.0f ms; pool %zu entries, %.2f of %.2f GB\n",
+                n, S.pool.back().bytes() / 1e6, since(t0) * 1e3, S.pool.size(), S.pool_bytes / 1e9, S.pool_budget / 1e9);
+    };
+    auto pool_switch = [&](const server::prompt & P) -> bool {
+        const server::prefix_entry * best = nullptr;
+        for (const auto & pe : S.pool) {
+            if (pe.tok.size() >= P.tok.size() || (best && pe.tok.size() <= best->tok.size())) continue;
+            if (!std::equal(pe.tok.begin(), pe.tok.end(), P.tok.begin())) continue;
+            // Images: the pads match any image of the same size, so compare hashes. A
+            // splice inside the prefix must be the cached image; a cached image must be
+            // in the prompt's splices, unless the prompt continues this very entry.
+            bool ok = true; size_t covered = 0;
+            for (const auto & sp : P.splices) {
+                if (sp.first >= (int32_t) pe.tok.size()) continue;
+                const auto it = pe.img.find(sp.first);
+                if (it == pe.img.end() || it->second != hash_bytes(sp.second.data(), sp.second.size() * sizeof(float))) { ok = false; break; }
+                covered++;
+            }
+            if (ok && covered != pe.img.size() && P.via != pe.id) ok = false;
+            if (ok) best = &pe;
+        }
+        const uint64_t best_id = best ? best->id : 0;
+        pool_save(best_id);   // may move entries: look the hit up again by id
+        server::prefix_entry * hit = best_id ? pool_find(best_id) : nullptr;
+        if (!hit) { std::lock_guard<std::mutex> lk(S.live.mu); S.live.pc_misses++; return false; }
+        const auto t0 = clk::now();
+        std::string err;
+        if (!S.eng.checkpoint_restore(hit->ck, err)) {
+            fprintf(stderr, "[prefix-cache] restore failed: %s\n", err.c_str());
+            std::lock_guard<std::mutex> lk(S.live.mu); S.live.pc_misses++;
+            return false;
+        }
+        // `last` follows the live sequence, so a later save files this conversation's reply under it.
+        S.consumed = hit->tok; S.consumed_img = hit->img; S.last = hit->last;
+        hit->used = ++S.pool_clock;
+        std::lock_guard<std::mutex> lk(S.live.mu);
+        S.live.pc_hits++; S.live.pc_t_restore += since(t0); S.live.pc_tokens_restored += hit->tok.size();
+        if (hit->boundary) S.live.pc_boundary_hits++;
+        S.live.n_past = S.eng.n_past();
+        fprintf(stderr, "[prefix-cache] restored %zu of %zu prompt tokens in %.0f ms%s\n", hit->tok.size(), P.tok.size(), since(t0) * 1e3,
+                hit->boundary ? " (boundary checkpoint)" : "");
+        return true;
     };
 
     // on_delta(text, is_reasoning) is called as tokens land; return false to stop.
@@ -1221,26 +1598,64 @@ int main(int argc, char ** argv) {
         // needs_reset(): a previous request hit a graph failure and unwound. The
         // engine survived (it no longer aborts the process), but its recurrent
         // state is part-written and cannot be continued, so this request starts
-        // from a clean engine whatever the prefix says.
-        if (prefix_reuse(P) == 0 || S.eng.needs_reset()) {
-            S.eng.reset();
-            S.eng.clear_embeddings();
-            S.consumed.clear();
-            S.consumed_img.clear();
+        // from a clean engine whatever the prefix says -- and not from a pooled
+        // checkpoint either.
+        const bool must_reset = S.eng.needs_reset();
+        if (prefix_reuse(P) == 0 || must_reset) {
+            if (!S.consumed.empty() && !must_reset) {
+                // Where this prompt leaves what the engine holds: the one line that says why a turn
+                // re-prefilled (a re-rendered reply, an edited earlier message, a new conversation).
+                const size_t lim = std::min(S.consumed.size(), P.tok.size());
+                const size_t k = std::mismatch(S.consumed.begin(), S.consumed.begin() + lim, P.tok.begin()).first - S.consumed.begin();
+                auto snip = [&](const std::vector<int32_t> & v, size_t from, size_t to) {
+                    std::string t = S.vb.decode(std::vector<int32_t>(v.begin() + std::min(from, v.size()), v.begin() + std::min(to, v.size())), true);
+                    std::string o;
+                    for (char c : t) o += c == '\n' ? std::string("\\n") : std::string(1, c);
+                    return o.size() > 160 ? o.substr(0, 160) + "..." : o;
+                };
+                fprintf(stderr, "[prefix-cache] no extend: prompt %zu tokens, engine holds %zu, first difference at %zu%s | before: \"%s\" | held: \"%s\" | prompt: \"%s\"\n",
+                        P.tok.size(), S.consumed.size(), k, k == lim ? (P.tok.size() <= S.consumed.size() ? " (prompt is not longer)" : " (image differs)") : "",
+                        snip(P.tok, k > 12 ? k - 12 : 0, k).c_str(), snip(S.consumed, k, k + 16).c_str(), snip(P.tok, k, k + 16).c_str());
+            }
+            const bool restored = !must_reset && S.pool_budget > 0 && pool_switch(P);
+            if (!restored) {
+                S.eng.reset();
+                S.eng.clear_embeddings();
+                S.consumed.clear();
+                S.consumed_img.clear();
+            }
         }
         if ((int32_t) P.tok.size() >= (int32_t) S.n_ctx) {
             e = "context_length_exceeded: prompt of " + std::to_string(P.tok.size())
               + " tokens exceeds the " + std::to_string(S.n_ctx) + " token context";
             return false;
         }
+        // From here on this call mutates the engine's sequence state. A failure
+        // after this point can leave it inconsistent: the layer graphs advance the
+        // DeltaNet scan as they run, while n_past_ is only bumped once the whole
+        // eval succeeds, so a mid-eval error (a short expert read, say) leaves some
+        // layers ahead of the token count. KV and the indexer survive that -- they
+        // are positional and get overwritten -- but a scan cannot be rewound, so the
+        // next request must not continue from it.
+        bool state_dirty = false;
+        struct dirty_guard {
+            server & st; const bool & dirty; bool ok = false;
+            ~dirty_guard() {
+                if (ok || !dirty) return;
+                st.last.msgs = json(); st.consumed.clear(); st.consumed_img.clear();
+                st.eng.reset(); st.eng.clear_embeddings();
+            }
+        } dg{S, state_dirty};
         for (const auto & sp : P.splices) {
             if (sp.first < (int32_t) S.consumed.size()) continue;   // already evaluated (and verified above)
+            state_dirty = true;
             S.eng.set_embeddings(sp.first, sp.second.data(),
                                  (int32_t) (sp.second.size() / 2560));
             S.consumed_img[sp.first] = hash_bytes(sp.second.data(), sp.second.size() * sizeof(float));
         }
 
         std::vector<int32_t> hist = P.tok;
+        if ((int32_t) P.tok.size() > (int32_t) S.consumed.size()) state_dirty = true;   // a tail will be fed
         int32_t fed = (int32_t) S.consumed.size();
         const int32_t fed0 = fed;
         R.n_input  = (int32_t) hist.size();
@@ -1256,13 +1671,19 @@ int main(int argc, char ** argv) {
 
         const auto tp = clk::now();
         const float * lg = nullptr;
+        // A prompt-boundary checkpoint: stop the prefill at the end of the history, save, go on.
+        const bool at_boundary = S.pool_budget > 0 && S.pool_boundary > 0 &&
+                                 P.boundary >= std::max(S.pool_boundary, S.pool_min) &&
+                                 fed < P.boundary && P.boundary < (int32_t) hist.size();
         while (fed < (int32_t) hist.size()) {
-            const int32_t take = std::min<int32_t>(S.n_batch, (int32_t) hist.size() - fed);
+            const int32_t stop = (at_boundary && fed < P.boundary) ? P.boundary : (int32_t) hist.size();
+            const int32_t take = std::min<int32_t>(S.n_batch, stop - fed);
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.prompt_base = fed - fed0; S.live.prompt_done = fed - fed0; }
             lg = S.eng.eval(hist.data(), fed + take, take, e);
             if (!lg) return false;
             fed += take;
             { std::lock_guard<std::mutex> lk(S.live.mu); S.live.prompt_base = fed - fed0; S.live.prompt_done = fed - fed0; S.live.n_past = S.eng.n_past(); }
+            if (at_boundary && fed == P.boundary) pool_boundary_save(hist, fed);
             if (on_tick) on_tick();
         }
         R.t_prompt = since(tp);
@@ -1475,26 +1896,38 @@ int main(int argc, char ** argv) {
         // Close the turn so the next request can continue from here. The sampled
         // end-of-turn token was appended but never evaluated, so the engine's
         // n_past -- not hist.size() -- is what it has actually consumed.
+        dg.ok = true;   // finished cleanly: the state describes exactly S.consumed
         S.consumed.assign(hist.begin(), hist.begin() + S.eng.n_past());
-        S.last_gen.assign(hist.begin() + P.tok.size(), hist.end());
+        S.last.gen.assign(hist.begin() + P.tok.size(), hist.end());
         // Generation stops before <|im_end|>\n closes the turn; add it so a
         // replayed history lines up with what the engine will next be fed.
-        for (int32_t t : S.vb.encode("\n", false, true)) S.last_gen.push_back(t);
-        S.last_prompt    = P.tok;
-        S.last_content   = R.content;
-        S.last_reasoning = R.reasoning;
-        S.last_thinking  = thinking;
+        for (int32_t t : S.vb.encode("\n", false, true)) S.last.gen.push_back(t);
+        S.last.prompt    = P.tok;
+        S.last.content   = R.content;
+        S.last.reasoning = R.reasoning;
+        S.last.thinking  = thinking;
         return true;
     };
 
     // ---- HTTP ---------------------------------------------------------------
     httplib::Server svr;
     svr.set_payload_max_length(256ull << 20);   // base64 images are bulky
+    // SO_REUSEADDR, as llama-server sets, instead of httplib's default SO_REUSEPORT. A
+    // supervisor may reuse one child port across servers: connections the previous
+    // server closed stay in TIME_WAIT on it for up to 60 s, and Linux lets a new bind through
+    // only when both sockets carry the same option. With REUSEPORT only, switching between
+    // this server and llama-server or vLLM failed with "address in use" in both directions
+    // until TIME_WAIT expired. REUSEPORT would also let a stale instance share the port.
+    svr.set_socket_options([](socket_t sock) { httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1); });
     // httplib's socket timeouts default to 5 s per write and per read. A client
     // UI that stops draining the stream for 5 s (rendering a long reasoning
     // trace) would get the connection cut without a trailer and without a log
     // line here -- "peer closed connection without sending complete message
     // body" on its side. A local server can afford to wait.
+    // prime the unwinder: glibc's first backtrace() dlopens libgcc_s, taking the loader and malloc locks.
+    // Done first inside the stall probe's handler, it deadlocked a generation thread interrupted inside
+    // malloc (a long first-request JIT compile) for good. Loaded here, while nothing is interrupted.
+    { void * f[2]; (void) backtrace(f, 2); }
     signal(SIGSEGV, on_fatal); signal(SIGABRT, on_fatal); signal(SIGBUS, on_fatal); signal(SIGFPE, on_fatal);
     signal(SIGUSR2, on_stall_probe);
     // A local web page (the console, a harness) may read /stats and /props
@@ -1521,21 +1954,33 @@ int main(int argc, char ** argv) {
         });
     }
     svr.set_write_timeout(3600, 0);
-    // Stall watchdog: a generation that produces no token for 30 s is logged
-    // with what the expert cache is waiting on, every 30 s until it moves.
+    // Stall watchdog: a request that makes no progress is logged with what the expert cache is
+    // waiting on, and the stuck thread prints its own stack. Progress is prefill layers AND generated
+    // tokens: the engine advances prompt_done after every layer of every chunk, so a long prefill that
+    // is moving is not a stall (it used to be reported every 30 s as "no new token ... at generated
+    // token 0"). Thresholds: 30 s while generating, 120 s while prefilling, because one layer of the
+    // first prefill after a load can spend ~60 s in kernel JIT.
     std::thread([&]() {
-        int last_n = -1; double stalled = 0;
+        double last_p = -1, stalled = 0;
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
-            bool busy; int n;
-            { std::lock_guard<std::mutex> lk(S.live.mu); busy = S.live.busy; n = S.live.n_prompt * 0 + S.live.n_gen; }
-            if (!busy) { last_n = -1; stalled = 0; continue; }
-            if (n != last_n) { last_n = n; stalled = 0; continue; }
+            bool busy, prefilling; int n; double done, input;
+            { std::lock_guard<std::mutex> lk(S.live.mu); busy = S.live.busy; prefilling = S.live.prefilling;
+              n = S.live.n_gen; done = S.live.prompt_done; input = (double) S.live.n_prompt; }
+            if (!busy) { last_p = -1; stalled = 0; continue; }
+            const double p = done + (double) n;
+            if (p != last_p) { last_p = p; stalled = 0; continue; }
             stalled += 5;
-            if (stalled >= 30 && ((int) stalled % 30) == 0) {
+            const double limit = prefilling ? 120 : 30;
+            if (stalled >= limit && ((int) stalled % 30) == 0) {
                 const int ws = S.eng.cache_wait_state();
-                fprintf(stderr, "[qwfn-server] STALL: no new token for %.0f s at generated token %d; expert cache waiting on %s (%zu reads)\n",
-                        stalled, n, ws == 1 ? "demand reads" : ws == 2 ? "speculative reads" : "nothing (compute or lock)", S.eng.cache_wait_count());
+                const char * what = ws == 1 ? "demand reads" : ws == 2 ? "speculative reads" : "nothing (compute or lock)";
+                if (prefilling)
+                    fprintf(stderr, "[qwfn-server] STALL: prefill has not advanced for %.0f s (at %.0f of %.0f prompt tokens); expert cache waiting on %s (%zu reads)\n",
+                            stalled, done, input, what, S.eng.cache_wait_count());
+                else
+                    fprintf(stderr, "[qwfn-server] STALL: no new token for %.0f s at generated token %d; expert cache waiting on %s (%zu reads)\n",
+                            stalled, n, what, S.eng.cache_wait_count());
                 if (g_gen_thread_set) pthread_kill(g_gen_thread, SIGUSR2);   // the stuck thread prints its own stack
             }
         }
@@ -1625,6 +2070,13 @@ int main(int argc, char ** argv) {
           tp = S.live.t_prompt_total; tg = S.live.t_gen_total; busy = S.live.busy; n_past = S.live.n_past;
           npair = S.live.n_pairs_total; nacc = S.live.n_accepted_total; ndraft = S.live.n_drafted_total; }
         long long ninp, ncach; { std::lock_guard<std::mutex> lk(S.live.mu); ninp = S.live.n_input_total; ncach = S.live.n_cached_total; }
+        json pcache;
+        { std::lock_guard<std::mutex> lk(S.live.mu);
+          pcache = {{"budget_bytes", S.pool_budget}, {"min_tokens", S.pool_min}, {"entries", S.live.pc_entries}, {"bytes", S.live.pc_bytes},
+                    {"skipped_short", S.live.pc_skipped_short}, {"boundary_min_tokens", S.pool_boundary},
+                    {"boundary_saves", S.live.pc_boundary_saves}, {"boundary_hits", S.live.pc_boundary_hits}, {"t_boundary_save", S.live.pc_t_boundary_save},
+                    {"hits", S.live.pc_hits}, {"misses", S.live.pc_misses}, {"saves", S.live.pc_saves}, {"evictions", S.live.pc_evictions},
+                    {"tokens_restored", S.live.pc_tokens_restored}, {"t_save", S.live.pc_t_save}, {"t_restore", S.live.pc_t_restore}}; }
         return json{
             {"busy", busy},
             // prompt: the current request's prompt while busy, the last one's when idle.
@@ -1645,6 +2097,33 @@ int main(int argc, char ** argv) {
                               // the raw counters, so a harness can difference two samples
                               {"lookups", c.lookups}, {"hits", c.hits}, {"gpu_hits", c.gpu_hits},
                               {"promotions", c.promotions}, {"pf_issued", c.pf_issued}, {"pf_used", c.pf_used}}},
+            // cumulative decode split, seconds: difference two samples for a per-token budget
+            {"decode", {{"t_decode", S.eng.t_decode}, {"t_graph_a", S.eng.t_layerA}, {"t_moe_gpu", S.eng.t_moe_gpu},
+                        {"t_moe_cpu", S.eng.t_moe_cpu}, {"t_io", S.eng.t_io}, {"t_inputs", S.eng.t_inputs},
+                        {"n_exp_gpu", S.eng.n_exp_gpu}, {"n_exp_cpu", S.eng.n_exp_cpu},
+                        {"t_readback", S.eng.t_readback}, {"t_prefetch", S.eng.t_prefetch}, {"t_settle_promo", S.eng.t_settle_promo},
+                        {"t_uploads", S.eng.t_uploads}, {"t_head", S.eng.t_head}, {"n_upload_skip", S.eng.n_upload_skip},
+                        {"t_replay_alloc", S.eng.t_replay_alloc}, {"t_replay_launch", S.eng.t_replay_launch},
+                        {"t_replay_wait", S.eng.t_replay_wait}, {"n_replay", S.eng.n_replay},
+                        {"cache_misses", c.misses}, {"cache_reads", c.n_reads}, {"cache_bytes_read", c.bytes_read},
+                        {"cache_t_submit", c.t_submit}, {"cache_t_wait", c.t_wait}, {"cache_t_promote", c.t_promote},
+                        {"cache_bursts", c.n_bursts}, {"cache_pf_wasted", c.pf_wasted},
+                        {"cache_t_wait_spec", c.t_wait_spec}, {"cache_t_wait_demand", c.t_wait_demand}}},
+            // cumulative layer-major prefill split: seconds, and expert bytes read from disk vs copied from the RAM tier
+            {"prefill_split", {{"t_prefill", S.eng.t_prefill}, {"t_graph_a", S.eng.t_pf_graphA}, {"t_moe", S.eng.t_pf_moe},
+                               {"t_read", S.eng.t_pf_read}, {"bytes_read", S.eng.prefill_bytes_read()},
+                               {"bytes_from_ram", S.eng.prefill_bytes_from_ram()},
+                               {"t_zero", S.eng.t_pf_zero}, {"t_readback", S.eng.t_pf_readback},
+                               {"t_sync", S.eng.t_pf_sync}, {"t_prefetch", S.eng.t_pf_prefetch},
+                               {"t_head", S.eng.t_pf_head}, {"t_warm", S.eng.t_warm},
+                               {"t_attn_in", S.eng.t_pf_attn_in}, {"t_pos", S.eng.t_pf_pos},
+                               {"qsa_cellblk", S.eng.t_qsa_cellblk}, {"qsa_blkidx", S.eng.t_qsa_blkidx},
+                               {"qsa_bias", S.eng.t_qsa_bias}, {"qsa_upload", S.eng.t_qsa_upload},
+                               {"gA_build", S.eng.t_pf_gA_build}, {"gA_run", S.eng.t_pf_gA_run},
+                               {"gA_free", S.eng.t_pf_gA_free}, {"gA_attn", S.eng.t_pf_gA_attn},
+                               {"gA_dn", S.eng.t_pf_gA_dn}, {"gA_ple", S.eng.t_pf_gA_ple},
+                               {"n_gA_attn", S.eng.n_pf_gA_attn}, {"n_gA_dn", S.eng.n_pf_gA_dn}}},
+            {"prefix_cache", pcache},
             {"speculative", {{"pairs", npair}, {"accepted", nacc}, {"drafted", ndraft}, {"acceptance", ndraft ? (double) nacc / ndraft : 0.0},
                              {"tokens_per_step", npair ? (double) (npair + nacc) / npair : 1.0}}},
             {"timings", t}};
@@ -1814,9 +2293,9 @@ int main(int argc, char ** argv) {
     struct chat_result { gen_result R; json calls; std::string text; };
     auto finish_request = [&](const chat_request & Q, chat_result & C) {
         C.text = parse_tool_calls(Q.forced + C.R.content, Q.tools, C.calls);
-        S.last_tool_key = tool_calls_key(C.calls); S.last_content = C.calls.empty() ? C.R.content : C.text;
+        S.last.tool_key = tool_calls_key(C.calls); S.last.content = C.calls.empty() ? C.R.content : C.text;
         if (!C.calls.empty()) C.R.finish = "tool_calls";
-        S.last_msgs = Q.msgs;
+        S.last.msgs = Q.msgs;
     };
     auto log_done = [&](const chat_request & Q, const gen_result & R) {
         fprintf(stderr, "[qwfn-server] %s: prompt %d tok (%d cached) %.1f tok/s | generated %d tok (%zu reasoning chars%s) in %.1f s, %.1f tok/s, finish %s%s\n",
@@ -1827,7 +2306,7 @@ int main(int argc, char ** argv) {
     auto run_batch = [&](chat_request & Q, const server::prompt & P, chat_result & C, std::string & err) -> bool {
         if (!generate(P, Q.smp, Q.max_tok, Q.thinking, Q.stops,
                       [](const std::string &, bool) { return true; }, C.R, err, Q.reasoning_budget)) {
-            S.last_msgs = json();   // cache is no longer trustworthy
+            S.last.msgs = json();   // cache is no longer trustworthy
             fprintf(stderr, "[qwfn-server] %s: generation failed after %d tokens: %s\n", Q.id.c_str(), C.R.n_gen, err.c_str());
             return false;
         }
@@ -1972,11 +2451,11 @@ int main(int argc, char ** argv) {
             // so the next request starts clean instead of running on a
             // desynchronised state.
             fprintf(stderr, "[qwfn-server] %s: stream aborted by an exception after %d generated tokens: %s\n", Q.id.c_str(), R.n_gen, out.aborted.c_str());
-            S.last_msgs = json(); S.consumed.clear(); S.eng.reset(); S.eng.clear_embeddings();
+            S.last.msgs = json(); S.consumed.clear(); S.eng.reset(); S.eng.clear_embeddings();
             { std::lock_guard<std::mutex> lg(S.live.mu); S.live.busy = false; }
             return out;
         }
-        if (out.ok) finish_request(Q, out.C); else S.last_msgs = json();
+        if (out.ok) finish_request(Q, out.C); else S.last.msgs = json();
         if (ev.write_failed)
             fprintf(stderr, "[qwfn-server] %s: client stopped reading after %d prompt + %d generated tokens (%.0f s); stream dropped\n",
                     Q.id.c_str(), R.n_prompt, R.n_gen, R.t_prompt + R.t_gen);
@@ -2003,7 +2482,7 @@ int main(int argc, char ** argv) {
         // with the provider and released when the stream is done.
         auto lk = std::make_shared<std::unique_lock<std::mutex>>(S.mu);
         auto P = std::make_shared<server::prompt>();
-        if (!build_prompt(Q->msgs, Q->effort, Q->thinking, Q->tools_block, Q->forced, *P, e)) { fail(res, 400, e); return; }
+        if (!build_prompt(Q->msgs, Q->effort, Q->thinking, Q->tools_block, Q->forced, Q->tools, *P, e)) { fail(res, 400, e); return; }
 
         if (!Q->stream) {
             chat_result C;
@@ -2133,7 +2612,7 @@ int main(int argc, char ** argv) {
         auto lk = std::make_shared<std::unique_lock<std::mutex>>(S.mu);
         auto P = std::make_shared<server::prompt>();
         std::string e;
-        if (!build_prompt(Q->msgs, Q->effort, Q->thinking, Q->tools_block, Q->forced, *P, e)) { fail_anthropic(res, 400, e); return; }
+        if (!build_prompt(Q->msgs, Q->effort, Q->thinking, Q->tools_block, Q->forced, Q->tools, *P, e)) { fail_anthropic(res, 400, e); return; }
 
         if (!Q->stream) {
             chat_result C;
@@ -2238,7 +2717,7 @@ int main(int argc, char ** argv) {
             return;
         }
         server::prompt P; std::string e;
-        if (!build_prompt(Q.msgs, Q.effort, Q.thinking, Q.tools_block, Q.forced, P, e)) { fail_anthropic(res, 400, e); return; }
+        if (!build_prompt(Q.msgs, Q.effort, Q.thinking, Q.tools_block, Q.forced, Q.tools, P, e)) { fail_anthropic(res, 400, e); return; }
         res.set_content(json{{"input_tokens", (long long) P.tok.size()}}.dump(), "application/json");
     });
     // Claude Code warms its connection with HEAD /api/hello (httplib answers a
@@ -2264,15 +2743,17 @@ int main(int argc, char ** argv) {
         }
 
         std::lock_guard<std::mutex> lk(S.mu);
-        S.last_msgs = json();            // raw completions break the chat chain
         server::prompt P;
         P.tok = S.vb.encode(p, false, true);
         gen_result R;
         std::string e;
-        if (!generate(P, smp, max_tok, /*thinking=*/false, stops,
-                      [](const std::string &, bool) { return true; }, R, e)) {
-            fail(res, 500, e, "server_error"); return;
-        }
+        // Raw completions break the chat chain -- but only once this request is running:
+        // cleared before generate(), a prefix-cache save of the chat it switches away
+        // from would file that conversation without its message list.
+        const bool gen_ok = generate(P, smp, max_tok, /*thinking=*/false, stops,
+                                     [](const std::string &, bool) { return true; }, R, e);
+        S.last.msgs = json();
+        if (!gen_ok) { fail(res, 500, e, "server_error"); return; }
         res.set_content(json{
             {"id", "cmpl-" + std::to_string(now_unix())}, {"object", "text_completion"},
             {"created", now_unix()}, {"model", S.model_id},

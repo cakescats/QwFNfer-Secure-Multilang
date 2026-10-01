@@ -183,8 +183,22 @@ target_include_directories(qwfn_core PUBLIC
 if(NOT WIN32)
   target_include_directories(qwfn_core PUBLIC "${URING_INCLUDE_DIR}")
 endif()
-target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads ${QWFN_IO_LIBS})
+target_link_libraries(qwfn_core PUBLIC ggml_base ggml_all Threads::Threads ${QWFN_IO_LIBS} ${CMAKE_DL_LIBS})
 target_compile_options(qwfn_core PRIVATE ${QWFN_OPT_FLAGS} ${QWFN_ARCH_FLAGS} ${QWFN_WARN_FLAGS})
+
+# The ggml-sycl patch series (patches/ggml-sycl, Intel Arc) adds two weight layouts as
+# new ggml types. A stock ggml -- the CUDA build -- does not have them, so the engine
+# compiles their use in only when the headers it builds against declare them.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES "${LLAMA_CPP_ROOT}/ggml/include")
+check_cxx_source_compiles("#include <ggml.h>
+int main() { return (int) GGML_TYPE_Q2_0_SOA + (int) GGML_TYPE_IQ4_NL_SOA; }" QWFN_HAVE_GGML_SOA)
+unset(CMAKE_REQUIRED_INCLUDES)
+if(QWFN_HAVE_GGML_SOA)
+  target_compile_definitions(qwfn_core PUBLIC QWFN_HAVE_GGML_SOA=1)
+else()
+  target_compile_definitions(qwfn_core PUBLIC QWFN_HAVE_GGML_SOA=0)
+endif()
 
 # Collected once at configure time, so build llama.cpp before configuring this.
 # If the list comes up empty the copy is skipped and the DLLs have to be on PATH
@@ -251,6 +265,18 @@ qwfn_tool(qwfn-tok
   SOURCES  tools/qwfn_tok.cpp src/qwfn_vocab.cpp
   INCLUDES "${LLAMA_CPP_ROOT}/include"
   LIBS     qwfn_core llama_ref)
+
+# Overlay tooling (docs/dense-overlay.md): metadata heads and local re-encodes of split GGUFs.
+# POSIX only (unistd.h).
+if(NOT WIN32)
+  qwfn_tool(gguf-requant SOURCES tools/overlay/gguf_requant.cpp LIBS ggml_base ggml_all Threads::Threads
+            INCLUDES "${LLAMA_CPP_ROOT}/ggml/include")
+endif()
+
+# Isolated kernel benches at this model's decode shapes (tools/perf).
+foreach(b mv_bench moe_bench)
+  qwfn_tool(${b} SOURCES tools/perf/${b}.cpp LIBS ggml_base ggml_all INCLUDES "${LLAMA_CPP_ROOT}/ggml/include")
+endforeach()
 
 qwfn_tool(qwfn-train-predictor SOURCES tools/qwfn_train_predictor.cpp LIBS qwfn_core)
 target_compile_definitions(qwfn-train-predictor PRIVATE LLAMA_CPP_BUILD_DIR="${LLAMA_CPP_BUILD}")

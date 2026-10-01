@@ -63,6 +63,16 @@ public:
     // experts are served from CPU RAM or from VRAM.
     void reset();
 
+    // Prefix checkpoints (the server's prefix cache). The per-sequence bytes that
+    // describe the first n_tokens positions: the leading n_tokens rows of every KV
+    // and indexer cache (they are positional, so later rows do not matter) and the
+    // whole recurrent state, conv and PLE conv histories. restore() writes exactly
+    // what save() read, in the same order, into a state of the same config.
+    size_t checkpoint_bytes(int32_t n_tokens) const;
+    void   save(int32_t n_tokens, uint8_t * dst) const;
+    void   restore(int32_t n_tokens, const uint8_t * src);
+    const state_config & config() const { return cfg_; }
+
     size_t bytes() const { return bytes_; }
     std::string summary() const;
 
@@ -81,6 +91,9 @@ private:
     ggml_backend_buffer_t buf_h_ = nullptr;
     size_t                bytes_h_ = 0;
     bool                  kv_host_ = false, idx_host_ = false;
+
+    // The (tensor, leading bytes) pairs a checkpoint of n_tokens covers, in order.
+    template <typename F> void for_checkpoint(int32_t n_tokens, F && f) const;
 
     std::vector<ggml_tensor *> k_, v_, idx_, rs_, conv_;
     ggml_tensor * ple_conv_ = nullptr;

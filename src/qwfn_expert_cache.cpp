@@ -121,7 +121,15 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
     // silently falls back to an ordinary CPU buffer if pinning fails, and that
     // one is neither pinned nor page-aligned, so check both before trusting it.
     arena_pinned_ = false;
-    if (cfg.host_buft && !getenv("QWFN_PAGEABLE_ARENA")) {
+    // QWFN_LOCK_HOST: anonymous, locked, driver-registered memory instead of the backend's host
+    // buffer, which the xe driver may swap out under pressure (qwfn_io.h).
+    // Without the driver import, copies from it are staged and slow (a pageable arena cost 220 -> 80
+    // tok/s prefill), so an unregistered block is dropped for the backend's buffer.
+    if (host_lock_requested() && cfg.vram_backend && host_block_alloc(arena_block_, arena_bytes_, "expert RAM tier", true)) {
+        if (arena_block_.imported) { arena_ = (uint8_t *) arena_block_.p; arena_pinned_ = true; }
+        else host_block_free(arena_block_);
+    }
+    if (!arena_ && cfg.host_buft && !getenv("QWFN_PAGEABLE_ARENA")) {
         arena_hostbuf_ = ggml_backend_buft_alloc_buffer(cfg.host_buft, arena_bytes_);
         uint8_t * p = arena_hostbuf_ ? (uint8_t *) ggml_backend_buffer_get_base(arena_hostbuf_) : nullptr;
         if (arena_hostbuf_ && p && ggml_backend_buffer_get_type(arena_hostbuf_) == cfg.host_buft &&
@@ -280,6 +288,37 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
                 xfer_ctx_ = ggml_init(xp);
                 xfer_ = ggml_new_tensor_1d(xfer_ctx_, GGML_TYPE_I8, 1);
                 xfer_->buffer = vram_buf_;
+#if QWFN_HAVE_GGML_SOA
+                if (cfg.q2_soa && cfg.vram_backend) {
+                    // Ask the backend: a MUL_MAT_ID with a Q2_0_SOA weight, at this model's expert width.
+                    ggml_init_params tp{}; tp.mem_size = ggml_tensor_overhead() * 8; tp.no_alloc = true;
+                    ggml_context * tc = ggml_init(tp);
+                    ggml_tensor * as  = ggml_new_tensor_3d(tc, GGML_TYPE_Q2_0_SOA, 256, 4, 2);
+                    ggml_tensor * b   = ggml_new_tensor_3d(tc, GGML_TYPE_F32, 256, 1, 1);
+                    ggml_tensor * ids = ggml_new_tensor_2d(tc, GGML_TYPE_I32, 1, 1);
+                    ggml_tensor * op  = ggml_mul_mat_id(tc, as, b, ids);
+                    q2_soa_ = ggml_backend_supports_op(cfg.vram_backend, op);
+                    ggml_free(tc);
+                    fprintf(stderr, "[qwfn] expert VRAM tier: q2_0 parts as Q2_0_SOA %s\n",
+                            q2_soa_ ? "(codes and scales in separate aligned arrays)" : "requested, but the backend does not support it: plain q2_0");
+                }
+                if (cfg.iq4_soa && cfg.vram_backend) {
+                    // The same question for IQ4_NL_SOA (ggml-sycl patch 17).
+                    ggml_init_params tp{}; tp.mem_size = ggml_tensor_overhead() * 8; tp.no_alloc = true;
+                    ggml_context * tc = ggml_init(tp);
+                    ggml_tensor * as  = ggml_new_tensor_3d(tc, GGML_TYPE_IQ4_NL_SOA, 256, 4, 2);
+                    ggml_tensor * b   = ggml_new_tensor_3d(tc, GGML_TYPE_F32, 256, 1, 1);
+                    ggml_tensor * ids = ggml_new_tensor_2d(tc, GGML_TYPE_I32, 1, 1);
+                    ggml_tensor * op  = ggml_mul_mat_id(tc, as, b, ids);
+                    iq4_soa_ = ggml_backend_supports_op(cfg.vram_backend, op);
+                    ggml_free(tc);
+                    fprintf(stderr, "[qwfn] expert VRAM tier: iq4_nl parts as IQ4_NL_SOA %s\n",
+                            iq4_soa_ ? "(codes and scales in separate aligned arrays)" : "requested, but the backend does not support it: plain iq4_nl");
+                }
+#else
+                if (cfg.q2_soa || cfg.iq4_soa)
+                    fprintf(stderr, "[qwfn] expert VRAM tier: QWFN_Q2_SOA / QWFN_IQ4_SOA need a ggml with the ggml-sycl patches; this build has none, ignored\n");
+#endif
                 fprintf(stderr, "[qwfn] expert VRAM tier: %.2f GB, %zu blocks (%.1f%%)%s\n",
                         (perm_bytes + ext_bytes) / 1e9, total_gslots_,
                         100.0 * (double) total_gslots_ / (double) (n_layer * hot->hp().n_expert),
@@ -306,7 +345,8 @@ void expert_cache::shutdown() {
     extra_bytes_ = 0;
     total_gslots_ = 0;
     if (arena_buf_) { ggml_backend_buffer_free(arena_buf_); arena_buf_ = nullptr; }
-    if (arena_hostbuf_) { ggml_backend_buffer_free(arena_hostbuf_); arena_hostbuf_ = nullptr; arena_ = nullptr; }
+    if (arena_block_.p) { host_block_free(arena_block_); arena_ = nullptr; }
+    else if (arena_hostbuf_) { ggml_backend_buffer_free(arena_hostbuf_); arena_hostbuf_ = nullptr; arena_ = nullptr; }
     else if (arena_) { dio_free(arena_); arena_ = nullptr; }
     arena_pinned_ = false;
     blk_.clear();
@@ -409,7 +449,7 @@ void expert_cache::fill_handle(const layer_pool & lp, uint32_t slot, expert_hand
 void expert_cache::fill_gpu_handle(const layer_pool & lp, uint32_t gslot, expert_handle & h) const {
     for (int q = 0; q < EXPERT_NPARTS; q++) {
         h.part[q] = lp.g_part[q] + (size_t) gslot * lp.g_part_bytes[q];
-        h.type[q] = lp.part_type[q];
+        h.type[q] = gpu_type(lp.part_type[q]);
     }
     h.buffer    = lp.g_buf;
     h.on_gpu    = true;
@@ -426,7 +466,7 @@ tier_view expert_cache::gpu_tier(uint32_t layer) const {
     for (int q = 0; q < EXPERT_NPARTS; q++) {
         v.part[q]   = lp.g_part[q];
         v.stride[q] = lp.g_part_bytes[q];
-        v.type[q]   = lp.part_type[q];
+        v.type[q]   = gpu_type(lp.part_type[q]);
     }
     v.n_slots = lp.g_slots;
     v.buffer  = lp.g_buf;
@@ -553,7 +593,18 @@ bool expert_cache::promote(layer_pool & lp, uint32_t expert_id, const uint8_t * 
     xfer_->buffer = lp.g_buf;
     for (int q = 0; q < EXPERT_NPARTS; q++) {
         xfer_->data  = lp.g_part[q] + (size_t) victim * lp.g_part_bytes[q];
-        xfer_->ne[0] = lp.g_part_bytes[q];
+        const ggml_type gt = gpu_type(lp.part_type[q]);
+        if (is_soa(gt)) {
+            // One slice of all the part's blocks: the SOA layout depends only on the block count, so this is
+            // the same byte arrangement the 2-D/3-D weight views read. The backend reorders on upload.
+            xfer_->type  = gt;
+            xfer_->ne[0] = (int64_t) (lp.g_part_bytes[q] / ggml_type_size(gt)) * ggml_blck_size(gt);
+            xfer_->nb[0] = ggml_type_size(gt);
+        } else {
+            xfer_->type  = GGML_TYPE_I8;
+            xfer_->ne[0] = lp.g_part_bytes[q];
+            xfer_->nb[0] = 1;
+        }
         xfer_->nb[1] = xfer_->nb[2] = xfer_->nb[3] = lp.g_part_bytes[q];
         const uint8_t * src = host_block + lp.part_off[q] + lp.part_pay[q];
         if (last_promote_async_) ggml_backend_tensor_set_async(cfg_.vram_backend, xfer_, src, 0, lp.g_part_bytes[q]);
@@ -922,7 +973,7 @@ bool expert_cache::settle_pending(const uint32_t * expert_ids, uint32_t n, bool 
         if (ready) for (uint32_t i = 0; i < n; i++) if (expert_ids[i] == p.expert) ready[i] = true;
     }
     pending_.clear();
-    st_.t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+    { const double dw =  std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count(); st_.t_wait += dw; st_.t_wait_spec += dw; }
     return true;
 }
 
@@ -950,7 +1001,7 @@ bool expert_cache::fetch_end() {
         const int32_t v = inflight_slots_[k];
         if (lp.slot_expert[v] == (uint16_t) inflight_experts_[k]) lp.slot_valid[v] = 1;
     }
-    st_.t_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count();
+    { const double dw =  std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count(); st_.t_wait += dw; st_.t_wait_demand += dw; }
     st_.bytes_read = io_hot_.stat_bytes + io_cold_.stat_bytes;
     return true;
 }

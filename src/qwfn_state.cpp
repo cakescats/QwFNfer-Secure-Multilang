@@ -103,6 +103,33 @@ void state::reset() {
     if (ple_conv_) ggml_backend_tensor_memset(ple_conv_, 0, 0, ggml_nbytes(ple_conv_));
 }
 
+template <typename F> void state::for_checkpoint(int32_t n_tokens, F && f) const {
+    const int64_t n_ctx = cfg_.n_ctx;
+    auto rows = [&](ggml_tensor * t) {   // a flat [dim * n_ctx] cache: its first n_tokens rows
+        return ggml_row_size(t->type, t->ne[0] / n_ctx) * (size_t) n_tokens;
+    };
+    for (size_t il = 0; il < k_.size(); il++) {
+        if (k_[il])    { f(k_[il], rows(k_[il])); f(v_[il], rows(v_[il])); f(idx_[il], rows(idx_[il])); }
+        if (rs_[il])   f(rs_[il],   ggml_nbytes(rs_[il]));
+        if (conv_[il]) f(conv_[il], ggml_nbytes(conv_[il]));
+    }
+    if (ple_conv_) f(ple_conv_, ggml_nbytes(ple_conv_));
+}
+
+size_t state::checkpoint_bytes(int32_t n_tokens) const {
+    size_t n = 0;
+    for_checkpoint(n_tokens, [&](ggml_tensor *, size_t b) { n += b; });
+    return n;
+}
+
+void state::save(int32_t n_tokens, uint8_t * dst) const {
+    for_checkpoint(n_tokens, [&](ggml_tensor * t, size_t b) { if (b) ggml_backend_tensor_get(t, dst, 0, b); dst += b; });
+}
+
+void state::restore(int32_t n_tokens, const uint8_t * src) {
+    for_checkpoint(n_tokens, [&](ggml_tensor * t, size_t b) { if (b) ggml_backend_tensor_set(t, src, 0, b); src += b; });
+}
+
 ggml_tensor * state::k_cache(uint32_t il)   const { return il < k_.size()    ? k_[il]    : nullptr; }
 ggml_tensor * state::v_cache(uint32_t il)   const { return il < v_.size()    ? v_[il]    : nullptr; }
 ggml_tensor * state::idx_cache(uint32_t il) const { return il < idx_.size()  ? idx_[il]  : nullptr; }

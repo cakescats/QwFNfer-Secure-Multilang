@@ -1,0 +1,208 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 9b10b58..d65a8d9 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -68,6 +68,155 @@
+ #include "ggml-sycl/sdattn.hpp"
+ #include "ggml-sycl/topkwg.hpp"
+ 
++// ---- decode fusions: ADD chains, the MoE weighted sum, the one-token conv (apply_fuse3.py) ----
++static bool fuse3_env(const char * name) { const char * e = getenv(name); return e && atoi(e) != 0; }
++static bool fuse_addchain_on() { static const bool v = fuse3_env("GGML_SYCL_FUSE_ADDCHAIN"); return v; }
++static bool fuse_moesum_on()   { static const bool v = fuse3_env("GGML_SYCL_FUSE_MOESUM");   return v; }
++static bool fuse_conv_on()     { static const bool v = fuse3_env("GGML_SYCL_FUSE_CONV");     return v; }
++
++static bool f3_single(const ggml_cgraph * g, int k) {
++    return !(g->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(g, k) == 1;
++}
++static bool f3_f32c(const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); }
++
++// ADD chain at i: returns its length (2..4) or 0; ops[] gets the operands in summation order
++static int f3_match_addchain(const ggml_cgraph * g, int i, const float * ops[5]) {
++    const ggml_tensor * a0 = g->nodes[i];
++    if (a0->op != GGML_OP_ADD || !f3_f32c(a0) || !f3_f32c(a0->src[0]) || !f3_f32c(a0->src[1])) return 0;
++    if (!ggml_are_same_shape(a0->src[0], a0) || !ggml_are_same_shape(a0->src[1], a0)) return 0;
++    ops[0] = (const float *) a0->src[0]->data; ops[1] = (const float *) a0->src[1]->data;
++    int L = 1;
++    while (L < 4 && i + L < g->n_nodes) {
++        const ggml_tensor * prev = g->nodes[i + L - 1], * a = g->nodes[i + L];
++        if (a->op != GGML_OP_ADD || !f3_f32c(a) || !ggml_are_same_shape(a, a0)) break;
++        const ggml_tensor * other = a->src[0] == prev ? a->src[1] : a->src[1] == prev ? a->src[0] : nullptr;
++        if (!other || other == prev || !f3_f32c(other) || !ggml_are_same_shape(other, a0)) break;
++        if (!f3_single(g, i + L - 1)) break;
++        ops[L + 1] = (const float *) other->data;
++        L++;
++    }
++    return L >= 2 ? L : 0;
++}
++
++static void f3_addchain(dpct::queue_ptr q, const float * const ops_in[5], int n_ops, float * out, int64_t n) {
++    const float * o0 = ops_in[0], * o1 = ops_in[1], * o2 = ops_in[2], * o3 = ops_in[3], * o4 = ops_in[4];
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((n + 255) / 256) * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
++        const int64_t j = it.get_global_id(0);
++        if (j >= n) return;
++        float v = o0[j] + o1[j];
++        if (n_ops > 2) v = v + o2[j];
++        if (n_ops > 3) v = v + o3[j];
++        if (n_ops > 4) v = v + o4[j];
++        out[j] = v;
++    });
++}
++
++// MoE weighted sum: CONT at i -> the MUL_MAT that reads it, or -1
++static ggml_tensor * g_moesum_pending[8];
++static int g_moesum_n = 0;
++static bool f3_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
++    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
++}
++static int f3_match_moesum(const ggml_cgraph * g, int i) {
++    const ggml_tensor * cont = g->nodes[i];
++    const ggml_tensor * perm = cont->src[0];
++    if (cont->op != GGML_OP_CONT || !perm || perm->op != GGML_OP_PERMUTE || !f3_single(g, i)) return -1;
++    if (perm->op_params[0] != 1 || perm->op_params[1] != 0 || perm->op_params[2] != 2 || perm->op_params[3] != 3) return -1;
++    const ggml_tensor * D = perm->src[0];
++    if (D->type != GGML_TYPE_F32 || D->nb[0] != sizeof(float) || D->ne[3] != 1 || D->ne[1] > 32) return -1;
++    for (int j = i + 1; j < g->n_nodes; j++) {
++        const ggml_tensor * m = g->nodes[j];
++        if (m->op == GGML_OP_MUL_MAT && m->src[0] && m->src[0]->op == GGML_OP_RESHAPE && m->src[0]->src[0] == cont) {
++            // the reshape is read only by this matmul; w is [n, 1, T]; the result [E, 1, T]
++            const ggml_tensor * w = m->src[1];
++            if (!f3_f32c(m) || w->type != GGML_TYPE_F32 || w->nb[0] != sizeof(float) || w->ne[0] != D->ne[1] || w->ne[1] != 1 ||
++                w->ne[2] != D->ne[2] || m->ne[0] != D->ne[0] || m->ne[1] != 1 || m->ne[2] != D->ne[2]) return -1;
++            int rj = -1;
++            for (int k = i + 1; k < j; k++) if (g->nodes[k] == m->src[0]) rj = k;
++            if (rj < 0 || !f3_single(g, rj)) return -1;
++            // nothing run between the CONT and the matmul, nor the matmul, may be allocated over D
++            if (f3_ranges_overlap(m, D)) return -1;
++            for (int k = i + 1; k < j; k++) {
++                const ggml_tensor * n = g->nodes[k];
++                if (n->data && ggml_nbytes(n) && f3_ranges_overlap(n, D)) return -1;
++            }
++            return j;
++        }
++    }
++    return -1;
++}
++static void f3_moesum(dpct::queue_ptr q, const ggml_tensor * m) {
++    const ggml_tensor * D = m->src[0]->src[0]->src[0]->src[0];   // reshape -> cont -> permute -> D
++    const ggml_tensor * w = m->src[1];
++    const float * dd = (const float *) D->data; const float * wd = (const float *) w->data; float * out = (float *) m->data;
++    const int64_t E = D->ne[0], n = D->ne[1], T = D->ne[2];
++    const int64_t d1 = D->nb[1] / 4, d2 = D->nb[2] / 4, w2 = w->nb[2] / 4;
++    const int64_t tot = E * T;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((tot + 255) / 256) * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
++        const int64_t i = it.get_global_id(0);
++        if (i >= tot) return;
++        const int64_t e = i % E, t = i / E;
++        float acc = 0.0f;
++        for (int64_t k = 0; k < n; k++) acc += dd[e + k * d1 + t * d2] * wd[k + t * w2];
++        out[i] = acc;
++    });
++}
++
++// one-token conv at the CONCAT i: returns the SILU's index, or 0
++static int f3_match_conv(const ggml_cgraph * g, int i, int * i_cpy, int * i_conv) {
++    const ggml_tensor * cat = g->nodes[i];
++    if (cat->op != GGML_OP_CONCAT || cat->op_params[0] != 0 || cat->type != GGML_TYPE_F32) return 0;
++    const ggml_tensor * st = cat->src[0], * xt = cat->src[1];
++    if (st->type != GGML_TYPE_F32 || xt->type != GGML_TYPE_F32 || xt->ne[0] != 1 || st->ne[2] != 1 || xt->ne[2] != 1) return 0;
++    const int64_t hist = st->ne[0], C = st->ne[1];
++    if (hist < 1 || hist > 7 || st->nb[0] != sizeof(float) || cat->ne[0] != hist + 1 || cat->ne[1] != C) return 0;
++    if ((cat->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(g, i) != 2) return 0;
++    int k = i + 1, cpy = -1, conv = -1, silu = -1;
++    for (; k < g->n_nodes && k <= i + 8 && silu < 0; k++) {
++        const ggml_tensor * n = g->nodes[k];
++        if (n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE || n->op == GGML_OP_PERMUTE) continue;
++        if (cpy < 0 && n->op == GGML_OP_CPY) { cpy = k; continue; }
++        if (conv < 0 && n->op == GGML_OP_SSM_CONV) { conv = k; continue; }
++        if (conv >= 0 && n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SILU && n->src[0] == g->nodes[conv]) { silu = k; continue; }
++        return 0;
++    }
++    if (cpy < 0 || conv < 0 || silu < 0) return 0;
++    const ggml_tensor * cp = g->nodes[cpy], * sc = g->nodes[conv], * su = g->nodes[silu];
++    const ggml_tensor * tail = cp->src[0], * sdst = cp->src[1];
++    if (tail->view_src != cat || tail->view_offs != (size_t) 1 * sizeof(float) || tail->ne[0] != hist || tail->ne[1] != C) return 0;
++    if (!f3_f32c(sdst) || ggml_nelements(sdst) != hist * C) return 0;
++    // the old state (st) and the new (sdst): the same memory in the same layout (each work-item reads its own row
++    // before writing it), or disjoint
++    const bool same = sdst->data == st->data && st->nb[1] == (size_t) hist * sizeof(float);
++    if (!same && f3_ranges_overlap(sdst, st)) return 0;
++    if (sc->src[0] != cat || sc->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc->src[1]) || sc->src[1]->ne[0] != hist + 1 || sc->src[1]->ne[1] != C) return 0;
++    if (!f3_f32c(su) || su->ne[0] != C || ggml_nelements(su) != C) return 0;
++    if (!f3_single(g, conv) || (cp->flags & GGML_TENSOR_FLAG_OUTPUT)) return 0;
++    for (int j = i + 1; j < silu; j++) if (g->nodes[j] == tail && !f3_single(g, j)) return 0;
++    *i_cpy = cpy; *i_conv = conv;
++    return silu;
++}
++static void f3_conv(dpct::queue_ptr q, const ggml_tensor * cat, const ggml_tensor * cp, const ggml_tensor * sc, ggml_tensor * su) {
++    const ggml_tensor * st = cat->src[0], * xt = cat->src[1];
++    const int64_t hist = st->ne[0], C = st->ne[1];
++    const float * sd = (const float *) st->data; const int64_t s1 = st->nb[1] / 4;
++    const char * xd = (const char *) xt->data; const size_t x1 = xt->nb[1];
++    const float * wd = (const float *) sc->src[1]->data;
++    float * od = (float *) su->data; float * nd = (float *) cp->src[1]->data;
++    q->parallel_for(sycl::nd_range<1>(sycl::range<1>(((C + 255) / 256) * 256), sycl::range<1>(256)), [=](sycl::nd_item<1> it) {
++        const int64_t c = it.get_global_id(0);
++        if (c >= C) return;
++        float p[8];
++        for (int64_t h = 0; h < hist; h++) p[h] = sd[c * s1 + h];
++        p[hist] = *(const float *) (xd + c * x1);
++        float sumf = 0.0f;
++        for (int64_t i0 = 0; i0 <= hist; i0++) sumf += p[i0] * wd[c * (hist + 1) + i0];
++        od[c] = sumf / (1.0f + sycl::exp(-sumf));
++        for (int64_t h = 0; h < hist; h++) nd[c * hist + h] = p[h + 1];
++    });
++}
++
+ static bool ggml_sycl_fuse_hc_mix_on() {
+     static const bool on = [] { const char * e = getenv("GGML_SYCL_FUSE_HC_MIX"); return e && atoi(e) != 0; }();
+     return on;
+@@ -6163,6 +6312,7 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+ 
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
++    g_moesum_n = 0;   // apply_fuse3.py: no CONT skip survives a graph
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -6263,6 +6413,39 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             i++;
+             continue;
+         }
++        // ---- apply_fuse3.py ----
++        if (node->op == GGML_OP_ADD && fuse_addchain_on()) {
++            const float * ops[5] = {};
++            const int L = f3_match_addchain(cgraph, i, ops);
++            if (L > 0) {
++                ggml_tensor * last = cgraph->nodes[i + L - 1];
++                f3_addchain(sycl_ctx->stream(), ops, L + 1, (float *) last->data, ggml_nelements(last));
++                i += L - 1;
++                continue;
++            }
++        }
++        if (node->op == GGML_OP_CONT && fuse_moesum_on() && g_moesum_n < 8) {
++            const int j = f3_match_moesum(cgraph, i);
++            if (j > 0) { g_moesum_pending[g_moesum_n++] = cgraph->nodes[j]; continue; }   // the matmul reads D itself
++        }
++        if (node->op == GGML_OP_MUL_MAT && g_moesum_n > 0) {
++            int hit = -1;
++            for (int k = 0; k < g_moesum_n; k++) if (g_moesum_pending[k] == node) hit = k;
++            if (hit >= 0) {
++                f3_moesum(sycl_ctx->stream(), node);
++                g_moesum_pending[hit] = g_moesum_pending[--g_moesum_n];
++                continue;
++            }
++        }
++        if (node->op == GGML_OP_CONCAT && fuse_conv_on()) {
++            int ic = -1, iv = -1;
++            const int is = f3_match_conv(cgraph, i, &ic, &iv);
++            if (is > 0) {
++                f3_conv(sycl_ctx->stream(), node, cgraph->nodes[ic], cgraph->nodes[iv], cgraph->nodes[is]);
++                i = is;
++                continue;
++            }
++        }
+         // GGML_SYCL_FUSE_HC_MIX: a bf16/f16 one-token MUL_MAT whose only reader is the next node, UNARY(SILU): mmvw
+         // writes silu(acc) straight into the UNARY's tensor
+         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_fuse_hc_mix_on() && i + 1 < cgraph->n_nodes) {

@@ -1,0 +1,250 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5064,6 +5064,63 @@
+            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+ }
+ 
++// GGML_SYCL_Q8_DIRECT (patch 20): a one-token Q8_0 MUL_MAT takes the direct path exactly when the dispatcher in
++// ggml_sycl_mul_mat would pick the reordered MMVQ kernel for it. MUL_MAT only: never MUL_MAT_ID's stack copies.
++static bool ggml_sycl_q8_direct_eligible(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                                         ggml_tensor * dst) {
++    if (!src0->buffer || ggml_backend_buffer_is_sycl_split(src0->buffer)) {
++        return false;
++    }
++    return dst->op == GGML_OP_MUL_MAT && ggml_sycl_q8_direct_on() && src0->type == GGML_TYPE_Q8_0 &&
++           src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
++           src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[0] == src0->ne[0] && ggml_is_contiguous(src0) &&
++           ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
++           src1->buffer && !ggml_backend_buffer_is_host(src1->buffer) && dst->buffer && !ggml_backend_buffer_is_host(dst->buffer) &&
++           // exactly when the generic dispatcher below would pick the reordered MMVQ kernel for this shape
++           !g_ggml_sycl_prioritize_dmmv && should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type) &&
++           can_use_mul_mat_vec_q(src0, src1, dst);
++}
++
++// Reorders src0 if it is not yet; returns the q8_1 (reorder SoA) copy of src1 -- from patch 19's cache, or quantized
++// now with the generic path's call -- or nullptr if src0 could not be reordered (then the generic path must run).
++static const char * ggml_sycl_q8_direct_prepare(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
++                                                const ggml_tensor * src1, ggml_tensor * dst) {
++    opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
++    const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++    if (!extra || !extra->optimized_feature.reorder) {
++        return nullptr;
++    }
++    ggml_sycl_set_device(ctx.device);
++    queue_ptr     stream = ctx.stream();
++    const int64_t ne10   = src1->ne[0];
++    const int64_t padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++    const size_t  bytes  = (size_t) padded * sizeof(block_q8_1) / QK8_1;
++    const bool    reuse  = ggml_sycl_q8_reuse_on();
++    if (!(reuse && ctx.q8r_src1 == src1 && ctx.q8r_data == src1->data && ctx.q8r_ne10 == ne10 && ctx.q8r_kind == 1)) {
++        if (ctx.q8r_cap < bytes) {
++            if (ctx.q8r_buf) {
++                stream->wait();   // the in-order queue may still read the old copy
++                sycl::free(ctx.q8r_buf, *stream);
++            }
++            ctx.q8r_cap = std::max<size_t>(bytes, 128 * 1024);
++            ctx.q8r_buf = (char *) sycl::malloc_device(ctx.q8r_cap, *stream);
++        }
++        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) src1->data, ctx.q8r_buf, (int) ne10, 1,
++                                                              (int) padded, stream);
++        if (reuse) {
++            ctx.q8r_src1 = src1; ctx.q8r_data = src1->data; ctx.q8r_nbytes = ggml_nbytes(src1); ctx.q8r_ne10 = ne10; ctx.q8r_kind = 1;
++        } else {
++            ctx.q8r_src1 = nullptr;   // the buffer now holds this src1's copy, but nothing may hit on it
++        }
++    }
++    return ctx.q8r_buf;
++}
++
++static bool ggml_sycl_q8_epilogue_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_Q8_EPILOGUE"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+ 
+@@ -5086,45 +5143,13 @@
+         return;
+     }
+     // GGML_SYCL_Q8_DIRECT: one-token Q8_0 matvec without ggml_sycl_op_mul_mat's generic per-call machinery (device
+-    // loop, pool allocations, per-column offsets): the reorder, the q8_1 input from patch 21's reuse cache (or one
+-    // quantize into it, the call and layout the generic path uses), and the reorder MMVQ kernel. MUL_MAT only: never
+-    // MUL_MAT_ID's stack copies.
+-    if (!split && dst->op == GGML_OP_MUL_MAT && ggml_sycl_q8_direct_on() && src0->type == GGML_TYPE_Q8_0 &&
+-        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+-        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[0] == src0->ne[0] && ggml_is_contiguous(src0) &&
+-        ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ggml_get_op_params_i32(dst, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+-        src1->buffer && !ggml_backend_buffer_is_host(src1->buffer) && dst->buffer && !ggml_backend_buffer_is_host(dst->buffer) &&
+-        // exactly when the generic dispatcher below would pick the reordered MMVQ kernel for this shape
+-        !g_ggml_sycl_prioritize_dmmv && should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type) &&
+-        can_use_mul_mat_vec_q(src0, src1, dst)) {
+-        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+-        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+-        if (extra && extra->optimized_feature.reorder) {
+-            ggml_sycl_set_device(ctx.device);
+-            queue_ptr     stream = ctx.stream();
+-            const int64_t ne10   = src1->ne[0];
+-            const int64_t padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-            const size_t  bytes  = (size_t) padded * sizeof(block_q8_1) / QK8_1;
+-            const bool reuse = ggml_sycl_q8_reuse_on();
+-            if (!(reuse && ctx.q8r_src1 == src1 && ctx.q8r_data == src1->data && ctx.q8r_ne10 == ne10 && ctx.q8r_kind == 1)) {
+-                if (ctx.q8r_cap < bytes) {
+-                    if (ctx.q8r_buf) {
+-                        stream->wait();   // the in-order queue may still read the old copy
+-                        sycl::free(ctx.q8r_buf, *stream);
+-                    }
+-                    ctx.q8r_cap = std::max<size_t>(bytes, 128 * 1024);
+-                    ctx.q8r_buf = (char *) sycl::malloc_device(ctx.q8r_cap, *stream);
+-                }
+-                quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) src1->data, ctx.q8r_buf, (int) ne10, 1,
+-                                                                      (int) padded, stream);
+-                if (reuse) {
+-                    ctx.q8r_src1 = src1; ctx.q8r_data = src1->data; ctx.q8r_nbytes = ggml_nbytes(src1); ctx.q8r_ne10 = ne10; ctx.q8r_kind = 1;
+-                } else {
+-                    ctx.q8r_src1 = nullptr;   // the buffer now holds this src1's copy, but nothing may hit on it
+-                }
+-            }
+-            ggml_sycl_q8_0_reorder_mmvq_direct(src0->data, ctx.q8r_buf, (float *) dst->data, (int) src0->ne[0],
+-                                               (int) src0->ne[1], stream);
++    // loop, pool allocations, per-column offsets): the reorder, the q8_1 input from patch 19's reuse cache (or one
++    // quantize into it, the call and layout the generic path uses), and the reorder MMVQ kernel.
++    if (!split && ggml_sycl_q8_direct_eligible(ctx, src0, src1, dst)) {
++        const char * q8 = ggml_sycl_q8_direct_prepare(ctx, src0, src1, dst);
++        if (q8) {
++            ggml_sycl_q8_0_reorder_mmvq_direct(src0->data, q8, (float *) dst->data, (int) src0->ne[0], (int) src0->ne[1],
++                                               ctx.stream());
+             return;
+         }
+     }
+@@ -6613,6 +6638,42 @@
+                 continue;
+             }
+         }
++        // GGML_SYCL_Q8_EPILOGUE: a direct-path one-token Q8_0 MUL_MAT read only by UNARY(SILU), or by SCALE (bias 0, read
++        // only by the SILU): one launch writing silu(scale * acc) into the SILU's tensor (patch 21)
++        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_q8_epilogue_on() && ggml_sycl_q8_direct_on() &&
++            ggml_sycl_q8_0_epilogue_supported() && i + 1 < cgraph->n_nodes &&
++            ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
++            ggml_sycl_q8_direct_eligible(*sycl_ctx, node->src[0], node->src[1], node)) {
++            int   last  = -1;
++            float scale = 1.0f;
++            ggml_tensor * n1 = cgraph->nodes[i + 1];
++            if (n1->op == GGML_OP_UNARY && ggml_get_unary_op(n1) == GGML_UNARY_OP_SILU && n1->src[0] == node) {
++                last = i + 1;
++            } else if (n1->op == GGML_OP_SCALE && n1->src[0] == node && i + 2 < cgraph->n_nodes &&
++                       ggml_node_get_use_count(cgraph, i + 1) == 1 && !(n1->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                float sb[2];
++                memcpy(sb, n1->op_params, sizeof sb);
++                ggml_tensor * n2 = cgraph->nodes[i + 2];
++                if (sb[1] == 0.0f && n2->op == GGML_OP_UNARY && ggml_get_unary_op(n2) == GGML_UNARY_OP_SILU && n2->src[0] == n1) {
++                    last  = i + 2;
++                    scale = sb[0];
++                }
++            }
++            if (last > 0) {
++                ggml_tensor * un = cgraph->nodes[last];
++                if (un->type == GGML_TYPE_F32 && ggml_is_contiguous(un) && ggml_are_same_shape(un, node) && un->buffer &&
++                    !ggml_backend_buffer_is_host(un->buffer)) {
++                    const char * q8 = ggml_sycl_q8_direct_prepare(*sycl_ctx, node->src[0], node->src[1], node);
++                    if (q8) {
++                        ggml_sycl_q8_0_reorder_mmvq_direct_silu(node->src[0]->data, q8, (float *) un->data,
++                                                                (int) node->src[0]->ne[0], (int) node->src[0]->ne[1],
++                                                                scale, sycl_ctx->stream());
++                        i = last;
++                        continue;
++                    }
++                }
++            }
++        }
+         // GGML_SYCL_FUSE_HC_MIX: sigmoid(u) * xn -> permute -> cont -> the (1/hc) matmul, as one kernel
+         if (node->op == GGML_OP_UNARY && ggml_sycl_fuse_hc_mix_on() && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+             const int last = ggml_sycl_match_hc_mix_mean(cgraph, i);
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -1257,6 +1257,53 @@
+         });
+ }
+ 
++// GGML_SYCL_Q8_EPILOGUE (patch 21): the same kernel with dst[row] = silu(scale * acc), computed exactly as the separate
++// SCALE (scale * x + 0.0f) and UNARY(SILU) (op_silu) kernels would.
++static void reorder_mul_mat_vec_q8_0_q8_1_wide_silu_sycl(const void * vx, const void * vy, float * dst, const int ncols,
++                                                         const int nrows, const float scale, dpct::queue_ptr stream) {
++    GGML_ASSERT(ncols % QK8_0 == 0);
++    constexpr int sg_per_wg = 8;
++    const int     nb        = ncols / QK8_0;
++    const size_t  d_base    = (size_t) ncols * nrows;   // scales follow all quants: [qs0|...|qsN][d0|...|dN]
++    const int     n_wg      = ceil_div(nrows, sg_per_wg);
++    stream->parallel_for(
++        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * sg_per_wg * WARP_SIZE), sycl::range<1>(sg_per_wg * WARP_SIZE)),
++        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++            const sycl::sub_group sg  = it.get_sub_group();
++            const int             row = (int) it.get_group(0) * sg_per_wg + (int) sg.get_group_linear_id();
++            if (row >= nrows) {
++                return;   // the whole sub-group shares the row
++            }
++            const int           lane = sg.get_local_linear_id();
++            const int8_t *      xq   = (const int8_t *) vx + (size_t) row * nb * QK8_0;
++            const ggml_half *   xd   = (const ggml_half *) ((const char *) vx + d_base) + (size_t) row * nb;
++            const int8_t *      yq   = (const int8_t *) vy;
++            const sycl::half2 * yds  = (const sycl::half2 *) ((const char *) vy + ncols);
++            float               sum  = 0.0f;
++#pragma unroll 2
++            for (int i = lane; i < nb; i += WARP_SIZE) {
++                const sycl::int4 * xv = (const sycl::int4 *) (xq + (size_t) i * QK8_0);
++                const sycl::int4 * yv = (const sycl::int4 *) (yq + (size_t) i * QK8_1);
++                const sycl::int4   x0 = xv[0], x1 = xv[1];
++                const sycl::int4   y0 = yv[0], y1 = yv[1];
++                int                s  = 0;
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    s = dpct::dp4a(x0[j], y0[j], s);
++                }
++#pragma unroll
++                for (int j = 0; j < 4; j++) {
++                    s = dpct::dp4a(x1[j], y1[j], s);
++                }
++                sum += static_cast<float>(xd[i]) * static_cast<float>(yds[i][0]) * s;
++            }
++            sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
++            if (lane == 0) {
++                dst[row] = op_silu<float>(scale * sum + 0.0f);
++            }
++        });
++}
++
+ template <int ncols_dst>
+ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
+         const void * vx, const void * vy, float * dst,
+@@ -3511,3 +3558,14 @@
+         reorder_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream);
+     }
+ }
++
++// GGML_SYCL_Q8_EPILOGUE (patch 21): whether the epilogue kernel is available -- it is patch 18's kernel, so only with
++// GGML_SYCL_Q8W (the unfused path then uses the same kernel, and the fusion changes no arithmetic).
++bool ggml_sycl_q8_0_epilogue_supported() {
++    return ggml_sycl_q8w_enabled();
++}
++
++void ggml_sycl_q8_0_reorder_mmvq_direct_silu(const void * vx, const void * vy, float * dst, const int ncols, const int nrows,
++                                             const float scale, dpct::queue_ptr stream) {
++    reorder_mul_mat_vec_q8_0_q8_1_wide_silu_sycl(vx, vy, dst, ncols, nrows, scale, stream);
++}
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -77,6 +77,11 @@
+ void ggml_sycl_q8_0_reorder_mmvq_direct(const void * vx, const void * vy, float * dst, int ncols, int nrows,
+                                         dpct::queue_ptr stream);
+ 
++// GGML_SYCL_Q8_EPILOGUE (patch 21): the direct kernel with dst = silu(scale * acc); available with GGML_SYCL_Q8W only.
++bool ggml_sycl_q8_0_epilogue_supported();
++void ggml_sycl_q8_0_reorder_mmvq_direct_silu(const void * vx, const void * vy, float * dst, int ncols, int nrows,
++                                             float scale, dpct::queue_ptr stream);
++
+ #endif // GGML_SYCL_MMVQ_HPP
+ 
+ // Fused q2_0 MoE gate + up + SwiGLU at one token (GGML_SYCL_MOE_Q2W=1); see apply_moeglu.py.

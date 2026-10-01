@@ -1,0 +1,31 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 686a4c7..b1cf92b 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5120,6 +5120,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+             return;
+         }
++    } else if (ne12 <= 8 && ids->ne[1] == ne12 && ne13 == 1 && ids->ne[2] == 1) {
++        // few tokens (e.g. a speculative decoding verify): run the fused kernel on each token view, so ids stay on the device
++        // the fused checks do not depend on the token: all tokens take this path, or the first one declines
++        bool ok = true;
++        for (int64_t t = 0; t < ne12 && ok; t++) {
++            ggml_tensor src1_t = *src1;
++            src1_t.ne[2] = 1;
++            src1_t.data  = (char *) src1->data + t * nb12;
++            ggml_tensor ids_t = *ids;
++            ids_t.ne[1] = 1;
++            ids_t.data  = (char *) ids->data + t * ids->nb[1];
++            ggml_tensor dst_t = *dst;
++            dst_t.ne[2] = 1;
++            dst_t.data  = (char *) dst->data + t * nb2;
++            ok = ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, &src1_t, &ids_t, &dst_t);
++            GGML_ASSERT(ok || t == 0);
++        }
++        if (ok) {
++            return;
++        }
+     }
+ 
+     std::vector<char> ids_host(ggml_nbytes(ids));

@@ -95,6 +95,7 @@ int main(int argc, char ** argv) {
     {
         const char * home = getenv("HOME");
         std::string dir = std::string(home ? home : ".") + "/.unsloth/llama.cpp/build/bin";
+        if (const char * bd = getenv("QWFN_GGML_BACKENDS")) dir = bd;
         ggml_backend_load_all_from_path(dir.c_str());
     }
     llama_backend_init();

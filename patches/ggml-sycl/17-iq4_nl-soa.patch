@@ -1,0 +1,307 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -431,7 +431,8 @@
+         GGML_TYPE_Q1_0    = 41,
+         GGML_TYPE_Q2_0    = 42,
+         GGML_TYPE_Q2_0_SOA = 43, // q2_0, each 2-D slice as [codes][scales]; SYCL only, never in files
+-        GGML_TYPE_COUNT   = 44,
++        GGML_TYPE_IQ4_NL_SOA = 44, // iq4_nl, each 2-D slice as [codes][scales]; SYCL only, never in files
++        GGML_TYPE_COUNT   = 45,
+     };
+ 
+     // [TAG_GGML_PREC]
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -696,6 +696,12 @@
+         .type_size                = sizeof(block_q2_0),
+         .is_quantized             = true,
+     },
++    [GGML_TYPE_IQ4_NL_SOA] = {
++        .type_name                = "iq4_nl_soa",
++        .blck_size                = QK4_NL,
++        .type_size                = sizeof(block_iq4_nl),
++        .is_quantized             = true,
++    },
+     [GGML_TYPE_Q4_0] = {
+         .type_name                = "q4_0",
+         .blck_size                = QK4_0,
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -932,11 +932,16 @@
+ // ---- Q2_0_SOA (see scripts/box/q2soa/apply_q2soa.py) ----
+ // A tensor's slices: blocks per 2-D slice, and how many slices. Writes and reads must cover whole slices, and the
+ // slices must be packed (the MUL_MAT_ID weights the engine builds, and 1-D transfer handles, are).
++// patch 17: IQ4_NL_SOA uses the same layout -- an iq4_nl block is a 2-byte scale and 16 code bytes, like q2_0's --
++// with 32 elements per block instead of 64.
++static_assert(sizeof(block_iq4_nl) == sizeof(block_q2_0), "iq4_nl and q2_0 blocks share the SOA conversion");
++static bool ggml_sycl_is_soa(const ggml_type t) { return t == GGML_TYPE_Q2_0_SOA || t == GGML_TYPE_IQ4_NL_SOA; }
+ static bool q2_0_soa_geometry(const ggml_tensor * t, size_t offset, size_t size, int64_t & bps, int64_t & nslices) {
+-    bps = (t->ne[0] / QK2_0) * t->ne[1];
++    const int64_t QK = t->type == GGML_TYPE_IQ4_NL_SOA ? QK4_NL : QK2_0;
++    bps = (t->ne[0] / QK) * t->ne[1];
+     nslices = t->ne[2] * t->ne[3];
+     const size_t slice_bytes = (size_t) bps * sizeof(block_q2_0);
+-    if (t->ne[0] % QK2_0 != 0 || t->nb[1] != (size_t) (t->ne[0] / QK2_0) * sizeof(block_q2_0)) return false;
++    if (t->ne[0] % QK != 0 || t->nb[1] != (size_t) (t->ne[0] / QK) * sizeof(block_q2_0)) return false;
+     if (t->ne[2] > 1 && t->nb[2] != slice_bytes) return false;
+     if (t->ne[3] > 1 && t->nb[3] != slice_bytes * t->ne[2]) return false;
+     return offset == 0 && size == slice_bytes * (size_t) nslices;
+@@ -976,7 +981,7 @@
+     ggml_sycl_set_device(ctx->device);
+     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
+     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+-    if (tensor->type == GGML_TYPE_Q2_0_SOA) {
++    if (ggml_sycl_is_soa(tensor->type)) {
+         int64_t bps, nslices;
+         GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
+         uint8_t * tmp = sycl::malloc_device<uint8_t>(size, *stream);
+@@ -1014,7 +1019,7 @@
+     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+ 
+     ggml_sycl_set_device(ctx->device);
+-    if (tensor->type == GGML_TYPE_Q2_0_SOA) {   // Q2_0_SOA: canonical bytes back
++    if (ggml_sycl_is_soa(tensor->type)) {   // SOA: canonical bytes back
+         int64_t bps, nslices;
+         GGML_ASSERT(q2_0_soa_geometry(tensor, offset, size, bps, nslices) && "Q2_0_SOA: whole packed slices only");
+         auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
+@@ -5021,7 +5026,7 @@
+ }
+ 
+ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+-    return ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_Q2_0_SOA &&
++    return ggml_is_quantized(src0->type) && !ggml_sycl_is_soa(src0->type) &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+ }
+@@ -6196,7 +6201,7 @@
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
+     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+-    if (tensor->type == GGML_TYPE_Q2_0_SOA) {
++    if (ggml_sycl_is_soa(tensor->type)) {
+         // the upload lands in a pool scratch and is reordered into place; the scratch goes back to the pool at
+         // once, which is safe on this in-order queue (anything that reuses it is enqueued after the reorder)
+         int64_t bps, nslices;
+@@ -6223,7 +6228,7 @@
+     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
+     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+-    GGML_ASSERT(tensor->type != GGML_TYPE_Q2_0_SOA && "Q2_0_SOA: read it with the synchronous get");
++    GGML_ASSERT(!ggml_sycl_is_soa(tensor->type) && "SOA types: read them with the synchronous get");
+     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
+@@ -7230,7 +7235,7 @@
+ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     // Q2_0_SOA is a weight layout: only the weight of MUL_MAT / MUL_MAT_ID, as whole packed slices
+     for (int i = 0; i < GGML_MAX_SRC; i++) {
+-        if (op->src[i] && op->src[i]->type == GGML_TYPE_Q2_0_SOA) {
++        if (op->src[i] && ggml_sycl_is_soa(op->src[i]->type)) {
+             if (i != 0 || (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID)) return false;
+             int64_t bps, ns;
+             if (!q2_0_soa_geometry(op->src[0], 0, ggml_nbytes(op->src[0]), bps, ns)) return false;
+@@ -7239,7 +7244,7 @@
+             if (op->op == GGML_OP_MUL_MAT && ns != 1) return false;
+         }
+     }
+-    if (op->type == GGML_TYPE_Q2_0_SOA) return false;
++    if (ggml_sycl_is_soa(op->type)) return false;
+     bool res = do_ggml_backend_sycl_device_supports_op(dev, op);
+     GGML_SYCL_DEBUG("[SYCL] call %s op->op=%s op->type=%s -> %s\n", __func__, ggml_op_name(op->op),
+                     ggml_type_name(op->type), res ? "true" : "false");
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -79,6 +79,23 @@
+         });
+ }
+ 
++// IQ4_NL_SOA (patch 17): k elements of whole slices as [codes][scales]; one work-item per code byte, which holds
++// element j (low nibble) and element j + 16 (high nibble) of its block, as dequantize_iq4_nl.
++template <typename dst_t>
++static void dequantize_iq4_nl_soa_sycl(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k,
++                                       dpct::queue_ptr stream) {
++    const int64_t nblocks = k / QK4_NL;
++    const uint8_t * qs = (const uint8_t *) vx;
++    const sycl::half * ds = (const sycl::half *) (qs + nblocks * 16);
++    stream->parallel_for(sycl::range<1>((size_t) nblocks * 16), [=](sycl::id<1> id) {
++        const int64_t g = id[0], ib = g / 16, j = g % 16;
++        const float d = (float) ds[ib];
++        const uint8_t q = qs[g];
++        y[ib * QK4_NL + j]      = (dst_t) (d * (float) kvalues_iq4nl[q & 0xf]);
++        y[ib * QK4_NL + j + 16] = (dst_t) (d * (float) kvalues_iq4nl[q >> 4]);
++    });
++}
++
+ template <typename dst_t>
+ static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int64_t k,
+                                      dpct::queue_ptr stream) {
+@@ -692,6 +709,8 @@
+     switch (type) {
+         case GGML_TYPE_Q2_0_SOA:
+             return dequantize_q2_0_soa_sycl;
++        case GGML_TYPE_IQ4_NL_SOA:
++            return dequantize_iq4_nl_soa_sycl;
+         case GGML_TYPE_Q1_0:
+             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
+         case GGML_TYPE_Q2_0:
+@@ -784,6 +803,8 @@
+     switch (type) {
+         case GGML_TYPE_Q2_0_SOA:
+             return dequantize_q2_0_soa_sycl;
++        case GGML_TYPE_IQ4_NL_SOA:
++            return dequantize_iq4_nl_soa_sycl;
+         case GGML_TYPE_Q1_0:
+             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
+         case GGML_TYPE_Q2_0:
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2879,6 +2879,132 @@
+     else                             go(std::integral_constant<int, WARP_SIZE / 2>{});
+ }
+ 
++// ---- IQ4_NL_SOA one-token MoE matvec (patch 17) ----
++// The 16-entry IQ4_NL table in four registers, and get_int_from_table_16's byte-permute lookup on them:
++// x = the values of q4's low nibbles, y = of its high nibbles.
++static __dpct_inline__ sycl::int2 iq4nl_lookup(const uint32_t q4, const uint32_t t0, const uint32_t t1,
++                                               const uint32_t t2, const uint32_t t3) {
++    uint32_t tmp[2];
++    const uint32_t sel = 0x32103210 | ((q4 & 0x88888888) >> 1);
++#pragma unroll
++    for (uint32_t i = 0; i < 2; ++i) {
++        const uint32_t shift = 16 * i;
++        const uint32_t low  = dpct::byte_level_permute(t0, t1, q4 >> shift);
++        const uint32_t high = dpct::byte_level_permute(t2, t3, q4 >> shift);
++        tmp[i] = dpct::byte_level_permute(low, high, sel >> shift);
++    }
++    return sycl::int2(dpct::byte_level_permute(tmp[0], tmp[1], 0x6420), dpct::byte_level_permute(tmp[0], tmp[1], 0x7531));
++}
++
++// One expert's slice: codes of block (row, b) at slice + blk*16 (16-byte aligned), its scale in the half array
++// after all the slice's codes. The arithmetic per block is vec_dot_iq4_nl_q8_1's.
++// Lookup modes (GGML_SYCL_IQ4_SOA_LUT): 1 (default) a 256-entry table in local memory, code byte -> the two values
++// of its nibbles, 2.75x the stock kernel; 0 the byte-permute lookup (dpct::byte_level_permute is written with 64-bit
++// variable shifts, which the GPU emulates: ALU-bound at the stock kernel's speed).
++template <int LPR, int LUT>
++static void mul_mat_vec_iq4_nl_soa_moe(
++    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
++    const int ncols, const int nrows,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride,
++    const sycl::nd_item<3> & it, uint16_t * lut) {
++    constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++    const int expert_idx = it.get_group(1);
++    const int i02        = ids_dev[expert_idx];
++    const int lane       = it.get_local_id(2);
++    const int row        = (it.get_group(2) * it.get_local_range(1) + it.get_local_id(1)) * ROWS_PER_SG + lane / LPR;
++    const int t          = lane % LPR;
++    if constexpr (LUT == 1) {
++        const int lid = it.get_local_linear_id(), nl = (int) it.get_local_range().size();
++        for (int i = lid; i < 256; i += nl)
++            lut[i] = (uint16_t) ((uint8_t) kvalues_iq4nl[i & 0xf] | ((uint16_t) (uint8_t) kvalues_iq4nl[i >> 4] << 8));
++        sycl::group_barrier(it.get_group());
++    }
++
++    const uint8_t *    slice = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
++    const block_q8_1 * y     = (const block_q8_1 *) ((const char *) vy_base + (size_t) expert_idx * src1_row_stride);
++    float *            dst   = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
++
++    const int bpr = ncols / QK4_NL;
++    const sycl::half * scales = (const sycl::half *) (slice + (size_t) nrows * bpr * 16);
++    const uint8_t * kv = (const uint8_t *) kvalues_iq4nl;   // an int8 table: assembled bytewise, no aligned-load assumption
++    const uint32_t t0 = kv[0]  | (kv[1]  << 8) | (kv[2]  << 16) | ((uint32_t) kv[3]  << 24);
++    const uint32_t t1 = kv[4]  | (kv[5]  << 8) | (kv[6]  << 16) | ((uint32_t) kv[7]  << 24);
++    const uint32_t t2 = kv[8]  | (kv[9]  << 8) | (kv[10] << 16) | ((uint32_t) kv[11] << 24);
++    const uint32_t t3 = kv[12] | (kv[13] << 8) | (kv[14] << 16) | ((uint32_t) kv[15] << 24);
++    float acc = 0.0f;
++    if (row < nrows) {
++        for (int b = t; b < bpr; b += LPR) {
++            const size_t blk = (size_t) row * bpr + b;
++            const sycl::uint4 q = *(const sycl::uint4 *) (slice + blk * 16);
++            const int * u = (const int *) y[b].qs;
++            int sumi = 0;
++            const uint32_t qw[4] = { q.x(), q.y(), q.z(), q.w() };
++#pragma unroll
++            for (int k = 0; k < 4; k++) {
++                int vx, vy;
++                if constexpr (LUT == 1) {
++                    uint32_t x = 0, yv = 0;
++#pragma unroll
++                    for (int j = 0; j < 4; j++) {
++                        const uint32_t e = lut[(qw[k] >> (8 * j)) & 0xff];
++                        x |= (e & 0xffu) << (8 * j); yv |= (e >> 8) << (8 * j);
++                    }
++                    vx = (int) x; vy = (int) yv;
++                } else {
++                    const sycl::int2 v = iq4nl_lookup(qw[k], t0, t1, t2, t3); vx = v.x(); vy = v.y();
++                }
++                sumi = dpct::dp4a(vx, u[k], sumi);
++                sumi = dpct::dp4a(vy, u[k + 4], sumi);
++            }
++            acc += (float) scales[blk] * (float) y[b].ds[0] * (float) sumi;
++        }
++    }
++#pragma unroll
++    for (int mask = LPR / 2; mask > 0; mask >>= 1) {
++        acc += dpct::permute_sub_group_by_xor(it.get_sub_group(), acc, mask);
++    }
++    if (row < nrows && t == 0) {
++        dst[row] = acc;
++    }
++}
++
++static void launch_mul_mat_vec_iq4_nl_soa_moe(
++    const void * vx_base, const void * vy, const int32_t * ids_dev,
++    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride, dpct::queue_ptr stream) {
++    const int bpr = ncols / QK4_NL;
++    constexpr int SG_PER_WG = 4;
++    // GGML_SYCL_IQ4_SOA_LPR=32|16|8 forces the lanes per row (tuning); otherwise by row length
++    static const int lpr_env = [] { const char * e = getenv("GGML_SYCL_IQ4_SOA_LPR"); return e ? atoi(e) : 0; }();
++    static const int lut_mode = [] { const char * e = getenv("GGML_SYCL_IQ4_SOA_LUT"); return e ? atoi(e) : 1; }();
++    const int lpr = lpr_env ? lpr_env : bpr >= WARP_SIZE ? WARP_SIZE : bpr >= WARP_SIZE / 2 ? WARP_SIZE / 2 : WARP_SIZE / 4;
++    auto go = [&](auto lpr_tag) {
++        constexpr int LPR = decltype(lpr_tag)::value;
++        constexpr int ROWS_PER_SG = WARP_SIZE / LPR;
++        const int n_sg = (nrows + ROWS_PER_SG - 1) / ROWS_PER_SG;
++        const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) ((n_sg + SG_PER_WG - 1) / SG_PER_WG));
++        const sycl::range<3> block_dims(1, SG_PER_WG, WARP_SIZE);
++        const int lm = lut_mode;   // captured by value: device code cannot read the function-static
++        stream->submit([&](sycl::handler & cgh) {
++            sycl::local_accessor<uint16_t, 1> lut(sycl::range<1>(256), cgh);
++            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    uint16_t * l = lut.get_multi_ptr<sycl::access::decorated::no>().get();
++                    if (lm == 0)      mul_mat_vec_iq4_nl_soa_moe<LPR, 0>(vx_base, vy, dst_base, ids_dev, ncols, nrows,
++                                                expert_weight_stride, dst_row_stride, src1_row_stride, item, l);
++                    else                    mul_mat_vec_iq4_nl_soa_moe<LPR, 1>(vx_base, vy, dst_base, ids_dev, ncols, nrows,
++                                                expert_weight_stride, dst_row_stride, src1_row_stride, item, l);
++                });
++        });
++    };
++    if (lpr >= WARP_SIZE)          go(std::integral_constant<int, WARP_SIZE>{});
++    else if (lpr >= WARP_SIZE / 2) go(std::integral_constant<int, WARP_SIZE / 2>{});
++    else                           go(std::integral_constant<int, WARP_SIZE / 4>{});
++}
++
+ static bool ggml_sycl_moe_q2w_enabled() {
+     static const bool v = [] { const char * e = getenv("GGML_SYCL_MOE_Q2W"); return e && atoi(e) != 0; }();
+     return v;
+@@ -3005,6 +3131,11 @@
+                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
++        case GGML_TYPE_IQ4_NL_SOA:
++            if (ncols % QK4_NL != 0) return false;
++            launch_mul_mat_vec_iq4_nl_soa_moe(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
++            return true;
+         case GGML_TYPE_Q2_0_SOA:
+             if (ncols % QK2_0 != 0) return false;
+             launch_mul_mat_vec_q2_0_moe_wide(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,

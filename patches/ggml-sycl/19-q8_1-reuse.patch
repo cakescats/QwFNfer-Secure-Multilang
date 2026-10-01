@@ -1,0 +1,109 @@
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -338,6 +338,16 @@
+     std::string name;
+     optimize_feature opt_feature;
+ 
++    // GGML_SYCL_Q8_REUSE: the last one-token src1 quantized to q8_1 for MMVQ, kept (in q8r_buf, allocated once and
++    // kept for the process) for the next matmul on the same src1. q8r_src1 == nullptr: nothing cached.
++    const ggml_tensor * q8r_src1 = nullptr;
++    const void *        q8r_data = nullptr;
++    size_t              q8r_nbytes = 0;   // src1's size at store time: the overlap check never dereferences q8r_src1
++    int64_t             q8r_ne10 = 0;
++    int                 q8r_kind = -1;
++    char *              q8r_buf  = nullptr;
++    size_t              q8r_cap  = 0;
++
+     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
+ 
+     explicit ggml_backend_sycl_context(int device) :
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -3593,6 +3593,11 @@
+     peer_access_enabled = enable_peer_access;
+ }
+ 
++static bool ggml_sycl_q8_reuse_on() {
++    static const bool on = [] { const char * e = getenv("GGML_SYCL_Q8_REUSE"); return e && atoi(e) != 0; }();
++    return on;
++}
++
+ template <template <int> typename quantize_f>
+ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
+                                  const ggml_tensor *src1, ggml_tensor *dst,
+@@ -3719,7 +3724,29 @@
+         }
+ 
+         if constexpr(quantize_enabled) {
+-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
++          // GGML_SYCL_Q8_REUSE: one token on one device -- reuse the q8_1 copy the previous matmul on this src1 made
++          const int    q8r_kind  = std::is_same_v<quantize_f<QK8_1 / WARP_SIZE>, quantize_and_reorder_q8_1_soa<QK8_1 / WARP_SIZE>> ? 1 : 0;
++          const size_t q8r_bytes = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
++          // MUL_MAT only: MUL_MAT_ID reaches this function with stack copies of its tensors, which must never be cached
++          const bool   q8r       = ggml_sycl_q8_reuse_on() && dst->op == GGML_OP_MUL_MAT && !split && nrows1 == 1 &&
++                                   src1_on_device && src1_is_contiguous;
++          if (q8r && ctx.q8r_src1 == src1 && ctx.q8r_data == src1->data && ctx.q8r_ne10 == ne10 && ctx.q8r_kind == q8r_kind) {
++            dev[i].src1_ddq = ctx.q8r_buf;
++          } else {
++            if (q8r) {
++                if (ctx.q8r_cap < q8r_bytes) {
++                    if (ctx.q8r_buf) {
++                        stream->wait();   // the in-order queue may still read the old copy
++                        sycl::free(ctx.q8r_buf, *stream);
++                    }
++                    ctx.q8r_cap = std::max<size_t>(q8r_bytes, 128 * 1024);
++                    ctx.q8r_buf = (char *) sycl::malloc_device(ctx.q8r_cap, *stream);
++                }
++                dev[i].src1_ddq = ctx.q8r_buf;
++                ctx.q8r_src1 = src1; ctx.q8r_data = src1->data; ctx.q8r_nbytes = ggml_nbytes(src1); ctx.q8r_ne10 = ne10; ctx.q8r_kind = q8r_kind;
++            } else {
++                dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
++            }
+ 
+             if (src1_on_device && src1_is_contiguous) {
+                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+@@ -3732,6 +3759,7 @@
+                     std::exit(1);
+                 }
+             }
++          }
+         }
+ 
+         if (dst_on_device) {
+@@ -6367,6 +6395,8 @@
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
+     g_moesum_n = 0;   // apply_fuse3.py: no CONT skip survives a graph
++    sycl_ctx->q8r_src1 = nullptr;   // GGML_SYCL_Q8_REUSE: nothing cached survives a graph
++    int q8r_from = 0;               // first node not yet checked against the cached src1
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -6376,6 +6406,25 @@
+         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+             continue;
+         }
++        // GGML_SYCL_Q8_REUSE: before this node runs, check every node since the last check -- including the ones a
++        // fusion below folded into an earlier launch, however many -- for a write over the cached src1
++        if (sycl_ctx->q8r_src1) {
++            const char * a0 = (const char *) sycl_ctx->q8r_data;
++            const char * a1 = a0 + sycl_ctx->q8r_nbytes;
++            for (int j = q8r_from; j <= i; j++) {
++                const ggml_tensor * w = cgraph->nodes[j];
++                if (!w->data || ggml_sycl_is_view_or_noop(w)) {
++                    continue;
++                }
++                const char * b0 = (const char *) w->data;
++                const char * b1 = b0 + ggml_nbytes(w);
++                if (b0 < a1 && a0 < b1) {
++                    sycl_ctx->q8r_src1 = nullptr;
++                    break;
++                }
++            }
++        }
++        q8r_from = i + 1;
+ 
+         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
+         if (nodes_to_skip != 0) {

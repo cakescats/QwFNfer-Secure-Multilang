@@ -2,6 +2,7 @@
 #include "qwfn_plat.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -31,12 +32,17 @@ bool weights::init(const model_index * mi, bool prefer_gpu,
                    const std::string & backend_dir, std::string & err) {
     mi_ = mi;
 
-    if (backend_dir.empty()) ggml_backend_load_all();
-    else                     ggml_backend_load_all_from_path(backend_dir.c_str());
+    const char * env_dir = getenv("QWFN_GGML_BACKENDS");
+    const std::string dir = env_dir && *env_dir ? env_dir : backend_dir;
+    if (dir.empty()) ggml_backend_load_all();
+    else             ggml_backend_load_all_from_path(dir.c_str());
 
     if (prefer_gpu) {
         dev_ = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
         on_gpu_ = dev_ != nullptr;
+        // Without this a missing backend module or runtime silently falls back to a much slower CPU run.
+        if (!dev_ && getenv("QWFN_REQUIRE_GPU")) { err = "no GPU backend device (backend dir: '" + dir + "')"; return false; }
+        if (!dev_) fprintf(stderr, "[qwfn] no GPU backend device (backend dir: '%s'); running on the CPU\n", dir.c_str());
     }
     if (!dev_) {
         dev_ = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -46,6 +52,7 @@ bool weights::init(const model_index * mi, bool prefer_gpu,
 
     backend_ = ggml_backend_dev_init(dev_, nullptr);
     if (!backend_) { err = "failed to init backend device"; return false; }
+    if (on_gpu_) fprintf(stderr, "[qwfn] GPU device: %s\n", ggml_backend_dev_description(dev_));
     buft_ = ggml_backend_dev_buffer_type(dev_);
 
     // no_alloc: tensors are declared first, then backed by one buffer in commit().

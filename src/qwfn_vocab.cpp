@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace qwfn {
 
@@ -18,8 +19,12 @@ bool vocab::load(const std::string & path, std::string & err) {
     mp.vocab_only = true;              // parse the tokenizer, skip all 91 GB
     mp.n_gpu_layers = 0;
 
-    model_ = llama_model_load_from_file(path.c_str(), mp);
-    if (!model_) { err = "failed to load vocab from " + path; return false; }
+    // QWFN_VOCAB_MODEL: the tokenizer from another GGUF of the same model (llama.cpp's split loader
+    // rejects overlay shards that carry no split.no).
+    const char * over = getenv("QWFN_VOCAB_MODEL");
+    const std::string src = over && *over ? over : path;
+    model_ = llama_model_load_from_file(src.c_str(), mp);
+    if (!model_) { err = "failed to load vocab from " + src; return false; }
 
     v_ = llama_model_get_vocab(model_);
     if (!v_) { err = "model has no vocab"; return false; }

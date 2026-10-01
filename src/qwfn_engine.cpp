@@ -99,6 +99,9 @@ bool engine::init(const model_index * hot, const model_index * cold,
                 for (int q = 0; q < EXPERT_NPARTS; q++) {
                     const byte_range a = mi->expert_range(il, 0, (expert_part) q);
                     const byte_range b = mi->expert_range(il, 1, (expert_part) q);
+                    // The first slice's own offset counts too: a page-multiple stride off a
+                    // 32-byte GGUF tensor offset would make every in-place O_DIRECT read fail.
+                    if (a.valid() && (a.offset % QWFN_DIO_PAGE) != 0) return false;
                     if (a.valid() && b.valid() && ((b.offset - a.offset) % QWFN_DIO_PAGE) != 0) return false;
                 }
             return true;
@@ -135,6 +138,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         hpm_.full_attention_interval = hpm_.n_layer;   // in this index only the last block, the nextn block, is attention
         hpm_.ssm_dt_rank = 1;                           // the index's 48 trunk slots carry no state here; keep theirs tiny
         hpm_.hc_inject_prescaled = false;               // its inject weights are Q8_0 and are not folded
+        hpm_.hc_down_prescaled   = false;               // nor its down weights
         state_config scm; scm.n_ctx = cfg.n_ctx; scm.type_k = cfg.type_k; scm.type_v = cfg.type_v;
         if (!st_mtp_.init(&hpm_, scm, w_.buft(), err)) return false;
         mtp_on_ = true;
@@ -246,27 +250,48 @@ bool engine::init(const model_index * hot, const model_index * cold,
             for (const char * n : { "hc_attn_norm", "hc_ffn_norm", "ple_norm_key", "ple_norm_query", "ple_norm_conv" })
                 reshape_gamma(b + n + ".weight");
         }
-        // Fold the 1/hc of hc_combine's gate into the F32 inject weights: 0.25 is a
-        // power of two, so every product and partial sum rounds exactly as before
-        // and the scale kernel disappears. Only if every inject weight is F32.
-        bool all_f32 = true; std::vector<ggml_tensor *> inj;
-        for (uint32_t l = 0; l < hp_.n_layer && all_f32; l++)
-            for (const char * n : { "hc_attn_inject", "hc_ffn_inject" }) {
-                ggml_tensor * t = w_.get("blk." + std::to_string(l) + "." + n + ".weight");
+        // Fold the 1/hc scales of the hyper-connections into their weights: hc_combine's
+        // gate (inject) and hc_mix's low-rank branch (down). 0.25 is a power of two, so
+        // every product and partial sum rounds exactly as before and the scale kernels
+        // disappear (three per decode layer graph). F32, BF16 and F16 weights: scaling a
+        // 16-bit float by a power of two only moves its exponent. Each set is folded only
+        // if every tensor in it can be, so a flag never describes a half-folded model.
+        auto fold_set = [&](const std::vector<std::string> & names, const char * what) -> bool {
+            std::vector<ggml_tensor *> ts;
+            for (const std::string & nm : names) {
+                ggml_tensor * t = w_.get(nm);
                 if (!t) continue;
-                if (t->type != GGML_TYPE_F32) { all_f32 = false; break; }
-                inj.push_back(t);
+                if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_F16) return false;
+                if (!ggml_is_contiguous(t)) return false;
+                ts.push_back(t);
             }
-        if (all_f32 && !inj.empty() && !getenv("QWFN_NO_INJECT_FOLD")) {
-            std::vector<float> buf;
-            for (ggml_tensor * t : inj) {
-                buf.resize(ggml_nelements(t));
-                ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
-                for (float & v : buf) v *= 1.0f / (float) hc;
-                ggml_backend_tensor_set(t, buf.data(), 0, buf.size() * sizeof(float));
+            if (ts.empty()) return false;
+            std::vector<uint8_t> raw; std::vector<float> f;
+            for (ggml_tensor * t : ts) {
+                const int64_t n = ggml_nelements(t);
+                raw.resize(ggml_nbytes(t)); f.resize(n);
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                if (t->type == GGML_TYPE_F32)       memcpy(f.data(), raw.data(), n * sizeof(float));
+                else if (t->type == GGML_TYPE_BF16) ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), f.data(), n);
+                else                                ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), f.data(), n);
+                for (float & v : f) v *= 1.0f / (float) hc;
+                if (t->type == GGML_TYPE_F32)       memcpy(raw.data(), f.data(), n * sizeof(float));
+                else if (t->type == GGML_TYPE_BF16) ggml_fp32_to_bf16_row_ref(f.data(), (ggml_bf16_t *) raw.data(), n);
+                else                                ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t *) raw.data(), n);
+                ggml_backend_tensor_set(t, raw.data(), 0, raw.size());
             }
-            hp_.hc_inject_prescaled = true;
+            fprintf(stderr, "[qwfn] hc fold: %s scaled by 1/%lld in %zu tensors (%s)\n", what, (long long) hc, ts.size(), ggml_type_name(ts[0]->type));
+            return true;
+        };
+        std::vector<std::string> inj_names, down_names;
+        for (uint32_t l = 0; l < hp_.n_layer; l++) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            inj_names.push_back(b + "hc_attn_inject.weight"); inj_names.push_back(b + "hc_ffn_inject.weight");
+            down_names.push_back(b + "hc_attn_down.weight");  down_names.push_back(b + "hc_ffn_down.weight");
         }
+        down_names.push_back("output_hc_down.weight");
+        if (!getenv("QWFN_NO_INJECT_FOLD")) hp_.hc_inject_prescaled = fold_set(inj_names, "inject");
+        if (!getenv("QWFN_NO_DOWN_FOLD"))   hp_.hc_down_prescaled   = fold_set(down_names, "down");
     }
     constexpr int64_t MAXT = 1 + MTP_MAX_DRAFTS;   // positions of the longest verify step
     pack_n_ = MAXT * (n_embd + 2 * (int64_t) U + 2 * (int64_t) QWFN_SPEC_MAX);   // room for a multi-token step
@@ -462,6 +487,8 @@ bool engine::init(const model_index * hot, const model_index * cold,
         ec_cfg.vram_backend = w_.backend();
     }
     ec_cfg.async_promote = getenv("QWFN_SYNC_PROMOTE") == nullptr;
+    ec_cfg.q2_soa = getenv("QWFN_Q2_SOA") != nullptr;   // the VRAM tier's q2_0 experts in the SOA layout (SYCL)
+    ec_cfg.iq4_soa = getenv("QWFN_IQ4_SOA") != nullptr; // and its iq4_nl experts (ggml-sycl patch 17)
     ec_cfg.use_cold_tier = cfg.use_cold_tier;
     ec_cfg.max_promotions_per_layer = cfg.promote_per_layer;
     ec_cfg.ram_frac      = cfg.ram_frac;
@@ -522,6 +549,11 @@ bool engine::init(const model_index * hot, const model_index * cold,
     // that layer's graph ran: the next graph computes them from the tier by
     // slot (at most max_promotions_per_layer of them), the "late fold".
     n_late_ = moe_in_graph_ ? (1 + MTP_MAX_DRAFTS) * (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer) : 0;   // room for a multi-token step's budget
+    // A decode step fetches each layer once, for the union of its positions, and that fetch promotes at
+    // most promote_per_layer * n_new experts (eval_decode sets the cap per step): a T-position step's fold
+    // never holds more than late_rows(T). At T = 1 that cuts the fold's three mul_mat_id from 8 experts to 2
+    // in every layer graph. QWFN_LATE_FULL=1 restores the full width.
+    n_late_per_pos_ = getenv("QWFN_LATE_FULL") ? n_late_ : (int) std::max<uint32_t>(1, ec_cfg.max_promotions_per_layer);
     // Before the tier sizes itself from the free VRAM: the heads' 123 MB must come out of the tier, not the decode reserve.
     if (!cfg.predictor_path.empty() && !load_predictor(cfg.predictor_path, err)) return false;
     if (!ec_.init(hot, cold, ec_cfg, err)) return false;
@@ -646,7 +678,7 @@ static ggml_tensor * moe_id_graph(ggml_context * c, const tier_view & tv,
         // summation order, so only the GPU graphs ask for it; the CPU path keeps
         // the sequential sum it is validated with. Batched over the T positions.
         ggml_tensor * dt = ggml_reshape_3d(c, ggml_cont(c, ggml_permute(c, down, 1, 0, 2, 3)), n, n_embd, T);   // [n, n_embd, T]
-        ggml_tensor * wv = ggml_reshape_3d(c, ggml_cont(c, w), n, 1, T);                                       // [n, 1, T]
+        ggml_tensor * wv = ggml_reshape_3d(c, ggml_is_contiguous(w) ? w : ggml_cont(c, w), n, 1, T);          // [n, 1, T]; a cont is a kernel even on contiguous input
         return ggml_reshape_2d(c, ggml_mul_mat(c, dt, wv), n_embd, T);                                          // [n_embd, T]
     }
     ggml_tensor * wd   = ggml_mul(c, down, w);
@@ -712,6 +744,47 @@ void engine::reset() {
         std::vector<float> ninf(NBmax, -INFINITY);
         ggml_backend_tensor_set(qd_.bias, ninf.data(), 0, ninf.size() * 4);
     }
+}
+
+size_t engine::checkpoint_bytes() const {
+    return st_.checkpoint_bytes(n_past_);
+}
+
+bool engine::checkpoint_save(checkpoint & out, std::string & err) {
+    if (mtp_on_) { err = "checkpoint: not supported with the draft head"; return false; }
+    ggml_backend_synchronize(w_.backend());
+    const state_config & sc = st_.config();
+    out.n_past = n_past_;
+    out.n_ctx = sc.n_ctx; out.type_k = sc.type_k; out.type_v = sc.type_v;
+    out.kv_host = sc.kv_host; out.idx_host = sc.idx_host;
+    // A reused buffer that is too small is released first: growing it in place would make the
+    // vector allocate up to twice the size and copy the old contents across, briefly holding
+    // three checkpoints' worth of host memory for one.
+    const size_t need = st_.checkpoint_bytes(n_past_);
+    if (out.st.capacity() < need) std::vector<uint8_t>().swap(out.st);
+    out.st.resize(need);
+    st_.save(n_past_, out.st.data());
+    return true;
+}
+
+bool engine::checkpoint_restore(const checkpoint & in, std::string & err) {
+    if (mtp_on_) { err = "checkpoint: not supported with the draft head"; return false; }
+    const state_config & sc = st_.config();
+    if (in.n_ctx != sc.n_ctx || in.type_k != sc.type_k || in.type_v != sc.type_v ||
+        in.kv_host != sc.kv_host || in.idx_host != sc.idx_host) {
+        err = "checkpoint: taken under a different state configuration"; return false;
+    }
+    if (in.n_past < 0 || in.n_past > (int32_t) sc.n_ctx || in.st.size() != st_.checkpoint_bytes(in.n_past)) {
+        err = "checkpoint: size does not match its position"; return false;
+    }
+    ggml_backend_synchronize(w_.backend());
+    // reset() clears everything derived: rollback expectations, the decode bias,
+    // and marks the pooled block keys for a rebuild from the restored raw cache.
+    reset();
+    st_.restore(in.n_past, in.st.data());
+    clear_embeddings();
+    n_past_ = in.n_past;
+    return true;
 }
 
 // Everything the decode attention graph needs for this token: the write row,
@@ -915,11 +988,29 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
     const int64_t n_kv = n_past_c + Tc;
     ggml_init_params ip{}; ip.mem_size = ggml_tensor_overhead() * 16; ip.no_alloc = true;
     ai.ctx = ggml_init(ip);
-    ai.kq_mask = ggml_new_tensor_2d(ai.ctx, GGML_TYPE_F16, n_kv, Tc);
+    // QWFN_DEV_MASK: leave the mask null and let the graph builder generate it on
+    // the device. The QSA block structures below are still built on the host -- they
+    // are ~1/64 the bytes of the mask.
+    static const bool dev_mask = getenv("QWFN_DEV_MASK") != nullptr;
+    ai.kq_mask = dev_mask ? nullptr : ggml_new_tensor_2d(ai.ctx, GGML_TYPE_F16, n_kv, Tc);
     ai.ratio = cfg_.use_qsa ? qsa_ratio_ : 0;
     const uint32_t ratio = ai.ratio;
     const int64_t n_blocks = ratio ? (n_kv + ratio - 1) / ratio : 0;
-    if (ratio) {
+    // QWFN_QSA_PACK: one upload per chunk instead of four. The bias is pure position
+    // geometry and is built on the device (graph_builder::qsa_bias_dev); cell_blk is
+    // never read by the prefill graph and is not built at all; blk_cells and blk_pos
+    // are views of a single packed I32 tensor. At 89K this runs ~1,030 times (12
+    // attention layers x ~86 chunks), and each sync tensor_set drains the queue and
+    // bounces through a fresh host allocation.
+    static const bool qsa_pack = getenv("QWFN_QSA_PACK") != nullptr;
+    ggml_tensor * qsa_packed = nullptr;
+    if (ratio && qsa_pack) {
+        qsa_packed       = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, (int64_t) (ratio + 4) * n_blocks);
+        ai.qsa.blk_cells = ggml_view_1d(ai.ctx, qsa_packed, ratio * n_blocks, 0);
+        ai.qsa.blk_pos   = ggml_view_1d(ai.ctx, qsa_packed, 4 * n_blocks, (size_t) ratio * n_blocks * sizeof(int32_t));
+        ai.qsa.ratio     = ratio;
+        ai.qsa.n_blocks  = n_blocks;
+    } else if (ratio) {
         ai.qsa.cell_blk  = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, n_kv);
         ai.qsa.blk_cells = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, ratio * n_blocks);
         ai.qsa.blk_pos   = ggml_new_tensor_1d(ai.ctx, GGML_TYPE_I32, 4 * n_blocks);
@@ -927,49 +1018,116 @@ bool engine::build_attn_inputs(int64_t n_past_c, int64_t Tc, attn_inputs & ai, s
         ai.qsa.ratio     = ratio;
         ai.qsa.n_blocks  = n_blocks;
     }
-    ai.buf = ggml_backend_alloc_ctx_tensors_from_buft(ai.ctx, w_.buft());
-    if (!ai.buf) { ggml_free(ai.ctx); ai.ctx = nullptr; err = "failed to allocate per-chunk attention inputs"; return false; }
+    // With dev_mask and no QSA the context holds no tensors at all; alloc would
+    // return null for an empty context, which is not an error.
+    const bool want_alloc = !dev_mask || ratio != 0;
+    ai.buf = want_alloc ? ggml_backend_alloc_ctx_tensors_from_buft(ai.ctx, w_.buft()) : nullptr;
+    if (want_alloc && !ai.buf) { ggml_free(ai.ctx); ai.ctx = nullptr; err = "failed to allocate per-chunk attention inputs"; return false; }
     // These are O(n_kv * Tc) per chunk and at 128K ran for a third of the
     // prefill when written element by element. Row-wise fills: a row is a
     // run of zeros then a run of -inf (F16 0x0000 / 0xFC00).
-    {
-        std::vector<uint16_t> m((size_t) n_kv * Tc);
+    if (!dev_mask) {
+        // The buffer is reused across chunks rather than reallocated: a fresh ~100 MB
+        // allocation per chunk costs a page-fault storm plus the kernel's own zero-fill.
+        const size_t need = (size_t) n_kv * Tc;
+        if (mask_scratch_.size() < need) mask_scratch_.resize(need);
+        uint16_t * m = mask_scratch_.data();
         const uint16_t ninf = f16_of(-INFINITY);
         for (int64_t i = 0; i < Tc; i++) {
-            uint16_t * row = m.data() + i * n_kv;
+            uint16_t * row = m + i * n_kv;
             const int64_t vis = std::min<int64_t>(n_kv, n_past_c + i + 1);
             memset(row, 0, (size_t) vis * 2);
             std::fill(row + vis, row + n_kv, ninf);
         }
-        ggml_backend_tensor_set(ai.kq_mask, m.data(), 0, m.size() * 2);
+        ggml_backend_tensor_set(ai.kq_mask, m, 0, need * 2);
     }
-    if (ratio) {
+    if (ratio && qsa_pack) {
+        // Same values as the unpacked path below for blk_cells and blk_pos, written
+        // into one contiguous scratch laid out as the packed tensor: [bc | bp].
         const int64_t n_bid = n_kv / ratio;
-        const bool have_dead = n_bid < n_blocks;
-        const int64_t dead = have_dead ? n_bid : n_blocks - 1;
-        std::vector<int32_t> cb(n_kv), bc((size_t) ratio * n_blocks, 0), bp((size_t) 4 * n_blocks, 0);
-        std::vector<float> bi((size_t) n_blocks * Tc);
-        for (int64_t j = 0; j < n_bid * (int64_t) ratio; j++) cb[j] = (int32_t) (j / ratio);
-        for (int64_t j = n_bid * (int64_t) ratio; j < n_kv; j++) cb[j] = (int32_t) dead;
+        const size_t bc_n = (size_t) ratio * n_blocks, bp_n = (size_t) 4 * n_blocks;
+        if (bc_scratch_.size() < bc_n + bp_n) bc_scratch_.resize(bc_n + bp_n);
+        int32_t * bc = bc_scratch_.data();
+        int32_t * bp = bc + bc_n;
+        memset(bc, 0, (bc_n + bp_n) * sizeof(int32_t));     // scratch is reused: dirty
+        const auto tq1 = std::chrono::steady_clock::now();
         for (int64_t b = 0; b < n_bid; b++) {
             for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
         }
-        // Row i: 0 for whole blocks before the tail, 1e9 from the tail block on
-        // (still whole), -inf for blocks past n_bid; the dead block gets 1e9.
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
+        }
+        const auto tq4 = std::chrono::steady_clock::now();
+        t_qsa_blkidx += std::chrono::duration<double>(tq4 - tq1).count();
+        ggml_backend_tensor_set(qsa_packed, bc, 0, (bc_n + bp_n) * 4);
+        t_qsa_upload += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq4).count();
+    } else if (ratio) {
+        const int64_t n_bid = n_kv / ratio;
+        const bool have_dead = n_bid < n_blocks;
+        const int64_t dead = have_dead ? n_bid : n_blocks - 1;
+        // Persistent scratch, reused across chunks and therefore DIRTY -- and unlike the causal mask the loops below do not cover
+        // every entry (bc writes [0, n_bid*ratio), bp writes [0, n_bid) per section),
+        // so the arrays are zeroed explicitly. The original relied on vector zero-init.
+        const size_t cb_n = (size_t) n_kv, bc_n = (size_t) ratio * n_blocks, bp_n = (size_t) 4 * n_blocks;
+        if (cb_scratch_.size() < cb_n) cb_scratch_.resize(cb_n);
+        if (bc_scratch_.size() < bc_n) bc_scratch_.resize(bc_n);
+        if (bp_scratch_.size() < bp_n) bp_scratch_.resize(bp_n);
+        int32_t * cb = cb_scratch_.data();
+        int32_t * bc = bc_scratch_.data();
+        int32_t * bp = bp_scratch_.data();
+        memset(bc, 0, bc_n * sizeof(int32_t));
+        memset(bp, 0, bp_n * sizeof(int32_t));
+        const size_t bneed = (size_t) n_blocks * Tc;
+        if (bias_scratch_.size() < bneed) bias_scratch_.resize(bneed);
+        float * bi_p = bias_scratch_.data();
+        const auto tq0 = std::chrono::steady_clock::now();
+        for (int64_t j = 0; j < n_bid * (int64_t) ratio; j++) cb[j] = (int32_t) (j / ratio);
+        for (int64_t j = n_bid * (int64_t) ratio; j < n_kv; j++) cb[j] = (int32_t) dead;
+        const auto tq1 = std::chrono::steady_clock::now();
+        for (int64_t b = 0; b < n_bid; b++) {
+            for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
+        }
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
+        }
+        const auto tq2 = std::chrono::steady_clock::now();
+        t_qsa_cellblk += std::chrono::duration<double>(tq1 - tq0).count();
+        t_qsa_blkidx  += std::chrono::duration<double>(tq2 - tq1).count();
+        // Row i (query q): 0 for whole blocks before the tail, 1e9 for the block holding q
+        // (whole or the dead one), -1e9 for blocks wholly after q, -inf for blocks past
+        // n_bid. A block after q must not be forced: in a prefill chunk it would take one
+        // of the selection's slots from a past block, and the causal mask empties it.
+        const auto tq3 = std::chrono::steady_clock::now();
         for (int64_t i = 0; i < Tc; i++) {
-            float * row = bi.data() + i * n_blocks;
+            float * row = bi_p + i * n_blocks;
             const int64_t q = n_past_c + i;
             const int64_t tail_b = std::min<int64_t>(n_bid, ((q + 1) / ratio));   // first block at/after the tail
             std::fill(row, row + tail_b, 0.0f);
             std::fill(row + tail_b, row + n_bid, 1e9f);
             std::fill(row + n_bid, row + n_blocks, -INFINITY);
             if (have_dead) row[dead] = 1e9f;
+            for (int64_t b = tail_b; b < n_blocks; b++)
+                if (row[b] > 0.0f && b * (int64_t) ratio > q) row[b] = -1e9f;
         }
-        ggml_backend_tensor_set(ai.qsa.cell_blk,  cb.data(), 0, cb.size() * 4);
-        ggml_backend_tensor_set(ai.qsa.blk_cells, bc.data(), 0, bc.size() * 4);
-        ggml_backend_tensor_set(ai.qsa.blk_pos,   bp.data(), 0, bp.size() * 4);
-        ggml_backend_tensor_set(ai.qsa.bias,      bi.data(), 0, bi.size() * 4);
+        const auto tq4 = std::chrono::steady_clock::now();
+        t_qsa_bias += std::chrono::duration<double>(tq4 - tq3).count();
+        ggml_backend_tensor_set(ai.qsa.cell_blk,  cb,   0, cb_n * 4);
+        ggml_backend_tensor_set(ai.qsa.blk_cells, bc,   0, bc_n * 4);
+        ggml_backend_tensor_set(ai.qsa.blk_pos,   bp,   0, bp_n * 4);
+        ggml_backend_tensor_set(ai.qsa.bias,      bi_p, 0, bneed * 4);
+        t_qsa_upload += std::chrono::duration<double>(std::chrono::steady_clock::now() - tq4).count();
     }
     return true;
 }
@@ -1060,18 +1218,67 @@ void engine::profile_layer_graph(uint32_t il, int reps) {
     std::vector<double> t(n + 1, 0.0);
     for (int k = 1; k <= n; k++) t[k] = time_prefix(k);
     int n_view = 0, n_small = 0; double t_small = 0, t_big = 0;
+    // QWFN_PROFILE_MIN_US: print nodes at or above this delta (default 8; 0 lists every node, views included)
+    static const double min_us = getenv("QWFN_PROFILE_MIN_US") ? atof(getenv("QWFN_PROFILE_MIN_US")) : 8.0;
     for (int k = 1; k <= n; k++) {
         const double d = (t[k] - t[k - 1]) * 1e6;
         const ggml_tensor * nd = gf->nodes[k - 1];
         const bool view = nd->op == GGML_OP_NONE || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_VIEW || nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_TRANSPOSE;
         if (view) n_view++; else if (d < 8.0) { n_small++; t_small += d; } else t_big += d;
-        if (d >= 8.0)
+        if (d >= min_us)
             fprintf(stderr, "[profile]   %3d %-13s %-30s [%lld,%lld,%lld] src0=%-8s +%4.0f us  (cum %5.0f)\n", k, ggml_op_name(nd->op), nd->name,
                     (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2],
                     nd->src[0] ? ggml_type_name(nd->src[0]->type) : "-", d, t[k] * 1e6);
     }
     fprintf(stderr, "[profile]   full graph: %.0f us; %d view/no-op nodes, %d kernels under 8 us (%.0f us together), the rest %.0f us\n",
             t[n] * 1e6, n_view, n_small, t_small, t_big);
+}
+
+void engine::profile_prefill_graph(ggml_cgraph * gf, uint32_t il, int64_t Tc, int reps) {
+    const int n = ggml_graph_n_nodes(gf);
+    if (!ggml_gallocr_alloc_graph(galloc_gpu_, gf)) { fprintf(stderr, "[pfprof] alloc failed\n"); return; }
+    auto time_prefix = [&](int k) -> double {
+        const int saved = gf->n_nodes;
+        gf->n_nodes = k;
+        double best = 1e9;
+        for (int r = 0; r < reps + 2; r++) {
+            const auto t0 = std::chrono::steady_clock::now();
+            ggml_backend_graph_compute(w_.backend(), gf);
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (r >= 2 && dt < best) best = dt;
+        }
+        gf->n_nodes = saved;
+        return best;
+    };
+    fprintf(stderr, "[pfprof] PREFILL layer %u (%s), Tc=%lld, %d nodes; min of %d replays per prefix\n",
+            il, hp_.is_attn_layer(il) ? "attention" : "recurrent(deltanet)", (long long) Tc, n, reps);
+    std::vector<double> t(n + 1, 0.0);
+    for (int k = 1; k <= n; k++) t[k] = time_prefix(k);
+    // group by op so the picture is readable rather than 200 lines
+    std::map<std::string, double> by_op;
+    std::map<std::string, int>    cnt_op;
+    int n_view = 0; double t_view = 0;
+    for (int k = 1; k <= n; k++) {
+        const double d = (t[k] - t[k - 1]) * 1e6;
+        const ggml_tensor * nd = ggml_graph_node(gf, k - 1);
+        const bool view = nd->op == GGML_OP_NONE || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_VIEW ||
+                          nd->op == GGML_OP_PERMUTE || nd->op == GGML_OP_TRANSPOSE;
+        if (view) { n_view++; t_view += d; continue; }
+        by_op[ggml_op_name(nd->op)] += d;
+        cnt_op[ggml_op_name(nd->op)]++;
+        if (d >= 200.0)
+            fprintf(stderr, "[pfprof]   %3d %-16s %-28s [%lld,%lld,%lld] %8.0f us\n", k, ggml_op_name(nd->op), nd->name,
+                    (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], d);
+    }
+    std::vector<std::pair<double,std::string>> rank;
+    for (auto & kv : by_op) rank.push_back({kv.second, kv.first});
+    std::sort(rank.rbegin(), rank.rend());
+    fprintf(stderr, "[pfprof] --- by op, full graph %.0f us ---\n", t[n] * 1e6);
+    for (auto & r : rank)
+        fprintf(stderr, "[pfprof]   %-18s %8.0f us  %5.1f%%  (%d nodes)\n",
+                r.second.c_str(), r.first, 100.0 * r.first / (t[n] * 1e6), cnt_op[r.second]);
+    fprintf(stderr, "[pfprof]   %-18s %8.0f us  %5.1f%%  (%d nodes)\n", "views/no-op", t_view,
+            100.0 * t_view / (t[n] * 1e6), n_view);
 }
 
 void engine::profile_all_graphs() {
@@ -1410,11 +1617,15 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
             if (is_attn) Tc = std::min<int64_t>(Tc, max_ubatch((int32_t) (n_past + off)));
             const int64_t n_past_c = n_past + off;
             attn_inputs ai;
+            const auto tai0 = std::chrono::steady_clock::now();
             if (is_attn && !build_attn_inputs(n_past_c, Tc, ai, err)) return false;
+            t_pf_attn_in += std::chrono::duration<double>(std::chrono::steady_clock::now() - tai0).count();
             {
+                const auto tp0 = std::chrono::steady_clock::now();
                 std::vector<int32_t> pos((size_t) 4 * Tc, 0);
                 for (int64_t i = 0; i < Tc; i++) pos[i] = pos[Tc + i] = pos[2 * Tc + i] = (int32_t) (n_past_c + i);
                 ggml_backend_tensor_set(inp_pos_, pos.data(), 0, pos.size() * 4);
+                t_pf_pos += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp0).count();
             }
             const auto ta0 = std::chrono::steady_clock::now();
             ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
@@ -1445,27 +1656,54 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
             ggml_build_forward_expand(g, ggml_cpy(c, sl,     v2(c, t_sel_, off, Tc)));
             ggml_build_forward_expand(g, ggml_cpy(c, wt,     v2(c, t_w_, off, Tc)));
             ggml_build_forward_expand(g, ggml_cpy(c, sh,     v2(c, t_sh_, off, Tc)));
+            {   // QWFN_PF_PROFILE=<layer>: per-node timing of this layer's first chunk graph
+                static const char * pfp = getenv("QWFN_PF_PROFILE");
+                if (pfp && (int) il == atoi(pfp) && !pf_profiled_) {
+                    pf_profiled_ = true;
+                    profile_prefill_graph(g, il, Tc);
+                }
+            }
+            const auto tgb = std::chrono::steady_clock::now();
             run_on(g, true);
+            const auto tgr = std::chrono::steady_clock::now();
             ggml_free(c);
             ai.release();
-            t_pf_graphA += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta0).count();
+            const auto tge = std::chrono::steady_clock::now();
+            {
+                const double d_build = std::chrono::duration<double>(tgb - ta0).count();
+                const double d_run   = std::chrono::duration<double>(tgr - tgb).count();
+                const double d_free  = std::chrono::duration<double>(tge - tgr).count();
+                t_pf_gA_build += d_build;
+                t_pf_gA_run   += d_run;
+                t_pf_gA_free  += d_free;
+                if (is_attn) { t_pf_gA_attn += d_run; n_pf_gA_attn++; }
+                else         { t_pf_gA_dn   += d_run; n_pf_gA_dn++;   }
+                if (is_ple)  { t_pf_gA_ple  += d_run; }   // overlaps attn/dn by construction
+                t_pf_graphA += d_build + d_run + d_free;  // unchanged total
+            }
             off += Tc;
         }
         cur_res = 1 - cur_res;
         pending = true;
+        const auto trb0 = std::chrono::steady_clock::now();
         ggml_backend_tensor_get(t_sel_, sel_.data(), 0, (size_t) U * T * sizeof(int32_t));
         ggml_backend_tensor_get(t_w_,   wgt_.data(), 0, (size_t) U * T * sizeof(float));
+        t_pf_readback += std::chrono::duration<double>(std::chrono::steady_clock::now() - trb0).count();
         if (t_xdump_) {
             if (!routers_dumped_) { if (!dump_routers(dump_dir_, err)) return false; routers_dumped_ = true; }
             dump_layer(il, T);
         }
 
         // ---- MoE: one sweep of this layer's experts, all T tokens -----------
+        const auto tsy0 = std::chrono::steady_clock::now();
         if (pf_.on_device()) ggml_backend_synchronize(w_.backend());
+        t_pf_sync += std::chrono::duration<double>(std::chrono::steady_clock::now() - tsy0).count();
         const auto tr0 = std::chrono::steady_clock::now();
         if (!pf_.load_layer(il, err)) return false;
         t_pf_read += std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
+        const auto tpf0 = std::chrono::steady_clock::now();
         pf_.prefetch_layer((il + 1) % hp_.n_layer, il + 1 < hp_.n_layer);
+        t_pf_prefetch += std::chrono::duration<double>(std::chrono::steady_clock::now() - tpf0).count();
         const bool on_gpu = pf_.on_device();
         const tier_view staged = pf_.staged_tier();
         for (int64_t off = 0; off < T; off += Tm) {
@@ -1497,7 +1735,12 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
             }
             t_pf_moe += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
         }
-        ggml_backend_tensor_set(t_pg_, zeros_.data(), 0, (size_t) n_embd * T * sizeof(float));
+        const auto tz0 = std::chrono::steady_clock::now();
+        // Device-side fill: this used to upload n_embd*T*4 bytes of host zeros
+        // per layer (910 MB at T=88826, ~43.7 GB per prefill) through ggml-sycl's
+        // sync set_tensor path, which also does a full queue wait and a double copy.
+        ggml_backend_tensor_memset(t_pg_, 0, 0, (size_t) n_embd * T * sizeof(float));
+        t_pf_zero += std::chrono::duration<double>(std::chrono::steady_clock::now() - tz0).count();
 
         if (cfg_.prefill_warm > 0) {
             const auto tw0 = std::chrono::steady_clock::now();
@@ -1551,6 +1794,7 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
 
     // ---- head: logits for the last position -------------------------------
     {
+        const auto th0 = std::chrono::steady_clock::now();
         ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
         graph_builder gb(c, &hp_, &w_); gb.bind(&st_, g, n_past);
         ggml_tensor * r = vres(c, cur_res, T - 1, 1);
@@ -1570,6 +1814,7 @@ bool engine::eval_prefill_big(const int32_t * hist, int32_t n_hist, int32_t T, s
         if (failed()) { take_failure(err); ggml_free(c); return false; }
         ggml_backend_tensor_get(logits, logits_.data(), 0, (size_t) n_vocab_ * sizeof(float));   // one position: logits_ holds two for a decoded pair
         ggml_free(c);
+        t_pf_head += std::chrono::duration<double>(std::chrono::steady_clock::now() - th0).count();
     }
     ec_.settle_promotions();
     // run_on() no longer aborts, so a graph that failed anywhere in this batch
@@ -1590,6 +1835,13 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // at T == 1, so forcing it there checks the permutation logic in isolation.
     static const bool force_batched = getenv("QWFN_FORCE_BATCHED") != nullptr;
     const bool decode = (T == 1 || (force_decode && T <= 1 + MTP_MAX_DRAFTS)) && !force_batched;   // a verify step: a token and its drafts
+    // Zero-upload skips trust only this call's own uploads.
+    late_zero_rows_ = 0; pc_zero_t_ = nullptr;
+    // The decode split counters are for decode only: a prompt's eval puts them back on every return path.
+    struct split_guard {
+        engine & e; bool on; decltype(t_io) io, la, mg, mc, ms; decltype(n_exp_gpu) ng, nc;
+        ~split_guard() { if (on) { e.t_io = io; e.t_layerA = la; e.t_moe_gpu = mg; e.t_moe_cpu = mc; e.t_moe_gpu_sync = ms; e.n_exp_gpu = ng; e.n_exp_cpu = nc; } }
+    } split_guard_{*this, !decode, t_io, t_layerA, t_moe_gpu, t_moe_cpu, t_moe_gpu_sync, n_exp_gpu, n_exp_cpu};
     if (mtp_on_ && T > 1 && !force_decode && n_past > 0 && mtp_kv_valid_) {
         // A later turn: the head's row for the last decoded position pairs its
         // wide residual (still in t_hlast_) with this batch's first token.
@@ -1679,10 +1931,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     // prompt's (a 27-token batch read 1 KB past the two-column tensors: garbage
     // ids and weights folded into every position, gibberish from the next turn on).
     auto late_fold = [&](ggml_context * c, uint32_t prev, ggml_tensor * pg) {
-        if (!decode || !moe_in_graph(prev) || n_late_ <= 0) return pg;
-        ggml_tensor * ids = ggml_view_2d(c, t_gids_, n_late_, T, t_gids_->nb[1], 0);
-        ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, n_late_, T, t_gw_->nb[1], t_gw_->nb[2], 0);
-        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, n_late_, T, /*fused_sum=*/true));
+        const int nl = late_rows(T);
+        if (!decode || !moe_in_graph(prev) || nl <= 0) return pg;
+        ggml_tensor * ids = ggml_view_2d(c, t_gids_, nl, T, t_gids_->nb[1], 0);
+        ggml_tensor * w   = ggml_view_3d(c, t_gw_, 1, nl, T, t_gw_->nb[1], t_gw_->nb[2], 0);
+        return ggml_add(c, pg, moe_id_graph(c, ec_.gpu_tier(prev), ids, w, t_cur_, n_embd, hp_.n_ff_exp, nl, T, /*fused_sum=*/true));
     };
 
     int sections[4] = { hp_.mrope_sections[0], hp_.mrope_sections[1],
@@ -1765,6 +2018,14 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             for (uint32_t k = 0; k < ratio; k++) bc[b * ratio + k] = (int32_t) (b * ratio + k);
             for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + b] = (int32_t) (b * ratio);
         }
+        // The partial tail block, if any: its real cells (the last one repeated) and position, as decode
+        // maps it. Left at zero it pointed at cell 0, and a query inside it -- the last 1-3 tokens of a chunk
+        // that ends mid-block -- could not attend to itself or the cells just before it.
+        if (n_bid < n_blocks) {
+            for (uint32_t k = 0; k < ratio; k++)
+                bc[n_bid * ratio + k] = (int32_t) std::min<int64_t>(n_bid * (int64_t) ratio + k, n_kv - 1);
+            for (int sec = 0; sec < 4; sec++) bp[sec * n_blocks + n_bid] = (int32_t) (n_bid * ratio);
+        }
         for (int64_t i = 0; i < T; i++) {
             const int64_t q = n_past + i;
             const int64_t tail = ((q + 1) / ratio) * ratio;   // the ragged tail stays visible
@@ -1772,6 +2033,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 bi[i * n_blocks + b] = (b >= n_bid) ? -INFINITY
                                      : (b * (int64_t) ratio >= tail ? 1e9f : 0.0f);
             if (have_dead) bi[i * n_blocks + dead] = 1e9f;
+            // blocks wholly after q are not forced (see build_attn_inputs)
+            for (int64_t b = tail / ratio; b < n_blocks; b++)
+                if (bi[i * n_blocks + b] > 0.0f && b * (int64_t) ratio > q) bi[i * n_blocks + b] = -1e9f;
         }
         ggml_backend_tensor_set(qsa.cell_blk,  cb.data(), 0, cb.size() * 4);
         ggml_backend_tensor_set(qsa.blk_cells, bc.data(), 0, bc.size() * 4);
@@ -1997,8 +2261,11 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 // QWFN_PREDICT_PLAIN=1 predicts from the bare residual for comparison.
                 static const bool predict_shared = getenv("QWFN_PREDICT_SHARED") != nullptr;
                 static const bool predict_plain  = getenv("QWFN_PREDICT_PLAIN") != nullptr;
+                // QWFN_PREDICT_CUR2=1: predict L+1's routing from this layer's own FFN-mix input through L+1's
+                // router, skipping the residual combine and L+1's hc_mix (not with the spec block).
+                static const bool predict_cur2 = getenv("QWFN_PREDICT_CUR2") != nullptr;
                 ggml_tensor * rp = r;
-                if (pg_here && !predict_plain) rp = gb.hc_combine(r, ggml_add(c, sh, pg_here), inject);
+                if (pg_here && !predict_plain && !predict_cur2) rp = gb.hc_combine(r, ggml_add(c, sh, pg_here), inject);
                 else if (predict_shared)        rp = gb.hc_combine(r, sh, inject);
                 // Speculative block (cfg spec_block): the residual predictor's
                 // remaining error is layer L+1's own block, which it cannot see.
@@ -2031,7 +2298,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 // the margin gate).
                 const int depth = (int) QWFN_SPEC_MAX;
                 ggml_tensor * xpred = nullptr, * scores = nullptr;
-                selnext = gb.moe_route_predict(rp, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores);
+                selnext = predict_cur2 && !spec_blk
+                        ? gb.moe_route_predict_x(cur2, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores)
+                        : gb.moe_route_predict(rp, (int) iln, depth, pred_w(iln), pred_b(iln), &xpred, &scores);
                 if (t_xdec_ && xpred)   // the head's input for layer il+1, kept for the decode dump
                     ggml_build_forward_expand(g, ggml_cpy(c, xpred, ggml_view_1d(c, t_xdec_, n_embd, (size_t) il * t_xdec_->nb[1])));
                 if (pack_ok) {   // into the readback pack (I32 -> F32 for the ids), see t_pack_
@@ -2155,6 +2424,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             pending = true;
         }
 
+        const auto trb0 = std::chrono::steady_clock::now();
         const bool packed = decode && ran_packed;
         const auto t_rb0 = std::chrono::steady_clock::now();
         if (packed) {
@@ -2191,6 +2461,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             if (hp_.is_attn_layer(il)) { t_layerA_attn += dtA; n_layerA_attn++; }
             else                       { t_layerA_rec  += dtA; n_layerA_rec++;  }
         }
+        if (decode) t_readback += std::chrono::duration<double>(std::chrono::steady_clock::now() - trb0).count();
         if (t_xdec_ && decode && T == 1) {   // this token's true routing of layer il; the record is complete at the last layer
             memcpy(tok_sel_.data() + (size_t) il * U, sel_.data(), (size_t) U * sizeof(int32_t));
             memcpy(tok_w_.data()   + (size_t) il * U, wgt_.data(), (size_t) U * sizeof(float));
@@ -2387,26 +2658,34 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     // yet: their slots go up for the next graph's late fold,
                     // through pinned staging on the compute stream -- after the
                     // promotion copies, before the graph that reads them.
-                    if ((int) late_gpu.size() > n_late_) {
+                    if ((int) late_gpu.size() > late_rows(T)) {
                         // More experts were promoted by this fetch than the next
                         // graph's fold has slots for. Computing only the first
-                        // n_late_ would drop the rest from the sum silently, so
+                        // late_rows(T) would drop the rest from the sum silently, so
                         // fail the request instead.
-                        fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), n_late_);
+                        fprintf(stderr, "[qwfn] %zu late experts, fold holds %d\n", late_gpu.size(), late_rows(T));
                         note_failure("late expert fold overflow", il);
                         return;
                     }
-                    std::vector<int32_t> gids((size_t) U * T, 0); std::vector<float> gw((size_t) U * T, 0.0f);
-                    for (int64_t j = 0; j < T; j++)
-                        for (size_t k = 0; k < late_gpu.size(); k++) { gids[j * U + k] = eh[late_gpu[k]].slot; gw[j * U + k] = w_tok(late_gpu[k], j); }
-                    if (p_gids_) {
-                        memcpy(p_gids_->data, gids.data(), gids.size() * sizeof(int32_t));
-                        memcpy(p_gw_->data,   gw.data(),   gw.size() * sizeof(float));
-                        ggml_backend_tensor_set_async(w_.backend(), t_gids_, p_gids_->data, 0, gids.size() * sizeof(int32_t));
-                        ggml_backend_tensor_set_async(w_.backend(), t_gw_,   p_gw_->data,   0, gw.size() * sizeof(float));
+                    // Nothing late and the rows already zero on the device from an earlier layer:
+                    // the fold reads the same zeros without two more copies.
+                    static const bool upload_skip = getenv("QWFN_NO_UPLOAD_SKIP") == nullptr;
+                    if (upload_skip && late_gpu.empty() && late_zero_rows_ >= T) {
+                        n_upload_skip += 2;
                     } else {
-                        ggml_backend_tensor_set(t_gids_, gids.data(), 0, gids.size() * sizeof(int32_t));
-                        ggml_backend_tensor_set(t_gw_,   gw.data(),   0, gw.size() * sizeof(float));
+                        std::vector<int32_t> gids((size_t) U * T, 0); std::vector<float> gw((size_t) U * T, 0.0f);
+                        for (int64_t j = 0; j < T; j++)
+                            for (size_t k = 0; k < late_gpu.size(); k++) { gids[j * U + k] = eh[late_gpu[k]].slot; gw[j * U + k] = w_tok(late_gpu[k], j); }
+                        if (p_gids_) {
+                            memcpy(p_gids_->data, gids.data(), gids.size() * sizeof(int32_t));
+                            memcpy(p_gw_->data,   gw.data(),   gw.size() * sizeof(float));
+                            ggml_backend_tensor_set_async(w_.backend(), t_gids_, p_gids_->data, 0, gids.size() * sizeof(int32_t));
+                            ggml_backend_tensor_set_async(w_.backend(), t_gw_,   p_gw_->data,   0, gw.size() * sizeof(float));
+                        } else {
+                            ggml_backend_tensor_set(t_gids_, gids.data(), 0, gids.size() * sizeof(int32_t));
+                            ggml_backend_tensor_set(t_gw_,   gw.data(),   0, gw.size() * sizeof(float));
+                        }
+                        late_zero_rows_ = late_gpu.empty() ? std::max(late_zero_rows_, (int64_t) T) : 0;
                     }
                     n_exp_gpu += which.size() + late_gpu.size();
                     t_moe_gpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
@@ -2421,6 +2700,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     // ones not in VRAM point at slot 0 with weight 0.
                     std::vector<int32_t> gids(U, 0); std::vector<float> gw(U, 0.0f);
                     for (int e : which) { gids[e] = eh[e].slot; gw[e] = wgt_[e]; }
+                    late_zero_rows_ = 0;
                     ggml_backend_tensor_set(t_gids_, gids.data(), 0, (size_t) U * sizeof(int32_t));
                     ggml_backend_tensor_set(t_gw_,   gw.data(),   0, (size_t) U * sizeof(float));
                     if (!alloc_graph(gM_[il].ga, gM_[il].gf, "VRAM-tier MoE allocation", il)) return;
@@ -2475,9 +2755,10 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // 71% of layers have no miss and keep the full window.
             // Measured on the replayed sequence: deferring costs more in
             // settle-wait at the next layer than it saves in demand-wait here
-            // (17.5/19.4 vs 19.2 tok/s), so early submission stays the default
-            // and QWFN_PREFETCH_DEFER=1 selects the deferred variant.
-            static const bool prefetch_early = getenv("QWFN_PREFETCH_DEFER") == nullptr;
+            // (17.5/19.4 vs 19.2 tok/s) under an older configuration. On the B70 stable config (no spec
+            // block) the deferred variant wins 3/3 pairs (-1.6 and -4.9 ms/token on the clean ones): it is
+            // the default here, and QWFN_PREFETCH_EARLY=1 selects early submission.
+            static const bool prefetch_early = getenv("QWFN_PREFETCH_EARLY") != nullptr;
             const bool had_miss = ec_.has_inflight();
 
             // VRAM-resident experts first: their kernels run behind everything
@@ -2489,6 +2770,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // the L+1 set and, when two-ahead is on, the L+2 set.
             bool prefetched = false;
             auto issue_prefetch = [&]() {
+                struct timed { double & t; std::chrono::steady_clock::time_point t0; ~timed() { t += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); } } timed_{t_prefetch, std::chrono::steady_clock::now()};
                 if (prefetched || !cfg_.speculate || il + 1 >= hp_.n_layer) return;
                 prefetched = true;
                 const uint32_t depth = std::min<uint32_t>(QWFN_SPEC_MAX, std::max<uint32_t>((uint32_t) U, cfg_.speculate_depth));
@@ -2656,7 +2938,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 if (t_rscale_) { const float one = 1.0f; ggml_backend_tensor_set(t_rscale_, &one, 0, 4); }
             }
             moe_gpu_settle();                      // t_pg_ is complete past this point
-            ec_.settle_promotions();               // the async H2D copies too; frees their RAM slots
+            { const auto tsp = std::chrono::steady_clock::now(); ec_.settle_promotions(); t_settle_promo += std::chrono::duration<double>(std::chrono::steady_clock::now() - tsp).count(); }   // the async H2D copies too; frees their RAM slots
             static const bool nan_check = getenv("QWFN_NAN_CHECK") != nullptr;
             if (nan_check) {   // diagnostic: where does a non-finite value first appear?
                 auto bad = [&](const float * v, size_t n) { for (size_t k = 0; k < n; k++) if (!std::isfinite(v[k])) return true; return false; };
@@ -2674,13 +2956,24 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // the staging is next written only after that graph has run
             // synchronously, so the DMA has long completed. Pageable memory would
             // make cudaMemcpyAsync block the caller anyway (see the promotions).
-            if (p_pc_ && nfl * sizeof(float) <= ggml_nbytes(p_pc_)) {
-                memcpy(p_pc_->data, acc.data(), nfl * sizeof(float));
-                ggml_backend_tensor_set_async(w_.backend(), t_pc_, p_pc_->data, 0, nfl * sizeof(float));
+            const auto tup = std::chrono::steady_clock::now();
+            // No CPU experts leaves acc bitwise zero; skip it when t_pc_ already holds zeros.
+            const bool pc_zero = memcmp(acc.data(), zeros_.data(), nfl * sizeof(float)) == 0;
+            static const bool upload_skip = getenv("QWFN_NO_UPLOAD_SKIP") == nullptr;
+            if (upload_skip && decode && pc_zero && pc_zero_t_ == t_pc_ && pc_zero_rows_ >= T) {
+                n_upload_skip++;
             } else {
-                ggml_backend_tensor_set(t_pc_, acc.data(), 0, nfl * sizeof(float));
+                if (p_pc_ && nfl * sizeof(float) <= ggml_nbytes(p_pc_)) {
+                    memcpy(p_pc_->data, acc.data(), nfl * sizeof(float));
+                    ggml_backend_tensor_set_async(w_.backend(), t_pc_, p_pc_->data, 0, nfl * sizeof(float));
+                } else {
+                    ggml_backend_tensor_set(t_pc_, acc.data(), 0, nfl * sizeof(float));
+                }
+                pc_zero_rows_ = !pc_zero ? 0 : pc_zero_t_ == t_pc_ ? std::max(pc_zero_rows_, (int64_t) T) : (int64_t) T;
+                pc_zero_t_ = pc_zero ? t_pc_ : nullptr;
             }
             upload_vtable(il + 1);                 // next layer's residency, after this layer's promotions
+            t_uploads += std::chrono::duration<double>(std::chrono::steady_clock::now() - tup).count();
         } else if (cbatch) {
             // ---- short prompt: the union of its experts through the cache ----
             // Distinct experts of the batch, ascending (ascending file offsets
@@ -2834,6 +3127,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 n_exp_gpu += n;
             }
             ec_.settle_promotions();
+            pc_zero_t_ = nullptr;
             ggml_backend_tensor_set(t_pc_, zeros_.data(), 0, (size_t) n_embd * T * sizeof(float));
         } else {
             // ---- prefill: expert-major permutation over the whole batch -----
@@ -3009,6 +3303,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 }
                 (void) h;
             }
+            pc_zero_t_ = nullptr;
             ggml_backend_tensor_set(t_pc_,   xfer_.data(), 0, (size_t) n_embd * T * sizeof(float));
             ggml_backend_tensor_set(t_pg_,      zeros_.data(), 0, (size_t) n_embd * T * sizeof(float));
 
@@ -3062,6 +3357,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
     if (deferred_wait_) { if (!ec_.fetch_end()) { err = "expert read failed"; return false; } deferred_wait_ = false; }
 
     // ---- head --------------------------------------------------------------
+    const auto thd = std::chrono::steady_clock::now();
     {
         ggml_context * c; ggml_cgraph * g; new_ctx(&c, &g);
         graph_builder gb(c, &hp_, &w_); gb.bind(&st_, g, n_past);
@@ -3093,6 +3389,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         ggml_backend_tensor_get(logits, logits_.data(), 0, (size_t) n_vocab_ * n_out * sizeof(float));
         ggml_free(c);
     }
+    if (decode) t_head += std::chrono::duration<double>(std::chrono::steady_clock::now() - thd).count();
 
     if (mtp_on_) {
         mtp_have_h_ = true; mtp_h_rows_ = T;

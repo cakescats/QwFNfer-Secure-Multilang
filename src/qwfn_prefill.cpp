@@ -59,6 +59,7 @@ prefill_streamer::~prefill_streamer() {
     for (auto & b : hb_) {
         if (b.buf)    ggml_backend_buffer_free(b.buf);
         if (b.pinned) ggml_backend_buffer_free(b.pinned);
+        else if (b.locked.p) host_block_free(b.locked);
         else if (b.p) dio_free(b.p);
     }
     io_.shutdown();
@@ -125,9 +126,15 @@ bool prefill_streamer::init(const model_index * mi, unsigned io_workers, bool io
         if (dev) host_buft = ggml_backend_dev_host_buffer_type(dev);
     }
     const int n_bufs = overlap_ ? 2 : 1;
+    const bool lock = host_lock_requested() && dev_buft && !getenv("QWFN_PREFILL_PAGEABLE");
     host_pinned_ = host_buft != nullptr;
     for (int i = 0; i < n_bufs; i++) {
-        if (host_buft) {
+        // QWFN_LOCK_HOST: used only when registered with the driver (see expert_cache::init).
+        if (lock && host_block_alloc(hb_[i].locked, stage_bytes_, "prefill staging", false) && !hb_[i].locked.imported)
+            host_block_free(hb_[i].locked);
+        if (hb_[i].locked.p) {
+            hb_[i].p = (uint8_t *) hb_[i].locked.p;
+        } else if (host_buft) {
             ggml_backend_buffer_t pb = ggml_backend_buft_alloc_buffer(host_buft, stage_bytes_);
             uint8_t * p = pb ? (uint8_t *) ggml_backend_buffer_get_base(pb) : nullptr;
             // The CUDA host type silently hands back an ordinary CPU buffer when
@@ -425,6 +432,9 @@ bool prefill_streamer::load_layer(uint32_t layer, std::string & err) {
                 for (uint32_t e = 0; e < n_expert; e++)
                     ggml_backend_tensor_set(xfer_, src + (size_t) e * slice_[q],
                             dev_off_[q] + (size_t) e * dev_slice_[q], slice_[q]);
+            } else if (dev_slice_[q] == slice_[q]) {
+                // Equal strides: one contiguous copy (backends without a 2D copy, e.g. SYCL, would loop n_expert copies).
+                ggml_backend_tensor_set_async(dev_backend_, xfer_, src, dev_off_[q], (size_t) n_expert * slice_[q]);
             } else {
                 ggml_backend_tensor_set_2d_async(dev_backend_, xfer_, src,
                         dev_off_[q], slice_[q], n_expert, dev_slice_[q], slice_[q]);

@@ -113,6 +113,7 @@ private:
         // the H2D upload is a real DMA at PCIe speed instead of a staged copy
         // through the driver's bounce buffer. Null when p is a plain dio_alloc.
         ggml_backend_buffer_t pinned = nullptr;
+        host_block            locked;            // QWFN_LOCK_HOST: p is anonymous, locked, driver-registered
         int32_t               layer = -1;        // what the buffer holds / is receiving
         bool                  ready = false;     // read complete
         bool                  failed = false;

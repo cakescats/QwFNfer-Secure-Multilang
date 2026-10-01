@@ -1,0 +1,7 @@
+[Unit]
+Description=Apply the Intel Arc Pro B70 power cap (B70_CAP_W)
+
+[Service]
+Type=oneshot
+Environment=B70_CAP_W=160
+ExecStart=/usr/local/sbin/b70-power-cap.sh

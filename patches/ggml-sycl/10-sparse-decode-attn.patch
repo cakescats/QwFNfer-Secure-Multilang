@@ -1,0 +1,234 @@
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 0487ef7..b8f5552 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -65,6 +65,7 @@
+ #include "ggml-sycl/mem.hpp"
+ #include "ggml-sycl/norm.hpp"
+ #include "ggml-sycl/mmvw.hpp"
++#include "ggml-sycl/sdattn.hpp"
+ #include "ggml-sycl/presets.hpp"
+ #include "ggml-sycl/quantize.hpp"
+ #include "ggml-sycl/repeat_back.hpp"
+@@ -6132,6 +6133,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             i += nodes_to_skip;
+             continue;
+         }
++        // K/V gathers from the q8_0 cache + F16 casts + one-token FLASH_ATTN_EXT (GGML_SYCL_FUSE_SPARSE_DECODE=1)
++        if (node->op == GGML_OP_GET_ROWS && ggml_sycl_sparse_decode_attn_fused(*sycl_ctx, cgraph, i)) {
++            i += 8;
++            continue;
++        }
+ #ifndef NDEBUG
+         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+         for (int j = 0; j < GGML_MAX_SRC; j++) {
+diff --git a/ggml/src/ggml-sycl/sdattn.cpp b/ggml/src/ggml-sycl/sdattn.cpp
+new file mode 100644
+index 0000000..073ae56
+--- /dev/null
++++ b/ggml/src/ggml-sycl/sdattn.cpp
+@@ -0,0 +1,190 @@
++// Sparse decode attention, fused (GGML_SYCL_FUSE_SPARSE_DECODE=1): the engine's one-token attention over the cells
++// its indexer selected, straight from the q8_0 KV cache.
++//
++// The unfused graph, per K and per V:  GET_ROWS(q8_0 cache, cells) -> RESHAPE [hd, nh_kv, NC] -> PERMUTE (0,2,1,3)
++// -> CPY to F16 [hd, NC, nh_kv], then FLASH_ATTN_EXT(Q [hd, 1, nh] view, K, V, mask [NC, 1] F16). On the B70 that is
++// ~15 us + ~24 us x 2 + ~111 us (the FA tile kernel: NC is not a multiple of 256, so the vector kernel is not
++// eligible) per attention layer. Here: one kernel reads each selected row's q8_0 blocks directly, rounds the values
++// through F16 exactly as the gather + cast did (so K and V are bit-identical), and runs an online softmax over a
++// chunk of cells for a group of heads; a second kernel merges the chunks. Scores and sums in F32 (the graph asks
++// for GGML_PREC_F32).
++//
++// Work split: (kv head) x (group of HPG query heads of that kv head) x (chunk of CPC cells), one subgroup each.
++// A lane owns LD = hd / SG consecutive dimensions (16 at hd = 256), so each head's partial output stays in registers.
++#include "sdattn.hpp"
++#include "ggml-impl.h"
++
++namespace {
++
++constexpr int SG  = 16;    // subgroup size
++constexpr int HPG = 2;     // query heads per subgroup (4 spills: ~168 floats per lane against 128 registers)
++constexpr int CPC = 32;    // cells per chunk
++constexpr int HD  = 256;   // head dim (checked by the matcher)
++constexpr int LD  = HD / SG;
++
++struct part { float m, l; };   // per (head, chunk): running max and sum; the output rows follow in a separate array
++
++// dims [LD*lane, LD*lane + LD) of row `cell`, kv head `kvh`: q8_0 blocks of 32, a lane covers half a block
++static inline void load_q8_0_f16round(const uint8_t * cache, size_t row_bytes, int32_t cell, int kvh, int lane, float v[LD]) {
++    const uint8_t * row = cache + (size_t) cell * row_bytes;
++    const int dim0 = kvh * HD + lane * LD;                 // first dim of this lane in the row
++    const uint8_t * blk = row + (size_t) (dim0 / QK8_0) * sizeof(block_q8_0);
++    const float d = (float) *(const sycl::half *) blk;
++    const int8_t * qs = (const int8_t *) (blk + sizeof(sycl::half)) + dim0 % QK8_0;
++#pragma unroll
++    for (int j = 0; j < LD; j++) v[j] = (float) (sycl::half) (d * (float) qs[j]);   // get_rows (f32) then cast to f16
++}
++
++void sdattn_partial(const float * Q, size_t q_nb0, size_t q_nb2, const uint8_t * kc, const uint8_t * vc, size_t row_bytes,
++                    const int32_t * cells, const sycl::half * mask, int NC, int nh, int nh_kv, float scale,
++                    float * po, part * pml, int n_chunks, const sycl::nd_item<3> & it) {
++    const int kvh = it.get_group(0), hg = it.get_group(1), chunk = it.get_group(2);
++    const int lane = it.get_local_id(2);
++    const int gqa = nh / nh_kv;
++    const int h0 = kvh * gqa + hg * HPG;
++    auto sg = it.get_sub_group();
++
++    float q[HPG][LD], o[HPG][LD], m[HPG], l[HPG];
++#pragma unroll
++    for (int h = 0; h < HPG; h++) {
++        const char * qh = (const char *) Q + (size_t) (h0 + h) * q_nb2;
++#pragma unroll
++        for (int j = 0; j < LD; j++) { q[h][j] = *(const float *) (qh + (size_t) (lane * LD + j) * q_nb0); o[h][j] = 0.f; }
++        m[h] = -INFINITY; l[h] = 0.f;
++    }
++    const int c0 = chunk * CPC, c1 = sycl::min(NC, c0 + CPC);
++    for (int c = c0; c < c1; c++) {
++        const float mk = (float) mask[c];
++        if (mk == -INFINITY) continue;                     // not visible: contributes nothing
++        const int32_t cell = cells[c];
++        float k[LD], v[LD];
++        load_q8_0_f16round(kc, row_bytes, cell, kvh, lane, k);
++        load_q8_0_f16round(vc, row_bytes, cell, kvh, lane, v);
++#pragma unroll
++        for (int h = 0; h < HPG; h++) {
++            float s = 0.f;
++#pragma unroll
++            for (int j = 0; j < LD; j++) s += q[h][j] * k[j];
++            s = sycl::reduce_over_group(sg, s, sycl::plus<float>()) * scale + mk;
++            const float mn = sycl::fmax(m[h], s);
++            const float corr = sycl::exp(m[h] - mn);       // m == -inf first time: exp(-inf) = 0
++            const float p = sycl::exp(s - mn);
++            l[h] = l[h] * corr + p;
++#pragma unroll
++            for (int j = 0; j < LD; j++) o[h][j] = o[h][j] * corr + p * v[j];
++            m[h] = mn;
++        }
++    }
++#pragma unroll
++    for (int h = 0; h < HPG; h++) {
++        const size_t idx = (size_t) (h0 + h) * n_chunks + chunk;
++        float * orow = po + idx * HD;
++#pragma unroll
++        for (int j = 0; j < LD; j++) orow[lane * LD + j] = o[h][j];
++        if (lane == 0) { pml[idx].m = m[h]; pml[idx].l = l[h]; }
++    }
++}
++
++// out[h][d] = sum_c o_c[d] exp(m_c - M) / sum_c l_c exp(m_c - M); an all-masked head gives 0 (FA would give NaN)
++void sdattn_merge(const float * po, const part * pml, int n_chunks, float * dst, const sycl::nd_item<2> & it) {
++    const int h = it.get_group(0), d = it.get_local_id(1);
++    float M = -INFINITY;
++    for (int c = 0; c < n_chunks; c++) M = sycl::fmax(M, pml[(size_t) h * n_chunks + c].m);
++    float num = 0.f, den = 0.f;
++    if (M != -INFINITY) {
++        for (int c = 0; c < n_chunks; c++) {
++            const part pc = pml[(size_t) h * n_chunks + c];
++            if (pc.m == -INFINITY) continue;
++            const float w = sycl::exp(pc.m - M);
++            num += po[((size_t) h * n_chunks + c) * HD + d] * w;
++            den += pc.l * w;
++        }
++    }
++    dst[(size_t) h * HD + d] = den > 0.f ? num / den : 0.f;
++}
++
++}  // namespace
++
++bool ggml_sycl_fuse_sparse_decode_enabled() {
++    static const bool v = [] { const char * e = getenv("GGML_SYCL_FUSE_SPARSE_DECODE"); return e && atoi(e) != 0; }();
++    return v;
++}
++
++// The 9 nodes from `i`: K gather (GET_ROWS, RESHAPE, PERMUTE, CPY), V gather (same), FLASH_ATTN_EXT. The engine emits
++// them contiguously (it expands Q and the mask first). Every shape the kernel relies on is checked.
++bool ggml_sycl_sparse_decode_attn_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
++    if (!ggml_sycl_fuse_sparse_decode_enabled()) return false;
++    if (i + 8 >= cgraph->n_nodes) return false;
++    ggml_tensor ** n = cgraph->nodes + i;
++    const ggml_op want[9] = { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CPY,
++                              GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CPY, GGML_OP_FLASH_ATTN_EXT };
++    for (int k = 0; k < 9; k++) if (n[k]->op != want[k]) return false;
++    ggml_tensor * fa = n[8];
++    // the chains feed each other in order, and the FA takes the two CPYs as K and V
++    for (int base : {0, 4}) {
++        if (n[base + 1]->src[0] != n[base] || n[base + 2]->src[0] != n[base + 1] || n[base + 3]->src[0] != n[base + 2]) return false;
++    }
++    if (fa->src[1] != n[3] || fa->src[2] != n[7]) return false;
++    // No intermediate may escape: each of the first 8 nodes is used only inside the 9 and is not a graph output.
++    // (Not ggml_can_fuse_subgraph: ggml_cast sets a CPY's src[1] to the CPY itself, and the graph's use count
++    // includes that self-reference, which the subgraph test does not count, so it refuses every cast. Uses are
++    // counted here from the node itself on.)
++    for (int k = 0; k < 8; k++) {
++        if ((n[k]->flags & GGML_TENSOR_FLAG_OUTPUT) || (n[k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) return false;
++        int inside = 0;
++        for (int j = k; j < 9; j++)
++            for (int s = 0; s < GGML_MAX_SRC; s++) if (n[j]->src[s] == n[k]) inside++;
++        if (inside != ggml_node_get_use_count(cgraph, i + k)) return false;
++    }
++    // the casts' destinations: ggml_cast's self-reference, or ggml_cpy into a fresh leaf nothing computes
++    // (the FA reads the result only through the CPY node, so the destination's write can be skipped)
++    for (int base : {3, 7}) {
++        const ggml_tensor * d = n[base]->src[1];
++        if (d == n[base]) continue;
++        if (!d || n[base]->view_src != d || d->op != GGML_OP_NONE) return false;
++    }
++    const ggml_tensor * kc = n[0]->src[0], * vc = n[4]->src[0], * cells = n[0]->src[1];
++    const ggml_tensor * Q = fa->src[0], * K = n[3], * V = n[7], * mask = fa->src[3];
++    if (n[4]->src[1] != cells) return false;
++    if (kc->type != GGML_TYPE_Q8_0 || vc->type != GGML_TYPE_Q8_0 || cells->type != GGML_TYPE_I32) return false;
++    if (kc->ne[0] != vc->ne[0] || kc->nb[1] != vc->nb[1] || kc->ne[0] % QK8_0 != 0) return false;
++    if (kc->nb[1] != (size_t) (kc->ne[0] / QK8_0) * sizeof(block_q8_0)) return false;   // packed rows
++    if (!ggml_is_contiguous(cells) || ggml_nelements(cells) != K->ne[1]) return false;
++    // [hd, NC, nh_kv] F16 after the permute (0,2,1,3) of [hd, nh_kv, NC]
++    const int64_t hd = K->ne[0], NC = K->ne[1], nh_kv = K->ne[2];
++    if (hd != HD || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || V->ne[0] != hd || V->ne[1] != NC || V->ne[2] != nh_kv) return false;
++    if (n[1]->ne[0] != hd || n[1]->ne[1] != nh_kv || n[1]->ne[2] != NC) return false;
++    if (n[2]->ne[0] != hd || n[2]->ne[1] != NC || n[2]->ne[2] != nh_kv) return false;
++    if (kc->ne[0] != hd * nh_kv || n[0]->type != GGML_TYPE_F32) return false;
++    // Q: [hd, 1, nh] F32, one token, no batch; mask [NC, 1] F16; plain softmax
++    const int64_t nh = Q->ne[2];
++    if (Q->type != GGML_TYPE_F32 || Q->ne[0] != hd || Q->ne[1] != 1 || Q->ne[3] != 1 || nh % nh_kv != 0) return false;
++    if ((nh / nh_kv) % HPG != 0 || Q->nb[0] != sizeof(float)) return false;
++    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[0] < NC || !ggml_is_contiguous(mask) || fa->src[4]) return false;
++    float scale, max_bias, softcap;
++    memcpy(&scale,    (const float *) fa->op_params + 0, sizeof(float));
++    memcpy(&max_bias, (const float *) fa->op_params + 1, sizeof(float));
++    memcpy(&softcap,  (const float *) fa->op_params + 2, sizeof(float));
++    if (max_bias != 0.0f || softcap != 0.0f) return false;
++    if (fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa) || fa->ne[0] != hd || fa->ne[1] != nh || fa->ne[2] != 1) return false;
++
++    const int n_chunks = (int) ((NC + CPC - 1) / CPC);
++    dpct::queue_ptr stream = ctx.stream();
++    ggml_sycl_pool_alloc<float> po(ctx.pool(), (size_t) nh * n_chunks * HD);
++    ggml_sycl_pool_alloc<part>  pml(ctx.pool(), (size_t) nh * n_chunks);
++    const float * Qd = (const float *) Q->data;
++    const size_t q_nb0 = Q->nb[0], q_nb2 = Q->nb[2], row_bytes = kc->nb[1];
++    const uint8_t * kcd = (const uint8_t *) kc->data, * vcd = (const uint8_t *) vc->data;
++    const int32_t * cd = (const int32_t *) cells->data;
++    const sycl::half * md = (const sycl::half *) mask->data;
++    float * pod = po.get(); part * pmd = pml.get();
++    const int iNC = (int) NC, inh = (int) nh, inh_kv = (int) nh_kv;
++    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(nh_kv, nh / nh_kv / HPG, n_chunks * SG), sycl::range<3>(1, 1, SG)),
++        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(SG)]] {
++            sdattn_partial(Qd, q_nb0, q_nb2, kcd, vcd, row_bytes, cd, md, iNC, inh, inh_kv, scale, pod, pmd, n_chunks, it);
++        });
++    float * dst = (float *) fa->data;
++    stream->parallel_for(sycl::nd_range<2>(sycl::range<2>(nh, HD), sycl::range<2>(1, HD)),
++        [=](sycl::nd_item<2> it) { sdattn_merge(pod, pmd, n_chunks, dst, it); });
++    return true;
++}
+diff --git a/ggml/src/ggml-sycl/sdattn.hpp b/ggml/src/ggml-sycl/sdattn.hpp
+new file mode 100644
+index 0000000..1d6a762
+--- /dev/null
++++ b/ggml/src/ggml-sycl/sdattn.hpp
+@@ -0,0 +1,8 @@
++#pragma once
++#include "common.hpp"
++
++// Fused sparse decode attention (GGML_SYCL_FUSE_SPARSE_DECODE=1): the K/V gathers from the q8_0 cache, their
++// F16 casts and the one-token FLASH_ATTN_EXT, as one kernel plus a merge. Returns false when the nodes at i do
++// not match exactly; the caller then runs them as usual. On true the caller skips the 8 nodes after i.
++bool ggml_sycl_fuse_sparse_decode_enabled();
++bool ggml_sycl_sparse_decode_attn_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);

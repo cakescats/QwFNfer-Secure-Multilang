@@ -1,0 +1,37 @@
+diff --git a/ggml/src/ggml-sycl/topk-moe.cpp b/ggml/src/ggml-sycl/topk-moe.cpp
+index 78574c4..7b0c946 100644
+--- a/ggml/src/ggml-sycl/topk-moe.cpp
++++ b/ggml/src/ggml-sycl/topk-moe.cpp
+@@ -571,7 +571,8 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
+     const ggml_tensor * scale   = nullptr;
+ 
+     std::vector<ggml_op> ops;
+-    int                  out_nodes[2];
++    int                  out_nodes[3];
++    int                  n_out = 2;
+ 
+     if (!args.delayed_softmax) {
+         const ggml_op gating_op = args.sigmoid ? GGML_OP_UNARY : GGML_OP_SOFT_MAX;
+@@ -591,9 +592,20 @@ int ggml_sycl_fuse_topk_moe(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
+         weights      = cgraph->nodes[i + (int) ops.size() - 1];
+         out_nodes[1] = i + (int) ops.size() - 1;
+ 
+-        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
++        // div_as_output: the final RESHAPE is a view of the DIV; the kernel's weights land in the DIV's memory
++        static const bool div_out = [] { const char * e = getenv("GGML_SYCL_TOPK_DIV_OUT"); return !e || atoi(e) != 0; }();
++        if (div_out && args.norm && !args.scale) {
++            const int div_idx = i + (int) ops.size() - 2;
++            const ggml_tensor * div = cgraph->nodes[div_idx];
++            if (div->op == GGML_OP_DIV && weights->view_src == div && weights->view_offs == 0 &&
++                ggml_is_contiguous(div) && ggml_is_contiguous(weights)) {
++                out_nodes[n_out++] = div_idx;
++            }
++        }
++
++        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, n_out) &&
+             ggml_sycl_should_use_topk_moe(node, weights, logits, ids) &&
+-            ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
++            ggml_sycl_check_fusion_memory_ranges(cgraph, i, (int) ops.size(), out_nodes, n_out, /*is_topk_moe=*/true)) {
+             ggml_sycl_op_topk_moe(ctx, logits, weights, ids, clamp, scale, args);
+             return (int) ops.size() - 1;
+         }

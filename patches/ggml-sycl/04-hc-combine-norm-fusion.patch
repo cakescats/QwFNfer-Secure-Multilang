@@ -1,0 +1,399 @@
+--- a/ggml/src/ggml-sycl/fusion.cpp
++++ b/ggml/src/ggml-sycl/fusion.cpp
+@@ -2,6 +2,8 @@
+ #include "binbcast.hpp"
+ 
+ #include <algorithm>
++#include <cstring>
++#include <string>
+ 
+ // mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
+ // (weight layout, split buffers, DMMV) is checked by ggml_sycl_mul_mat_glu_mmvq_fused().
+@@ -58,6 +60,113 @@
+     return true;
+ }
+ 
++static bool hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data;
++    const char * b0 = (const char *) b->data;
++    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
++}
++
++// Each check is stated in terms of what hc_norm_f32 (norm.cpp) assumes. Returns null if
++// fusable, else a reason (printed with GGML_SYCL_FUSE_HC=2).
++static const char * hc_norm_decline(const ggml_cgraph * cgraph, int i, bool * two_pass) {
++    *two_pass = false;
++    if (i + 4 > cgraph->n_nodes) return "graph end";
++    const ggml_op ops[4]  = { GGML_OP_OUT_PROD, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
++    const int     outs[2] = { i + 1, i + 3 };   // R2 lives on as the residual; Xn is the result
++    if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, outs, 2)) return "not the op sequence, or an intermediate escapes";
++
++    const ggml_tensor * op  = cgraph->nodes[i];
++    const ggml_tensor * add = cgraph->nodes[i + 1];
++    const ggml_tensor * rn  = cgraph->nodes[i + 2];
++    const ggml_tensor * mul = cgraph->nodes[i + 3];
++    const ggml_tensor * y   = op->src[0];
++    const ggml_tensor * w   = op->src[1];
++
++    // the subgraph test checks uses, not wiring: the chain must actually be connected
++    const ggml_tensor * R = add->src[0] == op ? add->src[1] : add->src[1] == op ? add->src[0] : nullptr;
++    const ggml_tensor * g = mul->src[0] == rn ? mul->src[1] : mul->src[1] == rn ? mul->src[0] : nullptr;
++    if (!R || R == op || rn->src[0] != add || !g || g == rn) return "chain not connected";
++
++    for (const ggml_tensor * t : { y, w, op, R, add, rn, g, mul }) {
++        if (t->type != GGML_TYPE_F32) return "not F32";
++        if (t->ne[3] != 1) return "4-D";
++    }
++    // Prefill only. At decode sizes (T=1: 4 rows, 40 KB) there is nothing to save and the
++    // fused kernel runs just H work-groups; keeping decode on its old path by construction.
++    if (cgraph->nodes[i + 1]->ne[2] < 32) return "decode-sized (T < 32)";
++    // OUT_PROD inner dimension 1: one product per element, y[e,t] * w[c,t]
++    if (y->ne[1] != 1 || w->ne[1] != 1) return "out_prod inner dim != 1";
++    if (op->ne[0] != y->ne[0] || op->ne[1] != w->ne[0] || op->ne[2] != y->ne[2] || w->ne[2] != y->ne[2]) return "out_prod shape";
++    // R, R2, Xn share one [E, H, T] shape; the kernel indexes them by (c, t) row strides
++    if (!ggml_are_same_shape(R, add) || !ggml_are_same_shape(op, add) || !ggml_are_same_shape(mul, add)) return "shape";
++    // gamma is indexed gamma[(c % rows) * s1 + e]: spans E, broadcasts over streams only
++    if (g->ne[0] != add->ne[0] || g->ne[2] != 1 || add->ne[1] % g->ne[1] != 0) return "gamma broadcast";
++    // columns are walked with unit stride in every operand
++    for (const ggml_tensor * t : { y, R, (const ggml_tensor *) add, g, (const ggml_tensor *) mul }) {
++        if (t->nb[0] != sizeof(float)) return "column stride";
++    }
++    // Aliasing. gallocr may place R2 over y or w (dead after the OUT_PROD) and Xn over
++    // R, y, w (dead after the ADD); the fused kernel still reads them, and rows owned by
++    // other work-groups could be overwritten first. Only R2 == R exactly is safe (the ADD
++    // in place): each element is read before it is written, by the same work-item.
++    const bool r2_inplace = add->data == R->data && add->nb[1] == R->nb[1] && add->nb[2] == R->nb[2];
++    if (hc_ranges_overlap(add, R) && !r2_inplace) return "R2 partially overlaps R";
++    for (const ggml_tensor * t : { y, w, g }) {
++        if (hc_ranges_overlap(add, t)) return "R2 overlaps an input";
++    }
++    // Xn exactly over R is the likely placement when R dies at the ADD (the norm output,
++    // which the MUL writes in place, is R-sized), and it is safe: a row's R reads all
++    // complete before the reduction (barrier or sub-group collective) and its Xn writes
++    // come after. R2 == R as well would make Xn == R2, which the loop below rejects.
++    // Xn over R2 or gamma cannot be serviced at all: both are read while Xn is written.
++    if (hc_ranges_overlap(mul, add)) return "Xn overlaps R2";
++    if (hc_ranges_overlap(mul, g))   return "Xn overlaps gamma";
++    // Xn over R (other than exactly), y or w is unsafe in one pass but safe in two: R, y
++    // and w are dead once pass 1 has written R2, and the queue is in order.
++    const bool xn_over_r = mul->data == R->data && mul->nb[1] == R->nb[1] && mul->nb[2] == R->nb[2];
++    if ((hc_ranges_overlap(mul, R) && !xn_over_r) || hc_ranges_overlap(mul, y) || hc_ranges_overlap(mul, w)) {
++        *two_pass = true;
++    }
++    return nullptr;
++}
++
++int ggml_sycl_can_fuse_hc_norm(const ggml_cgraph * cgraph, int node_idx) {
++    static const int mode = [] { const char * e = getenv("GGML_SYCL_FUSE_HC"); return e ? atoi(e) : 0; }();
++    if (mode == 0 || !g_ggml_sycl_enable_fusion) {
++        return 0;
++    }
++    bool two_pass = false;
++    const char * why = hc_norm_decline(cgraph, node_idx, &two_pass);
++    if (mode == 3 && !why) {
++        two_pass = true;   // test hook: test-backend-ops never aliases, so force pass 2
++    }
++    if (mode == 4 && two_pass) {
++        why = "two pass disabled (mode 4)";   // A/B hook: the one-pass-only behaviour
++    }
++    if (mode >= 2) {
++        // histogram by outcome (one pass / two pass / each decline reason), printed at
++        // power-of-two totals so a partial decline rate is attributable over a prefill
++        static const char * names[16] = { "one pass", "two pass" };
++        static uint64_t     counts[16] = {};
++        static int          n_names = 2;
++        static uint64_t     n = 0;
++        const char * key = why ? why : two_pass ? names[1] : names[0];
++        int k = 0;
++        while (k < n_names && strcmp(names[k], key) != 0) k++;
++        if (k == n_names && n_names < 16) names[n_names++] = key;
++        if (k < 16) counts[k]++;
++        n++;
++        if ((n & (n - 1)) == 0) {
++            std::string s;
++            for (int j = 0; j < n_names; j++) {
++                s += std::string(j ? ", " : "") + names[j] + "=" + std::to_string(counts[j]);
++            }
++            GGML_LOG_INFO("%s: after %llu: %s\n", __func__, (unsigned long long) n, s.c_str());
++        }
++    }
++    return why ? 0 : two_pass ? 2 : 1;
++}
++
+ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
+                         std::initializer_list<enum ggml_unary_op> unary_ops) {
+ #ifndef NDEBUG
+--- a/ggml/src/ggml-sycl/fusion.hpp
++++ b/ggml/src/ggml-sycl/fusion.hpp
+@@ -14,4 +14,12 @@
+ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
+                         std::initializer_list<enum ggml_unary_op> unary_ops);
+ 
++// OUT_PROD -> ADD -> RMS_NORM -> MUL starting at node_idx (the qwfn hyper-connection
++// combine + norm), serviced by ggml_sycl_op_hc_combine_norm(). Off unless GGML_SYCL_FUSE_HC
++// is set: 1 enables it, 2 also logs the first declines with their reason.
++// Returns 0 (not fusable), 1 (one pass) or 2 (two passes: Xn aliases an input that is
++// dead once R2 is written). GGML_SYCL_FUSE_HC=3 forces two passes (test hook); =4 allows
++// one pass only (A/B hook). Prefill-sized graphs only (T >= 32).
++int ggml_sycl_can_fuse_hc_norm(const ggml_cgraph * cgraph, int node_idx);
++
+ #endif  // GGML_SYCL_FUSION_HPP
+--- a/ggml/src/ggml-sycl/norm.cpp
++++ b/ggml/src/ggml-sycl/norm.cpp
+@@ -682,6 +682,156 @@
+         ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, main_stream, ctx.device);
+ }
+ 
++// OUT_PROD -> ADD -> RMS_NORM -> MUL in one pass: the qwfn hyper-connection combine
++// followed by the RMS-norm prologue of the next mix. Per row (c, t) of E columns:
++//   R2[e] = R[e] + y[e] * w[c]           (OUT_PROD with inner dim 1 is one product)
++//   Xn[e] = R2[e] * rsqrt(mean(R2^2) + eps) * gamma[e]
++// R2 is written because it lives on as the residual; the OUT_PROD and RMS_NORM results
++// are never materialised. Each work-item re-reads in the second loop only the R2
++// elements it wrote itself in the first, so no barrier is needed for R2.
++// Eligibility and aliasing: ggml_sycl_can_fuse_hc_norm() in fusion.cpp.
++static void hc_norm_f32(const float * R, const float * y, const float * w, const float * gamma,
++                        float * R2, float * Xn, const int ncols,
++                        const int64_t r_s1, const int64_t r_s2, const int64_t y_s2,
++                        const int64_t w_s0, const int64_t w_s2,
++                        const int64_t r2_s1, const int64_t r2_s2, const int64_t x_s1, const int64_t x_s2,
++                        const int64_t g_s1, const int g_nrows, const float eps,
++                        const sycl::nd_item<3> & item_ct1, float * s_sum, int block_size,
++                        float * scale_out) {
++    const int t   = item_ct1.get_group(1);
++    const int c   = item_ct1.get_group(2);
++    const int tid = item_ct1.get_local_id(2);
++    const int nwarps = block_size / WARP_SIZE;
++
++    const float   wct = w[c * w_s0 + t * w_s2];
++    const float * Rr  = R  + c * r_s1  + t * r_s2;
++    const float * yr  = y  + t * y_s2;
++    float *       R2r = R2 + c * r2_s1 + t * r2_s2;
++    float *       Xr  = Xn + c * x_s1  + t * x_s2;
++    const float * gr  = gamma + (int64_t) (c % g_nrows) * g_s1;
++
++    float tmp = 0.0f;
++    for (int col = tid; col < ncols; col += block_size) {
++        const float p = yr[col] * wct;
++        const float r = Rr[col] + p;
++        R2r[col] = r;
++        tmp += r * r;
++    }
++
++    // same reduction as rms_norm_f32
++    tmp = warp_reduce_sum(tmp, item_ct1);
++    if (block_size > WARP_SIZE) {
++        const auto sub_group = item_ct1.get_sub_group();
++        const auto sg_id = sub_group.get_group_linear_id();
++        const auto wi_in_sg = sub_group.get_local_linear_id();
++        if (wi_in_sg == 0) {
++            s_sum[sg_id] = tmp;
++        }
++        item_ct1.barrier(sycl::access::fence_space::local_space);
++        const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
++        tmp = 0.f;
++        for (size_t i = 0; i < nreduce; i += 1) {
++            tmp += s_sum[wi_in_sg + i * WARP_SIZE];
++        }
++        tmp = warp_reduce_sum(tmp, item_ct1);
++    }
++
++    const float mean  = tmp / ncols;
++    const float scale = sycl::rsqrt(mean + eps);
++    if (scale_out) {   // two-pass: Xn is written by hc_norm_apply_f32 once every row is done
++        if (tid == 0) {
++            scale_out[(int64_t) t * item_ct1.get_group_range(2) + c] = scale;
++        }
++        return;
++    }
++    for (int col = tid; col < ncols; col += block_size) {
++        Xr[col] = scale * R2r[col] * gr[col];
++    }
++}
++
++// Pass 2 of the two-pass form: Xn = R2 * scale[c, t] * gamma, same formula as pass 1's tail.
++static void hc_norm_apply_f32(const float * R2, const float * scale, const float * gamma, float * Xn,
++                              const int ncols, const int nrows,
++                              const int64_t r2_s1, const int64_t r2_s2, const int64_t x_s1, const int64_t x_s2,
++                              const int64_t g_s1, const int g_nrows, const sycl::nd_item<3> & item_ct1) {
++    const int t = item_ct1.get_group(1);
++    const int c = item_ct1.get_group(2);
++    const float s = scale[(int64_t) t * nrows + c];
++    const float * R2r = R2 + c * r2_s1 + t * r2_s2;
++    float *       Xr  = Xn + c * x_s1 + t * x_s2;
++    const float * gr  = gamma + (int64_t) (c % g_nrows) * g_s1;
++    for (int col = item_ct1.get_local_id(2); col < ncols; col += item_ct1.get_local_range(2)) {
++        Xr[col] = s * R2r[col] * gr[col];
++    }
++}
++
++void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context & ctx, ggml_tensor * out_prod, ggml_tensor * add,
++                                  ggml_tensor * rms_norm, ggml_tensor * mul, bool two_pass) {
++    const ggml_tensor * y = out_prod->src[0];
++    const ggml_tensor * w = out_prod->src[1];
++    const ggml_tensor * R = add->src[0] == out_prod ? add->src[1] : add->src[0];
++    const ggml_tensor * g = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
++    float eps = 0.0f;
++    memcpy(&eps, rms_norm->op_params, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
++
++    const int     ncols = (int) add->ne[0];
++    const int     nrows = (int) add->ne[1];   // streams (c)
++    const int     nchan = (int) add->ne[2];   // tokens (t)
++    const size_t  f = sizeof(float);
++    const float * R_dd = (const float *) R->data;
++    const float * y_dd = (const float *) y->data;
++    const float * w_dd = (const float *) w->data;
++    const float * g_dd = (const float *) g->data;
++    float *       R2_dd = (float *) add->data;
++    float *       X_dd  = (float *) mul->data;
++    const int64_t r_s1 = R->nb[1] / f, r_s2 = R->nb[2] / f, y_s2 = y->nb[2] / f;
++    const int64_t w_s0 = w->nb[0] / f, w_s2 = w->nb[2] / f;
++    const int64_t r2_s1 = add->nb[1] / f, r2_s2 = add->nb[2] / f;
++    const int64_t x_s1 = mul->nb[1] / f, x_s2 = mul->nb[2] / f;
++    const int64_t g_s1 = g->nb[1] / f;
++    const int     g_nrows = (int) g->ne[1];
++
++    dpct::queue_ptr stream = ctx.stream();
++    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
++    const sycl::range<3> global_dims(1, nchan, nrows);
++    ggml_sycl_pool_alloc<float> scale_buf(ctx.pool());
++    float * sc = two_pass ? scale_buf.alloc((size_t) nrows * nchan) : nullptr;
++    if (ncols < 1024) {
++        const sycl::range<3> block_dims(1, 1, WARP_SIZE);
++        stream->submit([&](sycl::handler & cgh) {
++            cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
++                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    hc_norm_f32(R_dd, y_dd, w_dd, g_dd, R2_dd, X_dd, ncols, r_s1, r_s2, y_s2, w_s0, w_s2,
++                                r2_s1, r2_s2, x_s1, x_s2, g_s1, g_nrows, eps, item_ct1, nullptr, WARP_SIZE, sc);
++                });
++        });
++    } else {
++        const int work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
++        assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
++        const sycl::range<3> block_dims(1, 1, work_group_size);
++        stream->submit([&](sycl::handler & cgh) {
++            sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
++            cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
++                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    hc_norm_f32(R_dd, y_dd, w_dd, g_dd, R2_dd, X_dd, ncols, r_s1, r_s2, y_s2, w_s0, w_s2,
++                                r2_s1, r2_s2, x_s1, x_s2, g_s1, g_nrows, eps, item_ct1,
++                                get_pointer(s_sum_acc_ct1), work_group_size, sc);
++                });
++        });
++    }
++    if (two_pass) {   // in-order queue: pass 1 has finished every row before this starts
++        const sycl::range<3> block_dims(1, 1, 256);
++        stream->submit([&](sycl::handler & cgh) {
++            cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
++                [=](sycl::nd_item<3> item_ct1) {
++                    hc_norm_apply_f32(R2_dd, sc, g_dd, X_dd, ncols, nrows, r2_s1, r2_s2, x_s1, x_s2,
++                                      g_s1, g_nrows, item_ct1);
++                });
++        });
++    }
++}
++
+ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+     const ggml_tensor * rms_norm_src = dst->src[0];
+     float eps = 0.0f;
+--- a/ggml/src/ggml-sycl/norm.hpp
++++ b/ggml/src/ggml-sycl/norm.hpp
+@@ -21,6 +21,11 @@
+ 
+ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul);
+ 
++// OUT_PROD -> ADD -> RMS_NORM -> MUL (hyper-connection combine + norm); preconditions from
++// ggml_sycl_can_fuse_hc_norm(). Writes the ADD and MUL results; the other two are elided.
++void ggml_sycl_op_hc_combine_norm(ggml_backend_sycl_context& ctx, ggml_tensor* out_prod, ggml_tensor* add,
++                                  ggml_tensor* rms_norm, ggml_tensor* mul, bool two_pass);
++
+ void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul_tensor, ggml_tensor* add_tensor);
+ 
+ void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6008,6 +6008,15 @@
+             }
+         }
+ #endif
++        if (node->op == GGML_OP_OUT_PROD) {
++            const int hc_plan = ggml_sycl_can_fuse_hc_norm(cgraph, i);
++            if (hc_plan != 0) {
++                ggml_sycl_op_hc_combine_norm(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
++                                             cgraph->nodes[i + 3], hc_plan == 2);
++                i += 3;
++                continue;
++            }
++        }
+         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
+         if (node->op == GGML_OP_GATED_DELTA_NET) {
+             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3690,6 +3690,46 @@
+ };
+ 
+ // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
++// The qwfn hyper-connection combine + norm, as qwfn_graph.cpp builds it: OUT_PROD (inner
++// dim 1) -> ADD -> RMS_NORM -> MUL, with the ADD result also consumed downstream. The
++// output adds R2 back onto Xn so that both fused-kernel outputs are checked.
++struct test_hc_combine_norm : public test_case {
++    const std::array<int64_t, 3> ne;   // E, H, T
++    const bool gamma_rows;             // gamma [E, H] (the engine) vs [E] (broadcast)
++    const bool inplace;                // R2 written over R: the exact-alias path
++
++    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_COMBINE_NORM"; }
++    bool run_whole_graph() override { return true; }
++    std::string vars() override { return VARS_TO_STR3(ne, gamma_rows, inplace); }
++
++    test_hc_combine_norm(std::array<int64_t, 3> ne = {2560, 4, 7}, bool gamma_rows = true, bool inplace = false)
++        : ne(ne), gamma_rows(gamma_rows), inplace(inplace) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t E = ne[0], H = ne[1], T = ne[2];
++        ggml_tensor * R   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, H, T);
++        ggml_tensor * y   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
++        ggml_tensor * inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
++        ggml_tensor * g   = gamma_rows ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, H)
++                                       : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, E);
++        ggml_set_name(R, "R"); ggml_set_name(y, "y"); ggml_set_name(inj, "inj"); ggml_set_name(g, "gamma");
++
++        ggml_tensor * w  = ggml_scale(ctx, ggml_sigmoid(ctx, inj), 2.0f);
++        ggml_tensor * p  = ggml_out_prod(ctx, ggml_reshape_3d(ctx, y, E, 1, T), ggml_reshape_3d(ctx, w, H, 1, T));
++        ggml_tensor * R2 = inplace ? ggml_add_inplace(ctx, R, p) : ggml_add(ctx, R, p);
++        ggml_tensor * Xn = ggml_mul(ctx, ggml_rms_norm(ctx, R2, 1e-6f), g);
++        ggml_tensor * out = ggml_add(ctx, Xn, R2);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t, -10.f, 10.f);
++        }
++    }
++};
++
+ struct test_rms_norm_mul_add : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+@@ -9673,6 +9713,18 @@
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
+     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
++    for (bool gr : { true, false }) {
++        test_cases.emplace_back(new test_hc_combine_norm({ 2560, 4, 1 }, gr));
++        test_cases.emplace_back(new test_hc_combine_norm({ 2560, 4, 7 }, gr));
++        test_cases.emplace_back(new test_hc_combine_norm({ 2560, 4, 512 }, gr));
++        test_cases.emplace_back(new test_hc_combine_norm({ 64, 4, 5 }, gr));      // < 1024 cols: sub-group path
++        test_cases.emplace_back(new test_hc_combine_norm({ 1000, 3, 9 }, gr));    // non-multiple of the WG size
++        test_cases.emplace_back(new test_hc_combine_norm({ 2560, 4, 7 }, gr, true));
++        // the fused path is gated to T >= 32; the cases above check the decline path
++        test_cases.emplace_back(new test_hc_combine_norm({ 64, 4, 40 }, gr));     // sub-group path
++        test_cases.emplace_back(new test_hc_combine_norm({ 1000, 3, 33 }, gr));   // non-multiple of the WG size
++        test_cases.emplace_back(new test_hc_combine_norm({ 2560, 4, 48 }, gr, true));
++    }
+ 
+     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
+     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
