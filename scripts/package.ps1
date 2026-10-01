@@ -94,7 +94,8 @@ $bad = @()
 foreach ($f in Get-ChildItem "$Out\bin" -Include *.exe, *.dll -Recurse) {
   foreach ($line in (& dumpbin /nologo /dependents $f.FullName)) {
     $d = $line.Trim().ToLower()
-    if ($d -match '\.dll$' -and $d -notmatch $os -and -not $have[$d]) { $bad += "$($f.Name) needs $d" }
+    # the dependents are bare file names; the 'Dump of file <path>' header is not one
+    if ($d -match '^[a-z0-9_.+-]+\.dll$' -and $d -notmatch $os -and -not $have[$d]) { $bad += "$($f.Name) needs $d" }
   }
 }
 if ($bad) { $bad | ForEach-Object { Write-Host $_ }; throw 'the bundle misses DLLs (above)' }
