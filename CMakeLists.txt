@@ -292,12 +292,10 @@ target_compile_definitions(qwfn-train-predictor PRIVATE LLAMA_CPP_BUILD_DIR="${L
 
 # ------------------------------------------------------------------ server --
 #
-# The HTTP front end is not on the Windows build yet: its stall watchdog prints
-# the generating thread's stack through backtrace() and pthread_kill(SIGUSR2),
-# and the Win32 equivalent (SuspendThread + StackWalk64) has still to be
-# written. Everything the server links against is already portable, so this is
-# the only thing standing between it and a Windows build.
-option(QWFN_BUILD_SERVER "Build qwfn-server" ${UNIX})
+# On Windows the stall watchdog logs the stall without the stuck thread's
+# stack (no pthread_kill/backtrace there); the Rafiekuntest port built and
+# ran the server that way, so it is on for every platform.
+option(QWFN_BUILD_SERVER "Build qwfn-server" ON)
 if(QWFN_BUILD_SERVER)
   # cpp-httplib 0.54 is split header/source, so its .cpp joins the target.
   qwfn_tool(qwfn-server
@@ -311,6 +309,4 @@ if(QWFN_BUILD_SERVER)
   if(WIN32)
     target_link_libraries(qwfn-server PRIVATE ws2_32 crypt32)   # cpp-httplib: sockets; crypt32 as in the tested Windows port
   endif()
-elseif(WIN32)
-  message(STATUS "qwfn-server: skipped (the stall watchdog has no Win32 implementation yet; -DQWFN_BUILD_SERVER=ON to try anyway)")
 endif()

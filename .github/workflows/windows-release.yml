@@ -45,9 +45,19 @@ jobs:
             "LIBRARY $base`r`nEXPORTS`r`n" + ($names -join "`r`n") | Out-File -Encoding ascii "$env:RUNNER_TEMP\$base.def"
             lib /DEF:"$env:RUNNER_TEMP\$base.def" /OUT:"$cu\lib\x64\$lib" /MACHINE:X64
           }
+      - name: Cache the llama.cpp build
+        id: llama-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/llama.cpp
+          key: llama-e85e15cf-cuda13-${{ env.CUDA_ARCHS }}-v1
       - name: Build llama.cpp (pinned upstream, CUDA backend)
         shell: pwsh
         run: |
+          if ("${{ steps.llama-cache.outputs.cache-hit }}" -eq "true") {
+            "GGML_LIBS=$env:RUNNER_TEMP\llama.cpp\build\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Host "llama.cpp from the cache"; exit 0
+          }
           $cu = ($env:CUDIR -replace '\\','/')
           # Upstream at a commit that knows the qwen4exp architecture (2026-09-25).
           # Older pins (e.g. the Unsloth b10798 mix) fail every Flash-Next start
