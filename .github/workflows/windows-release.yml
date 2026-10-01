@@ -45,9 +45,9 @@ jobs:
             "LIBRARY $base`r`nEXPORTS`r`n" + ($names -join "`r`n") | Out-File -Encoding ascii "$env:RUNNER_TEMP\$base.def"
             lib /DEF:"$env:RUNNER_TEMP\$base.def" /OUT:"$cu\lib\x64\$lib" /MACHINE:X64
           }
-      - name: Cache the llama.cpp build
+      - name: Cached llama.cpp build
         id: llama-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/llama.cpp
           key: llama-e85e15cf-cuda13-${{ env.CUDA_ARCHS }}-v1
@@ -73,6 +73,12 @@ jobs:
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
           cmake --build $env:RUNNER_TEMP\llama.cpp\build --target ggml-base ggml ggml-cpu ggml-cuda llama
           "GGML_LIBS=$env:RUNNER_TEMP\llama.cpp\build\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Save the llama.cpp build (also when a later step fails)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/llama.cpp
+          key: llama-e85e15cf-cuda13-${{ env.CUDA_ARCHS }}-v1
       - name: Package bundle
         shell: pwsh
         run: |
@@ -83,6 +89,12 @@ jobs:
           $env:QWFN_ZIP = "$pwd\dist\qwfnfer-windows-x86_64-cuda.zip"
           $env:QWFN_HOME = "$env:RUNNER_TEMP\qwfnfer"; $env:QWFN_BIN = "$env:RUNNER_TEMP\qbin"
           powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+      - name: Keep the build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: build-portable*.log
       - name: Keep the bundle
         uses: actions/upload-artifact@v4
         with:

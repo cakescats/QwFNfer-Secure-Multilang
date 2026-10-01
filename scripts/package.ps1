@@ -56,7 +56,12 @@ $Out  = "dist\$Name"
 Write-Host "== engine (portable build against $GgmlLibs)"
 cmake -S . -B build-portable -G Ninja -DCMAKE_BUILD_TYPE=Release "-DQWFN_PORTABLE=ON" `
   "-DLLAMA_CPP_ROOT=$LlamaCppRoot" "-DLLAMA_CPP_BUILD=$GgmlLibs" 2>&1 | Tee-Object build-portable.cmake.log | Select-Object -Last 5
-cmake --build build-portable --target qwfn-server qwfn-tok | Select-Object -Last 2
+# -k 0: every failing file in one run; on failure the compiler errors, not just the last lines.
+cmake --build build-portable --target qwfn-server qwfn-tok -- -k 0 2>&1 | Tee-Object build-portable.build.log | Select-Object -Last 2
+if ($LASTEXITCODE -ne 0) {
+  Select-String -Path build-portable.build.log -Pattern ': (fatal )?error |FAILED:|LNK[0-9]+' | Select-Object -First 80 | ForEach-Object { $_.Line }
+  throw 'engine build failed (errors above, full log: build-portable.build.log)'
+}
 Write-Host "== bundle $Out"
 Remove-Item -Recurse -Force $Out -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path "$Out\bin", "$Out\tools\console", "$Out\scripts" -Force | Out-Null
