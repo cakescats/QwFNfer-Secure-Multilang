@@ -1,7 +1,7 @@
 name: linux-release
 on:
   push:
-    branches: [ 'merge/**' ]   # a test build of a merge branch: one CUDA arch, no release
+    branches: [ 'cakescats-ru', 'merge/**' ]   # a test build of the main and merge branches: one CUDA arch, no release
   workflow_dispatch:
     inputs:
       tag:
@@ -26,7 +26,7 @@ jobs:
     permissions:
       contents: write   # publish the release + upload the zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Toolchain (CUDA 13 from NVIDIA's repository, no driver)
         run: |
           sudo apt-get update -q
@@ -43,7 +43,7 @@ jobs:
           echo "CUDA_LIBS=$cu/targets/x86_64-linux/lib" >> "$GITHUB_ENV"
       - name: Cached llama.cpp build
         id: llama-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/llama.cpp
           key: llama-ca14269-cuda13-${{ env.CUDA_ARCHS }}-${{ hashFiles('patches/ggml-cuda/*.patch', 'cmake/glibc_compat.h') }}-v1
@@ -71,7 +71,7 @@ jobs:
           cp "$RUNNER_TEMP/ggml-patches.txt" "$L/build/bin/"
       - name: Save the llama.cpp build (also when a later step fails)
         if: steps.llama-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/llama.cpp
           key: llama-ca14269-cuda13-${{ env.CUDA_ARCHS }}-${{ hashFiles('patches/ggml-cuda/*.patch', 'cmake/glibc_compat.h') }}-v1
@@ -85,18 +85,18 @@ jobs:
         run: QWFN_ZIP=$PWD/dist/qwfnfer-linux-x86_64-cuda.zip QWFN_HOME=$RUNNER_TEMP/qwfnfer QWFN_BIN=$RUNNER_TEMP/qbin scripts/install.sh
       - name: Keep the build logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-build-logs
           path: build-portable*.log
       - name: Keep the bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: qwfnfer-linux-x86_64-cuda
           path: dist/qwfnfer-linux-x86_64-cuda.zip
       - name: Publish release
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag }}
           prerelease: true
