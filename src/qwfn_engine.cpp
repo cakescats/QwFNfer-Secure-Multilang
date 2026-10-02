@@ -2443,15 +2443,35 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 // A's outputs from persistent tensors, never from A's allocation), and
                 // run once now, A then A2, so this token reads a complete pack.
                 ggml_gallocr_t ga1 = ggml_gallocr_new(w_.buft()), ga2 = ggml_gallocr_new(w_.buft());
-                if (!ga1 || !ga2 || !ggml_gallocr_alloc_graph(ga1, g1) || !ggml_gallocr_alloc_graph(ga2, g)) {
+                const bool ok1 = ga1 && ggml_gallocr_alloc_graph(ga1, g1);
+                const bool ok2 = ok1 && ga2 && ggml_gallocr_alloc_graph(ga2, g);
+                if (!ok2) {
+                    // No device memory for two per-layer allocators: replay is an optimisation, so run
+                    // this layer once, uncached, A then A2, as the unsplit path does when its own
+                    // allocator cannot be had (measured under scripts/oom_survival.sh: returning an
+                    // error here failed the request the unsplit path completes). A graph ga1 already
+                    // placed keeps that placement -- gallocr leaves a node that has data alone, so
+                    // sending it through the shared allocator after freeing ga1 wrote freed memory
+                    // (a SIGSEGV in the same test) -- and both allocators go only after the compute.
+                    static bool warned_split = false;
+                    if (!warned_split) { warned_split = true;
+                        fprintf(stderr, "[qwfn] early routing: no device memory for the per-layer allocators; layers run uncached\n"); }
+                    bool ok = (ok1 || ggml_gallocr_alloc_graph(galloc_gpu_, g1)) && compute_graph(w_.backend(), g1, "layer graph", il);
+                    ok = ok && ggml_gallocr_alloc_graph(galloc_gpu_, g) && compute_graph(w_.backend(), g, "layer graph", il);
+                    ggml_backend_synchronize(w_.backend());
                     if (ga1) ggml_gallocr_free(ga1);
                     if (ga2) ggml_gallocr_free(ga2);
                     ggml_free(c1); ggml_free(c);
-                    if (ibuf) ggml_backend_buffer_free(ibuf);
-                    if (ictx) ggml_free(ictx);
-                    err = "no device memory for the early-routing graphs of layer " + std::to_string(il) + "; run without QWFN_EARLY_ROUTE";
-                    return false;
-                }
+                    if (!ok) {
+                        if (ibuf) ggml_backend_buffer_free(ibuf);
+                        if (ictx) ggml_free(ictx);
+                        if (!take_failure(err)) err = "out of VRAM for the layer graphs at " + std::to_string(n_past_) +
+                                                      " tokens of context (layer " + std::to_string(il) + "); lower the batch or raise the reserve";
+                        return false;
+                    }
+                    gA_pack_[il] = 0;   // nothing cached for this layer
+                    cached = true;      // computed: skip the unsplit compute below
+                } else {
                 // Their own uid range: the CUDA backend skips a replay's property walk
                 // while a graph's uid is unchanged, so two graphs must never share one.
                 static uint64_t split_uid = 1ull << 40;
@@ -2466,6 +2486,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     err = "compute failed"; return false;
                 }
                 cached = true;
+                }
             } else if (replayable) {
                 // Keep the context alive and give the graph its own allocator, so
                 // the addresses it was built against do not move next token. If
