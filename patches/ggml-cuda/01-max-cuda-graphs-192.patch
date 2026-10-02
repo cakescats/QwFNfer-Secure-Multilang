@@ -1,0 +1,13 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 068c9b1..9e64da6 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1467,7 +1467,7 @@ struct ggml_backend_cuda_context {
+ #ifdef USE_CUDA_GRAPH
+     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+ 
+-    static const size_t max_cuda_graphs = 64;
++    static const size_t max_cuda_graphs = 192;   // qwfnfer: 64 -> 192, the early-routing decode keeps two graphs per layer (96)
+ 
+     int64_t last_graph_eviction_sweep = 0;
+ 

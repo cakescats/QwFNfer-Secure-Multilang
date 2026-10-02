@@ -136,6 +136,9 @@ public:
         // slack also absorbs the per-call input arena, which grows with n_kv.
         size_t vram_reserve = 768ull << 20;
         bool   use_cold_tier  = true;         // serve misses from the IQ1_S checkpoint
+        // An expert pack (qwfn_pack.h, built by qwfn-pack): a full-precision block
+        // is then one read of gate+up+down instead of three. Empty = off.
+        std::string pack_path;
         unsigned queue_depth  = 256;
         io_engine::backend io_backend = io_engine::backend::async;
         // Bound the H2D traffic spent warming T0: one block is ~2.18 MB, so
@@ -413,6 +416,17 @@ private:
     int32_t  choose_victim(layer_pool & lp);
     bool   would_promote(layer_pool & lp, uint32_t expert_id);   // promote()'s victim rule, without acting
     uint32_t n_hot_shards_ = 0;   // io_pf_ opens the hot shards then the cold ones
+    // Expert pack: its shard index in io_hot_ and io_pf_ (-1 = no pack), and per
+    // layer the file offset of expert 0 and the block stride (0 = this layer's
+    // slot layout differs from the pack's: read the GGUF parts).
+    int pack_shard_hot_ = -1, pack_shard_pf_ = -1;
+    std::vector<uint64_t> pack_off_;
+    std::vector<uint32_t> pack_stride_;
+    // The reads that fill one full-precision block of `layer` into the slot at
+    // `base`: one from the pack when it holds this layer, else one per part.
+    // Returns the payload bytes they carry.
+    template <class F> uint64_t hot_block_reqs(const layer_pool & lp, uint32_t layer, uint32_t e,
+                                               uint8_t * base, uint64_t tag, int pack_shard, F && push) const;
     uint8_t * slot_ptr(layer_pool & lp, uint32_t slot) const { return lp.base + (size_t) slot * lp.block_bytes; }
     void     fill_handle(const layer_pool & lp, uint32_t slot, expert_handle & h) const;
 

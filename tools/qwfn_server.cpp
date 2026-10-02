@@ -969,6 +969,7 @@ int main(int argc, char ** argv) {
           "      --think-budget N  max reasoning tokens per answer (0 = unlimited); also POST /props {\"reasoning_budget\":N} or per request\n"
           "      --ctx N         context (default 32768)   --batch N (default 2048)\n"
           "      --ram GB        --vram GB   --threads N   --cpu   --kv f16|q8_0\n"
+          "      --io-uring      expert reads over io_uring (default: a thread pool; --io-threads N sets its size)\n"
           "      --reserve MB    VRAM kept free after the expert tier is sized (default 768; raise it on a desktop GPU)\n"
           "      --ram-frac F    MemAvailable share the RAM tier may take (default 0.75)\n"
           "      --prefix-cache GB  host memory for checkpoints of conversations switched away from (default 0 = off), so\n"
@@ -1033,6 +1034,10 @@ int main(int argc, char ** argv) {
         if (a == "--ram"    && i + 1 < argc) { cfg.ram_bytes = (size_t)(atof(next()) * 1e9); continue; }
         if (a == "--vram"   && i + 1 < argc) { cfg.vram_bytes = (size_t)(atof(next()) * 1e9); continue; }
         if (a == "--threads"&& i + 1 < argc) { cfg.n_threads = atoi(next()); continue; }
+        // The expert read engine, as in qwfn-gen: the thread pool by default; io_uring
+        // reads in place, which an expert pack (QWFN_EXPERT_PACK) needs to pay off.
+        if (a == "--io-uring") { cfg.io_threads = false; continue; }
+        if (a == "--io-threads" && i + 1 < argc) { cfg.io_threads = true; cfg.io_workers = (unsigned) atoi(next()); continue; }
         if (a == "--ram-frac" && i + 1 < argc) { cfg.ram_frac = atof(next()); continue; }
         if (a == "--prefix-cache" && i + 1 < argc) { prefix_cache_gb = atof(next()); continue; }
         if (a == "--prefix-cache-min" && i + 1 < argc) {   // strict: atoi would turn garbage into 0, "save everything"

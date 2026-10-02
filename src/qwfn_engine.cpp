@@ -32,6 +32,12 @@ engine::~engine() {
         if (lg.ga)  ggml_gallocr_free(lg.ga);
         if (lg.ctx) ggml_free(lg.ctx);
     }
+    for (auto & lg : gA2_) {
+        if (lg.ga)  ggml_gallocr_free(lg.ga);
+        if (lg.ctx) ggml_free(lg.ctx);
+    }
+    if (ev_route_) ggml_backend_event_free(ev_route_);
+    if (ev_pred_)  ggml_backend_event_free(ev_pred_);
     for (auto & mg : gM_) {
         if (mg.ga)  ggml_gallocr_free(mg.ga);
         if (mg.ctx) ggml_free(mg.ctx);
@@ -490,6 +496,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
     ec_cfg.q2_soa = getenv("QWFN_Q2_SOA") != nullptr;   // the VRAM tier's q2_0 experts in the SOA layout (SYCL)
     ec_cfg.iq4_soa = getenv("QWFN_IQ4_SOA") != nullptr; // and its iq4_nl experts (ggml-sycl patch 17)
     ec_cfg.use_cold_tier = cfg.use_cold_tier;
+    if (const char * pk = getenv("QWFN_EXPERT_PACK")) ec_cfg.pack_path = pk;   // expert blocks as one read each (qwfn-pack)
     ec_cfg.max_promotions_per_layer = cfg.promote_per_layer;
     ec_cfg.ram_frac      = cfg.ram_frac;
     ec_cfg.ram_headroom  = cfg.ram_headroom;
@@ -590,6 +597,7 @@ bool engine::init(const model_index * hot, const model_index * cold,
         pf_.set_resident_source([this](uint32_t layer, std::vector<ram_slice> & out) { ec_.ram_resident_slices(layer, out); });
 
     gA_.assign(hp_.n_layer, layer_graph{});
+    gA2_.assign(hp_.n_layer, layer_graph{});
     gA_bucket_.assign(hp_.n_layer, -1);
     gM_.assign(hp_.n_layer, moe_graph{});
     if (getenv("QWFN_VRAM_AUDIT")) {
@@ -1500,6 +1508,7 @@ void engine::sync_tier_epoch() {
     // The dynamic tier moved: every replayed graph that folds an expert
     // matmul over it holds stale pointers. Rebuild them all next token.
     for (auto & lg : gA_) { if (lg.ga) ggml_gallocr_free(lg.ga); if (lg.ctx) ggml_free(lg.ctx); lg = layer_graph{}; }
+    for (auto & lg : gA2_) { if (lg.ga) ggml_gallocr_free(lg.ga); if (lg.ctx) ggml_free(lg.ctx); lg = layer_graph{}; }
     for (auto & mg : gM_) { if (mg.ga) ggml_gallocr_free(mg.ga); if (mg.ctx) ggml_free(mg.ctx); mg = moe_graph{}; }
     std::fill(gA_bucket_.begin(), gA_bucket_.end(), -1);
     tier_epoch_seen_ = ec_.tier_epoch();
@@ -2129,6 +2138,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             if (gA_[il].ga)  ggml_gallocr_free(gA_[il].ga);
             if (gA_[il].ctx) ggml_free(gA_[il].ctx);
             gA_[il] = layer_graph{};
+            if (gA2_[il].ga)  ggml_gallocr_free(gA2_[il].ga);
+            if (gA2_[il].ctx) ggml_free(gA2_[il].ctx);
+            gA2_[il] = layer_graph{};
         }
         // Whether the graph that runs for this layer writes the readback pack:
         // the cached graph's own property when it is replayed, this build's
@@ -2138,6 +2150,7 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
         // packing graphs and read the routing from tensors they never write:
         // stale expert ids in every layer, fast garbage, surviving reset.)
         bool ran_packed = false;
+        bool ran_split = false;   // the replay ran graph A and A2 separately (early routing)
         // A replayed graph A is launched here and waited for at the routing
         // readback below; these carry the timing across that gap.
         bool gA_async = false;
@@ -2158,6 +2171,25 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // over every node and the graph submit), the wait for the device.
             if (ggml_backend_graph_compute_async(w_.backend(), gA_[il].gf) != GGML_STATUS_SUCCESS) {
                 err = "replay compute failed"; return false;
+            }
+            if (gA2_[il].gf) {
+                // Split layer (early routing): the routing comes back behind graph A,
+                // flagged by ev_route_, and graph A2 runs behind it while the host
+                // works; the prediction A2 writes comes back behind it, flagged by ev_pred_.
+                if (!gA2_[il].allocated) {
+                    if (!ggml_gallocr_alloc_graph(gA2_[il].ga, gA2_[il].gf)) { err = "replay alloc failed"; return false; }
+                    gA2_[il].allocated = true;
+                }
+                const size_t head = (size_t) T * (n_embd + 2 * U);
+                ggml_backend_tensor_get_async(w_.backend(), t_pack_, p_pack_->data, 0, head * sizeof(float));
+                ggml_backend_event_record(ev_route_, w_.backend());
+                if (ggml_backend_graph_compute_async(w_.backend(), gA2_[il].gf) != GGML_STATUS_SUCCESS) {
+                    err = "replay compute failed"; return false;
+                }
+                ggml_backend_tensor_get_async(w_.backend(), t_pack_, (float *) p_pack_->data + head, head * sizeof(float),
+                                              (size_t) 2 * QWFN_SPEC_MAX * T * sizeof(float));
+                ggml_backend_event_record(ev_pred_, w_.backend());
+                ran_split = true;
             }
             const auto ta2 = std::chrono::steady_clock::now();
             // No synchronize here. The only thing that needs graph A to have
@@ -2223,6 +2255,39 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             gb.gate_drop = decode ? cfg_.gate_drop : 0.0f;
             gb.moe_route(cur2, il, &sl, &wt);
             gb.gate_drop = 0.0f;
+
+            // ---- early routing (QWFN_EARLY_ROUTE=1) --------------------------
+            // Graph A ends at the router: its outputs -- the residual, the FFN input,
+            // the injection, the routing -- go to their persistent tensors here, and
+            // the rest of the layer (shared expert, VRAM-resident experts, next-layer
+            // prediction) becomes graph A2, built on views of those tensors. On replay
+            // the host reads the routing as soon as graph A is done and computes the
+            // CPU experts while A2 runs, instead of after it (measured in the nsys
+            // trace of 2026-10-02: a median 209 us of GPU work per layer follows the
+            // router). Decode, one token, the packed readback, replayed graphs only.
+            static const bool early_route = getenv("QWFN_EARLY_ROUTE") != nullptr;
+            const bool split = early_route && pack_ok && replayable && T == 1 && p_pack_ != nullptr;
+            ggml_context * c1 = nullptr; ggml_cgraph * g1 = nullptr;
+            if (split) {
+                ggml_build_forward_expand(g, place(r, res_[1 - cur_res], 0) ? r : ggml_cpy(c, r, vres(c, 1 - cur_res)));
+                ggml_build_forward_expand(g, place(cur2, t_cur_, 0) ? cur2 : ggml_cpy(c, cur2, v2(c, t_cur_)));   // row 0 of t_cur_ is the pack's head
+                ggml_build_forward_expand(g, place(inject, t_inject_, 0) ? inject : ggml_cpy(c, inject, v2(c, t_inject_)));
+                // The weights by the same rule as the unsplit graph (see QWFN_FUSE_ROUTER below), so the
+                // router's kernels and rounding are the same and the tokens match bit for bit.
+                static const bool place_router_w1 = getenv("QWFN_FUSE_ROUTER") == nullptr;
+                ggml_build_forward_expand(g, place_router_w1 && place(wt, t_cur_, (size_t) T * n_embd * sizeof(float)) ? wt
+                        : ggml_cpy(c, wt, ggml_view_1d(c, t_pack_, U * T, (size_t) T * n_embd * sizeof(float))));
+                ggml_build_forward_expand(g, ggml_cpy(c, sl, ggml_view_1d(c, t_pack_, U * T, (size_t) (T * n_embd + U * T) * sizeof(float))));   // I32 -> F32
+                ggml_build_forward_expand(g, ggml_cpy(c, sl, v2(c, t_sel_)));   // the ids A2's VRAM experts gather by
+                c1 = c; g1 = g;
+                new_ctx(&c, &g);
+                gb.ctx0 = c; gb.bind(&st_, g, n_past);
+                r      = vres(c, 1 - cur_res);
+                cur2   = v2(c, t_cur_);
+                inject = v2(c, t_inject_);
+                sl     = v2(c, t_sel_);
+                wt     = ggml_reshape_3d(c, ggml_view_1d(c, t_pack_, U * T, (size_t) T * n_embd * sizeof(float)), 1, U, T);
+            }
             ggml_tensor * sh = gb.shared_expert(cur2, il);
 
             ggml_tensor * pg_here = nullptr;
@@ -2325,16 +2390,28 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             // Outputs in place where the shapes allow (one token): the node that
             // produces an output gets the persistent tensor's memory, so the copy
             // kernel goes. See `place` above.
+            if (!split) {   // a split layer wrote these at the end of graph A
             ggml_build_forward_expand(g, place(r, res_[1 - cur_res], 0) ? r : ggml_cpy(c, r, vres(c, 1 - cur_res)));
             ggml_build_forward_expand(g, place(cur2, t_cur_, 0) ? cur2 : ggml_cpy(c, cur2, v2(c, t_cur_)));   // row 0 of t_cur_ is the pack's head
             ggml_build_forward_expand(g, place(inject, t_inject_, 0) ? inject : ggml_cpy(c, inject, v2(c, t_inject_)));
             if (pack_ok) {
-                ggml_build_forward_expand(g, place(wt, t_cur_, (size_t) T * n_embd * sizeof(float)) ? wt
+                // Placing the router's weights marks their root (the DIV of the
+                // renormalisation) as a graph output, and ggml-cuda then refuses to fuse
+                // the router -- softmax, argsort, gather, renormalisation -- into its one
+                // topk-moe kernel: an output may not be an intermediate of a fusion.
+                // QWFN_FUSE_ROUTER=1 copies them instead, so the fusion takes. Measured
+                // 2026-10-02 on the Abliterated Q4_K_M (4 interleaved pairs): graph A
+                // -17 us per recurrent layer, -16 per attention layer (~0.8 ms/token), but
+                // 12.70 -> 12.68 tok/s, inside the noise, and the fused kernel's rounding
+                // changes the generated text. Off by default until it shows a gain.
+                static const bool place_router_w = getenv("QWFN_FUSE_ROUTER") == nullptr;
+                ggml_build_forward_expand(g, place_router_w && place(wt, t_cur_, (size_t) T * n_embd * sizeof(float)) ? wt
                         : ggml_cpy(c, wt, ggml_view_1d(c, t_pack_, U * T, (size_t) T * n_embd * sizeof(float))));
                 ggml_build_forward_expand(g, ggml_cpy(c, sl, ggml_view_1d(c, t_pack_, U * T, (size_t) (T * n_embd + U * T) * sizeof(float))));   // I32 -> F32: a real conversion
             } else {
                 ggml_build_forward_expand(g, ggml_cpy(c, sl,     v2(c, t_sel_)));
                 ggml_build_forward_expand(g, ggml_cpy(c, wt,     v2(c, t_w_)));
+            }
             }
             ggml_build_forward_expand(g, place(sh, t_sh_, 0) ? sh : ggml_cpy(c, sh, v2(c, t_sh_)));
             ran_packed = pack_ok;
@@ -2361,7 +2438,35 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 }
             }
             bool cached = false;
-            if (replayable) {
+            if (split) {
+                // Both halves cached for replay, each with its own allocator (A2 reads
+                // A's outputs from persistent tensors, never from A's allocation), and
+                // run once now, A then A2, so this token reads a complete pack.
+                ggml_gallocr_t ga1 = ggml_gallocr_new(w_.buft()), ga2 = ggml_gallocr_new(w_.buft());
+                if (!ga1 || !ga2 || !ggml_gallocr_alloc_graph(ga1, g1) || !ggml_gallocr_alloc_graph(ga2, g)) {
+                    if (ga1) ggml_gallocr_free(ga1);
+                    if (ga2) ggml_gallocr_free(ga2);
+                    ggml_free(c1); ggml_free(c);
+                    if (ibuf) ggml_backend_buffer_free(ibuf);
+                    if (ictx) ggml_free(ictx);
+                    err = "no device memory for the early-routing graphs of layer " + std::to_string(il) + "; run without QWFN_EARLY_ROUTE";
+                    return false;
+                }
+                // Their own uid range: the CUDA backend skips a replay's property walk
+                // while a graph's uid is unchanged, so two graphs must never share one.
+                static uint64_t split_uid = 1ull << 40;
+                g1->uid = ++split_uid; g->uid = ++split_uid;
+                gA_[il]  = layer_graph{ true, c1, g1, ga1 };
+                gA2_[il] = layer_graph{ true, c, g, ga2 };
+                gA_bucket_[il] = qd_.n_bucket; gA_T_[il] = (uint8_t) T; gA_pack_[il] = pack_ok;
+                if (!ev_route_) ev_route_ = ggml_backend_event_new(ggml_backend_get_device(w_.backend()));
+                if (!ev_pred_)  ev_pred_  = ggml_backend_event_new(ggml_backend_get_device(w_.backend()));
+                if (ggml_backend_graph_compute(w_.backend(), g1) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_graph_compute(w_.backend(), g)  != GGML_STATUS_SUCCESS) {
+                    err = "compute failed"; return false;
+                }
+                cached = true;
+            } else if (replayable) {
                 // Keep the context alive and give the graph its own allocator, so
                 // the addresses it was built against do not move next token. If
                 // the device cannot spare the buffer, fall back to the shared
@@ -2426,11 +2531,19 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
 
         const auto trb0 = std::chrono::steady_clock::now();
         const bool packed = decode && ran_packed;
+        pred_pending_ = false;   // set again below when this layer's prediction is still in flight
         const auto t_rb0 = std::chrono::steady_clock::now();
         if (packed) {
             const size_t pn = (size_t) T * (n_embd + 2 * U + 2 * QWFN_SPEC_MAX);
             const float * pk;
-            if (p_pack_) {
+            if (ran_split) {
+                // Early routing: the head (FFN input, weights, ids) was queued right
+                // behind graph A; graph A2 is still running behind it. Wait for the
+                // head only; the prediction is read before the prefetch needs it.
+                ggml_backend_event_synchronize(ev_route_);
+                pk = (const float *) p_pack_->data;
+                pred_pending_ = true;
+            } else if (p_pack_) {
                 // Queued on the backend's stream, so it both orders after graph A
                 // and lands in pinned memory: one wait, one DMA, where this used
                 // to be a synchronize followed by a pageable copy the driver
@@ -2446,7 +2559,8 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
             ggml_backend_tensor_set(h_cur_, pk, 0, (size_t) T * n_embd * sizeof(float));   // host tensor: a memcpy
             const float * pw = pk + T * n_embd, * ps = pw + U * T, * pp = ps + U * T, * pc = pp + QWFN_SPEC_MAX * T;
             for (int64_t k = 0; k < U * T; k++) { wgt_[k] = pw[k]; sel_[k] = (int32_t) lrintf(ps[k]); }
-            for (int64_t k = 0; k < (int64_t) QWFN_SPEC_MAX * T; k++) { pred_next_[k] = (int32_t) lrintf(pp[k]); scores_next_[k] = pc[k]; }
+            if (!ran_split)
+                for (int64_t k = 0; k < (int64_t) QWFN_SPEC_MAX * T; k++) { pred_next_[k] = (int32_t) lrintf(pp[k]); scores_next_[k] = pc[k]; }
         } else {
             if (gA_async) ggml_backend_synchronize(w_.backend());
             ggml_backend_tensor_get(t_sel_, sel_.data(), 0, (size_t) U * T * sizeof(int32_t));
@@ -2773,6 +2887,14 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 struct timed { double & t; std::chrono::steady_clock::time_point t0; ~timed() { t += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); } } timed_{t_prefetch, std::chrono::steady_clock::now()};
                 if (prefetched || !cfg_.speculate || il + 1 >= hp_.n_layer) return;
                 prefetched = true;
+                if (pred_pending_) {   // early routing: graph A2's prediction, behind ev_pred_
+                    const auto tpw = std::chrono::steady_clock::now();
+                    ggml_backend_event_synchronize(ev_pred_);
+                    t_pred_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - tpw).count();
+                    const float * pp = (const float *) p_pack_->data + (size_t) T * (n_embd + 2 * U), * pc = pp + QWFN_SPEC_MAX * T;
+                    for (int64_t k = 0; k < (int64_t) QWFN_SPEC_MAX * T; k++) { pred_next_[k] = (int32_t) lrintf(pp[k]); scores_next_[k] = pc[k]; }
+                    pred_pending_ = false;
+                }
                 const uint32_t depth = std::min<uint32_t>(QWFN_SPEC_MAX, std::max<uint32_t>((uint32_t) U, cfg_.speculate_depth));
                 const uint32_t K = QWFN_SPEC_MAX;
                 pred_.resize(K * T); spec_scores_.resize(K * T); pred_margin_.resize(K * T);
@@ -2813,7 +2935,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                 }
                 ec_.prefetch_begin(sets, n_sets);
             };
-            if (!had_miss || prefetch_early) issue_prefetch();
+            // Under early routing the prediction is graph A2's, still running: an early
+            // issue would wait for it before the CPU experts, which is the wait the split removes.
+            if ((!had_miss || prefetch_early) && !ran_split) issue_prefetch();
 
             if (!packed) {
                 ggml_backend_tensor_get(t_cur_, xfer_.data(), 0, (size_t) n_embd * T * sizeof(float));
@@ -2933,8 +3057,9 @@ bool engine::eval_batch(const int32_t * hist, int32_t n_hist, int32_t T, std::st
                     err = "expert read failed"; if (ibuf) ggml_backend_buffer_free(ibuf); if (ictx) ggml_free(ictx); return false;
                 }
                 { const double dtw = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count(); t_io += dtw; prof_io_end[il] += dtw; }
-                issue_prefetch();                  // no-op if already issued
+                if (!ran_split) issue_prefetch();  // no-op if already issued
                 add_cpu(all_cpu, true);            // one group, selection order
+                issue_prefetch();                  // early routing: after the CPU experts, A2 has had their time
                 if (t_rscale_) { const float one = 1.0f; ggml_backend_tensor_set(t_rscale_, &one, 0, 4); }
             }
             moe_gpu_settle();                      // t_pg_ is complete past this point

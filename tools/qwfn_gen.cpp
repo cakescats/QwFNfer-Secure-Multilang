@@ -508,6 +508,8 @@ int main(int argc, char ** argv) {
     printf("decode split: graphA(GPU) %.2f s | MoE gpu %.2f s (%llu experts, sync-wait %.2f s) | MoE cpu %.2f s (%llu experts) | io %.2f s\n",
            eng.t_layerA, eng.t_moe_gpu, (unsigned long long) eng.n_exp_gpu, eng.t_moe_gpu_sync,
            eng.t_moe_cpu, (unsigned long long) eng.n_exp_cpu, eng.t_io);
+    printf("              host waits: readback %.2f s | settle promotions %.2f s | prediction (early routing) %.2f s | prefetch %.2f s\n",
+           eng.t_readback, eng.t_settle_promo, eng.t_pred_wait, eng.t_prefetch);
     if (eng.n_exp_cpu && eng.n_exp_gpu)
         printf("              per expert: gpu %.0f us, cpu %.0f us  (%.1fx)\n",
                eng.t_moe_gpu / eng.n_exp_gpu * 1e6, eng.t_moe_cpu / eng.n_exp_cpu * 1e6,

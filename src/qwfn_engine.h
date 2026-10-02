@@ -377,6 +377,7 @@ public:
     uint64_t n_pf_gA_attn = 0, n_pf_gA_dn = 0;
     double t_moe_gpu = 0, t_moe_cpu = 0, t_layerA = 0;   // where decode time goes
     double t_readback = 0, t_prefetch = 0, t_settle_promo = 0, t_uploads = 0, t_head = 0;   // decode host work between the graphs
+    double t_pred_wait = 0;   // early routing: waiting for graph A2's prediction before the prefetch
     uint64_t n_upload_skip = 0;   // decode copies skipped because the device already held the zeros
     // The GPU MoE runs asynchronously, overlapped with the expert I/O wait and
     // the CPU MoE. t_moe_gpu then counts launch cost plus whatever the final
@@ -474,6 +475,14 @@ private:
         ggml_gallocr_t ga  = nullptr;
     };
     std::vector<layer_graph> gA_;
+    // Early routing (QWFN_EARLY_ROUTE=1): a decode layer's graph A ends at the router
+    // and gA2_ runs the rest -- shared expert, VRAM-resident experts, next-layer
+    // prediction -- while the host already works on the routing. Empty when the
+    // layer's cached graph is not split.
+    std::vector<layer_graph> gA2_;
+    ggml_backend_event_t ev_route_ = nullptr;   // the routing landed in p_pack_
+    ggml_backend_event_t ev_pred_  = nullptr;   // the next-layer prediction landed in p_pack_
+    bool pred_pending_ = false;                 // this layer's prediction is read after ev_pred_
     std::vector<int64_t>     gA_bucket_;   // attention layers: the block bucket the graph was built for
 
     // Decode-time sparse attention state; see graph_builder::sparse_attn_decode.

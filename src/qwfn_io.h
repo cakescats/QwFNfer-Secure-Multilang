@@ -101,6 +101,9 @@ public:
 
     size_t in_flight() const { return in_flight_; }
     bool   direct_io() const { return direct_; }
+    // Reads land in a per-worker buffer and are copied into place (the thread
+    // backend with 512-byte slots on a stack that wants 4096; see bounce_).
+    bool   bounces() const { return bounce_ && be_ == backend::threads; }
 
     // Offset within dst where the requested bytes actually begin.
     uint32_t payload_offset(uint64_t offset) const { return direct_ ? dio_pad(offset) : 0; }

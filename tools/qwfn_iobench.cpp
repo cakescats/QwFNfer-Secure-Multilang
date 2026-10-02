@@ -8,6 +8,7 @@
 #include "qwfn_expert_cache.h"
 #include "qwfn_io.h"
 #include "qwfn_model.h"
+#include "qwfn_pack.h"
 #include "qwfn_plat.h"
 #include "qwfn_ple.h"
 
@@ -121,6 +122,56 @@ static void bench_ceiling(model_index & mi, unsigned qd, int n_tokens_equiv,
         const double dt = secs(t0, clk::now());
         printf("  QD %-3u : %6.2f GB/s   %8.1f MB/token   -> %6.2f tok/s if every access misses\n",
                depth, bytes / dt / 1e9, bytes / 1e6 / n_tokens_equiv, n_tokens_equiv / dt);
+    }
+    for (auto b : bufs) dio_free(b);
+}
+
+// The same uniform miss pattern, read as whole expert blocks from an expert pack
+// (qwfn-pack): one request per expert instead of one per part. Run next to
+// bench_ceiling at the pack's slot alignment, so both see the engine's I/O path.
+static void bench_pack(model_index & mi, const pack_layout & L, const std::string & pack_path, unsigned qd,
+                       int n_tokens_equiv, io_engine::backend be) {
+    printf("\n== expert blocks from the pack over %s (one read per expert, every access a miss) ==\n",
+           be == io_engine::backend::threads ? "a pool of worker threads" : "the async engine");
+    std::string err;
+    io_engine io;
+    if (!io.init({ pack_path }, qd, true, err, be)) { printf("  init failed: %s\n", err.c_str()); return; }
+    const hparams & hp = mi.hp();
+    const uint32_t k = hp.n_expert_used;
+    std::mt19937_64 g(1234);
+    zipf z; z.init(hp.n_expert, 0.0);
+    const size_t MAXREQ = 64;
+    std::vector<uint8_t *> bufs(MAXREQ);
+    for (auto & b : bufs) b = (uint8_t *) dio_alloc(4u << 20);
+    for (unsigned depth : {2u, 4u, 8u, 16u, 32u}) {
+        if (depth > qd) continue;
+        std::vector<uint32_t> ids;
+        std::vector<io_request> reqs;
+        uint64_t tags[256], bytes = 0;
+        const auto t0 = clk::now();
+        for (int t = 0; t < n_tokens_equiv; t++) {
+            for (uint32_t il = 0; il < hp.n_layer; il++) {
+                pick_experts(z, g, hp.n_expert, k, ids);
+                reqs.clear();
+                const pack_layer & pl = L.layers[il];
+                for (uint32_t i = 0; i < k; i++) {
+                    reqs.push_back(io_request{ 0, pl.offset + (uint64_t) ids[i] * pl.stride, pl.block_bytes, bufs[reqs.size() % MAXREQ], 0 });
+                    for (int q = 0; q < EXPERT_NPARTS; q++) bytes += pl.part_bytes[q];
+                }
+                size_t sub = 0;
+                while (sub < reqs.size()) {
+                    const size_t want = std::min<size_t>(depth - io.in_flight(), reqs.size() - sub);
+                    const size_t got = want ? io.submit(reqs.data() + sub, want) : 0;
+                    sub += got;
+                    if (io.in_flight() >= depth || (got == 0 && io.in_flight())) io.reap(tags, 256, 1);
+                }
+                while (io.in_flight()) io.reap(tags, 256, 1);
+            }
+        }
+        const double dt = secs(t0, clk::now());
+        printf("  QD %-3u : %6.2f GB/s   %8.1f MB/token   -> %6.2f tok/s if every access misses%s\n",
+               depth, bytes / dt / 1e9, bytes / 1e6 / n_tokens_equiv, n_tokens_equiv / dt,
+               io.stat_errors ? "   (READ ERRORS)" : "");
     }
     for (auto b : bufs) dio_free(b);
 }
@@ -253,10 +304,12 @@ int main(int argc, char ** argv) {
             "                        clamped to 60%% of MemAvailable minus 3 GB headroom)\n"
             "  --alpha <f>           zipf skew for simulated routing (default 0.9)\n"
             "  --tokens <n>          tokens to simulate (default 40)\n"
-            "  --skip-mmap           do not run the demand-paging comparison\n");
+            "  --skip-mmap           do not run the demand-paging comparison\n"
+            "  --pack <file.qwpk>    also read whole expert blocks from an expert pack (qwfn-pack),\n"
+            "                        both runs at the pack's slot alignment, as the engine reads\n");
         return 1;
     }
-    std::string cold_path;
+    std::string cold_path, pack_path;
     double ram_gb = 4.0, alpha = 0.9;   // conservative default: the arena is anonymous RAM
     int n_tokens = 40;
     bool skip_mmap = false;
@@ -267,6 +320,7 @@ int main(int argc, char ** argv) {
         else if (a == "--alpha" && i + 1 < argc) alpha = atof(argv[++i]);
         else if (a == "--tokens" && i + 1 < argc) n_tokens = atoi(argv[++i]);
         else if (a == "--skip-mmap") skip_mmap = true;
+        else if (a == "--pack" && i + 1 < argc) pack_path = argv[++i];
     }
 
     model_index mi;
@@ -281,6 +335,17 @@ int main(int argc, char ** argv) {
         else fprintf(stderr, "cold tier unavailable: %s\n", err.c_str());
     }
 
+    if (!pack_path.empty()) {
+        pack_layout L;
+        if (!pack_open(pack_path, mi, L, err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+        set_dio_align(L.dio_align);   // what engine::init picks for this file
+        printf("\nexpert pack %s: %u-byte slots\n", pack_path.c_str(), L.dio_align);
+        for (auto be : { io_engine::backend::async, io_engine::backend::threads }) {
+            bench_ceiling(mi, 64, 3, be);
+            bench_pack(mi, L, pack_path, 64, 3, be);
+        }
+        return 0;
+    }
     bench_ceiling(mi, 64, 3, io_engine::backend::async);
     bench_ceiling(mi, 64, 3, io_engine::backend::threads);
     if (!skip_mmap) bench_mmap(mi, 1);

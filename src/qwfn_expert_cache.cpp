@@ -1,4 +1,5 @@
 #include "qwfn_expert_cache.h"
+#include "qwfn_pack.h"
 
 #include <algorithm>
 #include <vector>
@@ -24,12 +25,45 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
     cold_ = cfg.use_cold_tier ? cold : nullptr;
     cfg_  = cfg;
 
-    if (!io_hot_.init(hot->shard_paths(), cfg.queue_depth, /*direct_io=*/true, err, cfg.io_backend)) return false;
+    // The expert pack, when given and built from this checkpoint for this slot
+    // alignment, opens as one more shard after the hot ones (and, for the
+    // prefetch engine, after the cold ones). Any mismatch leaves it off.
+    pack_layout pack;
+    bool use_pack = false;
+    pack_shard_hot_ = pack_shard_pf_ = -1;
+    pack_off_.assign(hot->hp().n_layer, 0);
+    pack_stride_.assign(hot->hp().n_layer, 0);
+    if (!cfg.pack_path.empty()) {
+        std::string perr;
+        if (!pack_open(cfg.pack_path, *hot, pack, perr))
+            fprintf(stderr, "[qwfn] expert pack not used: %s\n", perr.c_str());
+        else if (pack.dio_align != dio_align())
+            fprintf(stderr, "[qwfn] expert pack not used: built for %u-byte slots, the engine runs %llu-byte slots\n",
+                    pack.dio_align, (unsigned long long) dio_align());
+        else
+            use_pack = true;
+    }
+
+    std::vector<std::string> hotp = hot->shard_paths();
+    if (use_pack) { pack_shard_hot_ = (int) hotp.size(); hotp.push_back(cfg.pack_path); }
+    if (!io_hot_.init(hotp, cfg.queue_depth, /*direct_io=*/true, err, cfg.io_backend)) return false;
+    // Through the bounce copy one 3 MiB block costs one worker a 3 MiB memcpy
+    // where three part reads spread it over three: measured 2026-10-02 on the Q4
+    // file, the pack made the thread backend slower (7.83 -> 7.64 tok/s, read
+    // wait 56 -> 64 ms/token) while io_uring, which reads in place, gained
+    // (8.36 -> 8.64 tok/s, 47 -> 40 ms/token).
+    if (use_pack && io_hot_.bounces()) {
+        fprintf(stderr, "[qwfn] expert pack not used: the thread I/O backend copies every read through a bounce "
+                        "buffer here, which makes whole-block reads slower; run with --io-uring to use it\n");
+        use_pack = false;
+        pack_shard_hot_ = -1;
+    }
     {
         // The prefetch reads either file: hot shards first, the cold ones after.
         std::vector<std::string> pfp = hot->shard_paths();
         n_hot_shards_ = (uint32_t) pfp.size();
         if (cold_) for (const auto & p : cold_->shard_paths()) pfp.push_back(p);
+        if (use_pack) { pack_shard_pf_ = (int) pfp.size(); pfp.push_back(cfg.pack_path); }
         if (!io_pf_.init(pfp, cfg.queue_depth, /*direct_io=*/true, err, cfg.io_backend)) return false;
     }
     if (cold_ && !io_cold_.init(cold_->shard_paths(), cfg.queue_depth, true, err, cfg.io_backend)) {
@@ -83,6 +117,21 @@ bool expert_cache::init(const model_index * hot, const model_index * cold,
             off += part_slot;
         }
         lp.block_bytes = off;
+        // The pack serves this layer only if its block is this slot, byte for byte
+        // (a cold tier with larger parts changes the slot; then the GGUF parts).
+        if (use_pack) {
+            const pack_layer & pl = pack.layers[il];
+            bool same = pl.block_bytes == lp.block_bytes;
+            for (int q = 0; q < EXPERT_NPARTS; q++)
+                same = same && pl.part_off[q] == lp.part_off[q] && pl.part_pay[q] == lp.part_pay[q] && pl.part_bytes[q] == lp.part_bytes[q];
+            if (same) { pack_off_[il] = pl.offset; pack_stride_[il] = pl.stride; }
+        }
+    }
+    if (use_pack) {
+        uint32_t n = 0;
+        for (uint32_t il = 0; il < n_layer; il++) n += pack_stride_[il] != 0;
+        fprintf(stderr, "[qwfn] expert pack: %s serves %u of %u layers (one read per expert block)\n",
+                cfg.pack_path.c_str(), n, n_layer);
     }
 
     // Never take more RAM than the kernel says it can spare. On a 30 GB box
@@ -811,7 +860,13 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
         live_.push_back(v);
 
         uint8_t * base = slot_ptr(lp, (uint32_t) v);
-        for (int q = 0; q < EXPERT_NPARTS; q++) {
+        if (!take_cold) {
+            const uint64_t pb = hot_block_reqs(lp, layer, e, base, (uint64_t) n_miss, pack_shard_hot_, [&](const io_request & r) {
+                push_pieces(r, [&](const io_request & p) { req_cold[n_req] = false; reqs[n_req++] = p; });
+            });
+            if (!pb) return false;
+            st_.bytes_from_disk += pb;
+        } else for (int q = 0; q < EXPERT_NPARTS; q++) {
             const byte_range br = src->expert_range(layer, e, (expert_part) q);
             if (!br.valid()) return false;
             push_pieces(io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], (uint64_t) n_miss },
@@ -869,23 +924,40 @@ bool expert_cache::fetch_begin(uint32_t layer, const uint32_t * expert_ids, uint
     return true;
 }
 
+template <class F>
+uint64_t expert_cache::hot_block_reqs(const layer_pool & lp, uint32_t layer, uint32_t e,
+                                      uint8_t * base, uint64_t tag, int pack_shard, F && push) const {
+    uint64_t payload = 0;
+    for (int q = 0; q < EXPERT_NPARTS; q++) payload += lp.part_bytes[q];
+    if (pack_shard >= 0 && pack_stride_[layer] != 0) {
+        // The block as the slot holds it: offset and length are dio_align()
+        // multiples, so the read lands at `base` and every part pointer holds.
+        push(io_request{ pack_shard, pack_off_[layer] + (uint64_t) e * pack_stride_[layer], lp.block_bytes, base, tag });
+        return payload;
+    }
+    for (int q = 0; q < EXPERT_NPARTS; q++) {
+        const byte_range br = hot_->expert_range(layer, e, (expert_part) q);
+        if (!br.valid()) return 0;
+        push(io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], tag });
+    }
+    return payload;
+}
+
 bool expert_cache::read_block_now(layer_pool & lp, uint32_t layer, int32_t slot, uint32_t expert) {
     io_request reqs[EXPERT_NPARTS];
+    size_t n_req = 0;
     uint8_t * base = slot_ptr(lp, (uint32_t) slot);
-    for (int q = 0; q < EXPERT_NPARTS; q++) {
-        const byte_range br = hot_->expert_range(layer, expert, (expert_part) q);
-        if (!br.valid()) return false;
-        reqs[q] = io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], 0 };
-        st_.bytes_from_disk += br.nbytes;
-    }
+    const uint64_t pb = hot_block_reqs(lp, layer, expert, base, 0, pack_shard_hot_, [&](const io_request & r) { reqs[n_req++] = r; });
+    if (!pb) return false;
+    st_.bytes_from_disk += pb;
     size_t submitted = 0; uint64_t tags[16]; size_t reaped = 0;
-    while (submitted < EXPERT_NPARTS) {
-        const size_t k = io_hot_.submit(reqs + submitted, EXPERT_NPARTS - submitted);
+    while (submitted < n_req) {
+        const size_t k = io_hot_.submit(reqs + submitted, n_req - submitted);
         if (k == 0) { const size_t got = io_hot_.reap(tags, 16, 1); if (got == 0) return false; reaped += got; continue; }
         submitted += k;
     }
-    while (reaped < EXPERT_NPARTS) { const size_t got = io_hot_.reap(tags, 16, EXPERT_NPARTS - reaped); if (got == 0) return false; reaped += got; }
-    st_.n_reads += EXPERT_NPARTS;
+    while (reaped < n_req) { const size_t got = io_hot_.reap(tags, 16, n_req - reaped); if (got == 0) return false; reaped += got; }
+    st_.n_reads += n_req;
     lp.slot_valid[slot] = 1;
     lp.slot_cold[slot]  = 0;
     return true;
@@ -923,13 +995,12 @@ bool expert_cache::fetch_batch(uint32_t layer, const uint32_t * expert_ids, uint
         }
         uint8_t * base = adopt >= 0 ? slot_ptr(lp, (uint32_t) adopt) : bounce + (size_t) n_miss * lp.block_bytes;
         if (adopt < 0) n_miss++;
+        const uint64_t pb = hot_block_reqs(lp, layer, e, base, 0, pack_shard_hot_, [&](const io_request & r) { reqs.push_back(r); });
+        if (!pb) return false;
+        st_.bytes_from_disk += pb;
         for (int q = 0; q < EXPERT_NPARTS; q++) {
-            const byte_range br = hot_->expert_range(layer, e, (expert_part) q);
-            if (!br.valid()) return false;
-            reqs.push_back(io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], 0 });
             out[i].part[q] = base + lp.part_off[q] + lp.part_pay[q];
             out[i].type[q] = lp.part_type[q];
-            st_.bytes_from_disk += br.nbytes;
         }
         out[i].buffer = adopt >= 0 ? arena_buf_ : nullptr; out[i].on_gpu = false; out[i].from_cold = false; out[i].slot = adopt;
         if (adopt >= 0) {
@@ -1025,11 +1096,8 @@ void expert_cache::prefetch(uint32_t layer, const uint32_t * expert_ids, uint32_
         lp.slot_freq[v]   = 1;
         lp.expert_slot[e] = v;
         uint8_t * base = slot_ptr(lp, (uint32_t) v);
-        for (int q = 0; q < EXPERT_NPARTS; q++) {   // prefetches always take full precision
-            const byte_range br = hot_->expert_range(layer, e, (expert_part) q);
-            if (!br.valid()) continue;
-            reqs[n_req++] = io_request{ br.shard, br.offset, br.nbytes, base + lp.part_off[q], 0 };
-        }
+        // prefetches always take full precision
+        hot_block_reqs(lp, layer, e, base, 0, pack_shard_hot_, [&](const io_request & r) { reqs[n_req++] = r; });
     }
     if (!n_req) return;
 
@@ -1379,10 +1447,14 @@ void expert_cache::prefetch_begin(const pf_set * sets, uint32_t n_sets) {
             const bool pf_cold = cold_ != nullptr && !lp.hotw[e];   // the tail comes from the cold file
             lp.slot_cold[v] = pf_cold ? 1 : 0;
             if (pf_cold) st_.cold_tier_reads++;
-            for (int q = 0; q < EXPERT_NPARTS; q++) {
-                const byte_range br = (pf_cold ? cold_ : hot_)->expert_range(layer, e, (expert_part) q);
+            if (!pf_cold) {
+                st_.bytes_from_disk += hot_block_reqs(lp, layer, e, base, tag, pack_shard_pf_, [&](const io_request & r) {
+                    push_pieces(r, [&](const io_request & p) { reqs[n_req++] = p; ent.remaining++; });
+                });
+            } else for (int q = 0; q < EXPERT_NPARTS; q++) {
+                const byte_range br = cold_->expert_range(layer, e, (expert_part) q);
                 if (!br.valid()) continue;
-                push_pieces(io_request{ br.shard + (pf_cold ? (int) n_hot_shards_ : 0), br.offset, br.nbytes, base + lp.part_off[q], tag },
+                push_pieces(io_request{ br.shard + (int) n_hot_shards_, br.offset, br.nbytes, base + lp.part_off[q], tag },
                             [&](const io_request & p) { reqs[n_req++] = p; ent.remaining++; });
                 st_.bytes_from_disk += br.nbytes;
             }
