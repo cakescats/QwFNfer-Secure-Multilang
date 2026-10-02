@@ -90,6 +90,9 @@
               <label><span class="lbl">Thinking budget (tokens, 0 = none) <span class="tip" data-tip="Cap on reasoning tokens per answer. 6000 keeps a hard think under about eight minutes at Q4 speed, inside the timeouts most harnesses have; the model is told time is up and answers from what it has. 0 lifts the cap.">?</span></span><input id="think_budget" type="number" min="0" step="500"></label>
               <label><span class="lbl">Skip missed experts <span class="tip" data-tip="Compute a token without the experts that are still on the NVMe instead of waiting for them. Faster decode at a small, measured quality cost: the output is no longer exact. Cannot be combined with the draft head.">?</span></span><select id="skip_miss"><option value="false">off</option><option value="true">on</option></select></label>
               <label><span class="lbl">Speculative block <span class="tip" data-tip="Predict the next layer's experts by running that layer's own block on the current residual, and fetch them while the current layer computes. The output is exact; on by default because it was never measured slower.">?</span></span><select id="spec_block"><option value="true">on</option><option value="false">off</option></select></label>
+              <label><span class="lbl">Early routing <span class="tip" data-tip="Each decode layer reads its routing back as soon as the router has run, so the CPU computes its experts while the GPU finishes the layer (shared expert, VRAM experts, next-layer prediction). The output is identical. Measured on the reference machine: +3.6% decode. Needs the ggml shipped with the bundle (its larger CUDA graph cache); on by default there.">?</span></span><select id="early_route"><option value="true">on</option><option value="false">off</option></select></label>
+              <label><span class="lbl">Expert pack <span class="tip" data-tip="The routed experts repacked one block per expert (qwfn-pack): a miss is one read instead of three, and the server then reads over io_uring. The output is identical. Measured on the reference machine: +6.4% decode. Build it once below; it takes about a minute and as much disk as the experts. Linux only.">?</span></span><select id="use_pack"><option value="true">use</option><option value="false">off</option></select></label>
+              <div class="row" style="grid-column:1/-1"><span class="muted" id="pack_state" style="font-size:12px">—</span><button class="secondary" type="button" id="pack_build">Build the expert pack</button></div>
               <label><span class="lbl">Draft head (MTP) <span class="tip" data-tip="The checkpoint's draft head (MTP/mtp-*.gguf): it proposes the token after next and the trunk verifies it as a two-token step, so the output stays the trunk's own; at temperature the draft is sampled from the head's distribution and accepted by the speculative-sampling rule, which keeps the trunk's exact distribution. It drafts after any prompt, streamed ones included. Measured on the reference machine (2026-09-10): +7-8% on the short and 43K-document replays at ~80% acceptance, and through OpenCode on a coding task +12% on Q4 and +19% on Q3 at 95-96% acceptance. It costs one tier step of VRAM and 2.7 GB of pinned RAM, both counted in the plan. On by default when the file is there. See docs/TESTING.md for the numbers on a 16 GB laptop GPU.">?</span></span><select id="mtp"><option value="false">off</option><option value="true">on</option></select></label>
               <label><span class="lbl">Vision (image input) <span class="tip" data-tip="Load the vision projector (mmproj-*.gguf) so images in requests are understood. It runs on the CPU: its 0.9 GB of weights stay in RAM and the encode uses the cores (about 15 s for a 1400x1000 screenshot, 0.3 s for a small image), so vision costs no VRAM at all and the expert tier keeps its size. On by default whenever the file is next to the model; off gives a text-only server and 0.9 GB more for the RAM tier.">?</span></span><select id="vision"><option value="true">on</option><option value="false">off</option></select></label>
               <label><span class="lbl">Attention state in RAM <span class="tip" data-tip="Where the attention caches live. 'indexer cache' keeps the indexer keys (3 MB per 1K tokens of context) in pinned RAM, read over PCIe at about 0.35 ms per token; 'indexer + KV cache' also moves the KV cache (7 MB per 1K tokens at q4_0) at about 2 ms per token. The VRAM they free goes to the expert tier: about 4% of decode per GB at 128K, and the difference between an expert tier and none at 256K (measured 7.0 to 9.7 tok/s). The tiers pick it per context: indexer from 64K, both from 128K (measured +5% decode at 126K) or whenever the tier would not fit otherwise.">?</span></span><select id="state_host"><option value="none">off (all in VRAM)</option><option value="idx">indexer cache</option><option value="kv,idx">indexer + KV cache</option></select></label>
@@ -344,6 +347,7 @@ function renderPlan() {
     (e.vram_tier_gb > 0 ? `expert tier <b>${e.vram_tier_gb} GB</b> of VRAM (~${commas(e.vram_tier_blocks)} experts, ${(e.vram_served*100).toFixed(0)}% of lookups) + <b>${$('ram').value} GB</b> of RAM` : `<b>no VRAM expert tier</b> at this context on this GPU (experts from <b>${$('ram').value} GB</b> of RAM and the NVMe)`) +
     ` · <b>${$('threads').value}</b> threads · predicted <b>${fmt(e.decode_tps_short)}</b> tok/s in chat, <b>${fmt(e.decode_tps_long_doc)}</b> on a long document, prefill ~<b>${e.prefill_tps_long}</b> tok/s · ` +
     `<b>${shName}</b>${e.state_host_gb ? ' (' + e.state_host_gb + ' GB)' : ''} · vision <b>${$('vision').value === 'true' ? 'on' : 'off'}</b> · draft head <b>${$('mtp').value === 'true' ? 'on' : 'off'}</b> · thinking <b>${$('think').value}</b>`;
+  $('plan').innerHTML += ` · expert pack <b>${$('use_pack').value === 'true' ? 'on' : 'off'}</b> · early routing <b>${$('early_route').value === 'true' ? 'on' : 'off'}</b>`;
   const cal = reco.calibration || {};
   $('reasons').innerHTML = `KV cache ${reco.kv_reason || ''}. RAM tier ${reco.ram_reason || ''}. ${reco.state_reason || ''}.` + (cal.date ? ` Tuned on this machine ${cal.date}: ${cal.threads ? cal.threads + ' threads' : ''}${cal.nvme_gbs ? ', drive ' + fmt(cal.nvme_gbs) + ' GB/s' : ''}${cal.host_other_gb ? ', the server needs ' + fmt(cal.host_other_gb) + ' GB besides the tier' : ''}.` : ' Not tuned on this machine yet: the numbers are the cost model\'s predictions from the reference machine\'s constants, and the RAM tier keeps 2 GB for the estimate\'s uncertainty until the tune has measured it.');
 }
@@ -360,6 +364,10 @@ function fillForm(r) {
   if (r.state_host) $('state_host').value = r.state_host;
   const mon = $('mtp').options[1]; mon.disabled = !r.mtp_file; mon.textContent = r.mtp_file ? 'on' : 'unavailable (no MTP file)';
   $('mtp').value = String(!!r.mtp);
+  $('early_route').value = String(!!r.early_route);
+  const pon = $('use_pack').options[0]; pon.disabled = !r.pack; pon.textContent = r.pack ? `use (${r.pack_gb} GB)` : 'unavailable (no pack yet)';
+  $('use_pack').value = String(!!r.pack && r.use_pack !== false);
+  renderPack();
   const e = r.estimates;
   $('est').innerHTML = `<span>VRAM expert tier <b>${e.vram_tier_gb > 0 ? e.vram_tier_gb + ' GB' : 'none'}</b> (~${e.vram_tier_blocks} blocks, ${(e.vram_served*100).toFixed(0)}% of lookups served from VRAM)</span><span>prefill batch <b>${r.batch}</b>${e.prefill_tps_long ? ` (~${e.prefill_tps_long} tok/s on a long document; lends ${e.lend_gb} GB of the tier while a prompt streams)` : ''}</span><span>KV + state <b>${e.state_vram_gb} GB</b> in VRAM${e.state_host_gb ? ` + <b>${e.state_host_gb} GB</b> in RAM` : ''}</span><span>dense core <b>${e.dense_core_gb} GB</b></span>${r.vision ? `<span>vision projector <b>${e.mmproj_gb} GB</b> in RAM, on the CPU</span>` : ''}<span>predicted decode <b>${fmt(e.decode_tps_short)}</b> tok/s in chat, <b>${fmt(e.decode_tps_long_doc)}</b> on a long document</span>`;
   $('delcustom').hidden = !r.custom_saved;
@@ -373,7 +381,7 @@ async function loadReco() {
   if (ctxChoice !== null) qs.set('ctx', ctxChoice);
   const r = await api('/api/recommend?' + qs.toString()); if (r.error) return; reco = r;
   if (!(presetId === 'custom' && customDirty)) presetId = r.preset;
-  const keep = presetId === 'custom' && customDirty ? { ram: $('ram').value, threads: $('threads').value, batch: $('batch').value, reserve: $('reserve').value, port: $('port').value, think: $('think').value, think_budget: $('think_budget').value, skip_miss: $('skip_miss').value, spec_block: $('spec_block').value, mtp: $('mtp').value } : null;
+  const keep = presetId === 'custom' && customDirty ? { ram: $('ram').value, threads: $('threads').value, batch: $('batch').value, reserve: $('reserve').value, port: $('port').value, think: $('think').value, think_budget: $('think_budget').value, skip_miss: $('skip_miss').value, spec_block: $('spec_block').value, mtp: $('mtp').value, early_route: $('early_route').value, use_pack: $('use_pack').value } : null;
   fillForm(r);
   if (keep) { Object.keys(keep).forEach(k => { if (!['ram','threads','batch','reserve'].includes(k) || !['ctx','kv','state_host','vision'].includes(lastChanged)) $(k).value = keep[k]; }); }
   models.forEach(m => m.tuned_date = (r.tune && r.tune.model === m.name) ? r.tune.date : m.tuned_date);
@@ -386,7 +394,7 @@ $('ctx').onchange = () => { markCustom('ctx'); ctxChoice = +$('ctx').value; load
 $('kv').onchange = () => { markCustom('kv'); kvChoice = $('kv').value; ctxChoice = +$('ctx').value; loadReco(); };
 $('vision').onchange = () => { markCustom('vision'); visionChoice = $('vision').value === 'true'; ctxChoice = +$('ctx').value; loadReco(); };
 $('state_host').onchange = () => { markCustom('state_host'); stateChoice = $('state_host').value; ctxChoice = +$('ctx').value; loadReco(); };
-['ram','threads','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp'].forEach(k => $(k).addEventListener('change', () => { markCustom(k); renderPresets(); renderPlan(); }));
+['ram','threads','batch','reserve','port','think','think_budget','skip_miss','spec_block','mtp','early_route','use_pack'].forEach(k => $(k).addEventListener('change', () => { markCustom(k); renderPresets(); renderPlan(); }));
 const CPUSETS = { p_phys: 'P-cores', p_smt: 'P-cores + SMT', phys: 'physical cores', all: 'all logical CPUs' };
 $('cpuauto').onchange = async () => { const r = await post('/api/config', { cpu_auto: $('cpuauto').checked }); $('custommsg').textContent = r.error || (r.cpu_auto ? 'CPU cores: picked by the next auto-tune' : 'CPU cores: the manual choice applies from the next server start'); await loadReco(); };
 $('cpumode').onchange = async () => { const r = await post('/api/config', { cpu_mode: $('cpumode').value }); $('custommsg').textContent = r.error || (r.cpu_mode === 'pcores' ? 'P-cores only: takes effect when the server is next started' : 'all cores: takes effect when the server is next started'); await loadReco(); };
@@ -395,6 +403,7 @@ function settings() {
   return { ctx: +$('ctx').value, kv: $('kv').value, ram: +$('ram').value, threads: +$('threads').value, batch: +$('batch').value, reserve: +$('reserve').value,
            port: +$('port').value, think: $('think').value, think_budget: +$('think_budget').value, skip_miss: $('skip_miss').value === 'true',
            spec_block: $('spec_block').value === 'true', vision: $('vision').value === 'true', mtp: $('mtp').value === 'true',
+           early_route: $('early_route').value === 'true', use_pack: $('use_pack').value === 'true',
            state_host: $('state_host').value, preset: presetId, cpu: $('cpumode').value, cpuset: $('cpumode').value === 'auto' && reco ? reco.cpuset : null };
 }
 $('savecustom').onclick = async () => {
@@ -406,6 +415,25 @@ $('savecustom').onclick = async () => {
 $('delcustom').onclick = async () => {
   const m = models.find(x => x.path === selected); if (!m) return;
   await post('/api/custom', { model: m.name, delete: true }); $('custommsg').textContent = 'custom tier deleted'; customDirty = false; presetId = 'coding'; await loadReco();
+};
+let packJob = null;
+function renderPack() {
+  const m = models.find(x => x.path === selected); if (!m) return;
+  const j = packJob;
+  $('pack_build').hidden = !!m.pack;
+  if (j && j.running) {
+    $('pack_build').disabled = true;
+    $('pack_state').textContent = j.model === m.name ? `building the expert pack: ${j.pct}% (${j.line})` : `building the expert pack of ${j.model}: ${j.pct}%`;
+    return;
+  }
+  $('pack_build').disabled = !!(j && !j.tool);
+  if (j && j.model === m.name && j.error) { $('pack_state').textContent = `expert pack: ${j.error}`; return; }
+  $('pack_state').textContent = m.pack ? `expert pack ready: ${m.pack_gb} GB (${m.pack})`
+    : (j && !j.tool ? 'expert pack: qwfn-pack is not next to the engine' : `no expert pack for this model yet: it goes to ${j ? j.pack_dir : 'the pack folder'}`);
+}
+$('pack_build').onclick = async () => {
+  const r = await post('/api/pack', { model: selected });
+  $('custommsg').textContent = r.error || 'building the expert pack…'; poll();
 };
 $('start').onclick = async () => {
   $('msg').textContent = 'starting…'; $('msg').className = 'muted'; $('start').disabled = true; $('tune').disabled = true;
@@ -613,6 +641,11 @@ async function pollLive() {
 async function poll() {
   let s; try { s = await api('/api/status'); } catch (e) { $('state').textContent = 'console unreachable'; return; }
   lastStatus = s;
+  if (s.pack_job) {
+    const was = packJob && packJob.running; packJob = s.pack_job;
+    if (was && !packJob.running && !packJob.error) { await loadModels(); await loadReco(); }
+    renderPack();
+  }
   $('modelid').textContent = s.model_id ? '(model: ' + s.model_id + ', OpenAI-compatible)' : ''; $('ep3').textContent = s.model_id || 'any'; $('ep5').textContent = s.model_id || 'qwen3.8-flash-next';
   setLocked(s);
   // While a server runs, the cards and the settings show what is being served.

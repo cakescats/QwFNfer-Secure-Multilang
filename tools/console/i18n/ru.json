@@ -519,8 +519,8 @@
    "<div><span>диск</span><b>${nv ? fmt(nv.gbs) + ' ГБ/с' : '—'}</b><span>${d.model || d.disk || 'случайные чтения по 2 МиБ'}${d.rotational ? ' · HDD' : ''}</span><small>${nv ? 'эталонный NVMe — 7.0' : 'не измерен'}</small></div>"
   ],
   [
-   "<div><span>threads</span><b>${r.threads}</b><span>of ${reco && reco.calibration ? reco.calibration.cpu_threads : '?'}</span><small>${r.sweep ? 'swept live on the server' : 'physical cores'}</small></div>",
-   "<div><span>потоки</span><b>${r.threads}</b><span>из ${reco && reco.calibration ? reco.calibration.cpu_threads : '?'}</span><small>${r.sweep ? 'подобрано на живом сервере' : 'по физическим ядрам'}</small></div>"
+   "<div><span>threads</span><b>${r.threads}</b><span>of ${reco && reco.calibration ? reco.calibration.cpu_threads : '?'}</span><small>${r.cpu ? `CPU ${r.cpu.set}` : r.sweep ? 'swept live on the server' : 'physical cores'}</small></div>",
+   "<div><span>потоки</span><b>${r.threads}</b><span>из ${reco && reco.calibration ? reco.calibration.cpu_threads : '?'}</span><small>${r.cpu ? `CPU ${r.cpu.set}` : r.sweep ? 'подобрано на живом сервере' : 'по физическим ядрам'}</small></div>"
   ],
   [
    "<div><span>KV cache</span><b>${r.plan.kv}</b><span>${r.plan.state_host !== 'none' ? 'state in RAM (' + r.plan.state_host + ')' : 'state in VRAM'}</span>",
@@ -1057,6 +1057,50 @@
   [
    "{ p_phys: 'P-cores', p_smt: 'P-cores + SMT', phys: 'physical cores', all: 'all logical CPUs' }",
    "{ p_phys: 'P-ядра', p_smt: 'P-ядра + гипертрединг', phys: 'физические ядра', all: 'все логические CPU' }"
+  ],
+  [
+   "Early routing <span class=\"tip\" data-tip=\"Each decode layer reads its routing back as soon as the router has run, so the CPU computes its experts while the GPU finishes the layer (shared expert, VRAM experts, next-layer prediction). The output is identical. Measured on the reference machine: +3.6% decode. Needs the ggml shipped with the bundle (its larger CUDA graph cache); on by default there.\">",
+   "Ранний роутинг <span class=\"tip\" data-tip=\"Каждый слой декода отдаёт роутинг сразу после роутера, и CPU считает своих экспертов, пока GPU досчитывает слой (общий эксперт, эксперты в VRAM, предсказание следующего слоя). Вывод тот же. Замер на эталонной машине: +3.6% к декоду. Нужна ggml из комплекта (у неё больше кэш CUDA-графов); там включено по умолчанию.\">"
+  ],
+  [
+   "Expert pack <span class=\"tip\" data-tip=\"The routed experts repacked one block per expert (qwfn-pack): a miss is one read instead of three, and the server then reads over io_uring. The output is identical. Measured on the reference machine: +6.4% decode. Build it once below; it takes about a minute and as much disk as the experts. Linux only.\">",
+   "Пакет экспертов <span class=\"tip\" data-tip=\"Маршрутизируемые эксперты, переупакованные по одному блоку на эксперта (qwfn-pack): промах читается одним запросом вместо трёх, а сервер читает через io_uring. Вывод тот же. Замер на эталонной машине: +6.4% к декоду. Соберите его один раз ниже: около минуты и столько же места на диске, сколько занимают эксперты. Только Linux.\">"
+  ],
+  [
+   "<select id=\"use_pack\"><option value=\"true\">use</option><option value=\"false\">off</option></select>",
+   "<select id=\"use_pack\"><option value=\"true\">использовать</option><option value=\"false\">выкл</option></select>"
+  ],
+  [
+   "id=\"pack_build\">Build the expert pack</button>",
+   "id=\"pack_build\">Собрать пакет экспертов</button>"
+  ],
+  [
+   "`use (${r.pack_gb} GB)` : 'unavailable (no pack yet)'",
+   "`использовать (${r.pack_gb} ГБ)` : 'недоступно (пакета ещё нет)'"
+  ],
+  [
+   "` · expert pack <b>${$('use_pack').value === 'true' ? 'on' : 'off'}</b> · early routing <b>${$('early_route').value === 'true' ? 'on' : 'off'}</b>`",
+   "` · пакет экспертов <b>${$('use_pack').value === 'true' ? 'вкл' : 'выкл'}</b> · ранний роутинг <b>${$('early_route').value === 'true' ? 'вкл' : 'выкл'}</b>`"
+  ],
+  [
+   "`building the expert pack: ${j.pct}% (${j.line})` : `building the expert pack of ${j.model}: ${j.pct}%`",
+   "`собирается пакет экспертов: ${j.pct}% (${j.line})` : `собирается пакет экспертов для ${j.model}: ${j.pct}%`"
+  ],
+  [
+   "`expert pack: ${j.error}`",
+   "`пакет экспертов: ${j.error}`"
+  ],
+  [
+   "`expert pack ready: ${m.pack_gb} GB (${m.pack})`",
+   "`пакет экспертов готов: ${m.pack_gb} ГБ (${m.pack})`"
+  ],
+  [
+   "'expert pack: qwfn-pack is not next to the engine' : `no expert pack for this model yet: it goes to ${j ? j.pack_dir : 'the pack folder'}`",
+   "'пакет экспертов: рядом с движком нет qwfn-pack' : `для этой модели пакета ещё нет: он ляжет в ${j ? j.pack_dir : 'папку пакетов'}`"
+  ],
+  [
+   "'building the expert pack…'",
+   "'собирается пакет экспертов…'"
   ]
  ],
  "messages": [
@@ -1419,6 +1463,30 @@
   [
    "cannot reach the model server: %s",
    "нет связи с сервером модели: %s"
+  ],
+  [
+   "a pack is already being built: %s",
+   "пакет уже собирается: %s"
+  ],
+  [
+   "qwfn-pack was not found next to the engine (build it: cmake --build build --target qwfn-pack)",
+   "рядом с движком нет qwfn-pack (соберите: cmake --build build --target qwfn-pack)"
+  ],
+  [
+   "expert packs are Linux-only for now (the engine reads them over io_uring)",
+   "пакеты экспертов пока только для Linux (движок читает их через io_uring)"
+  ],
+  [
+   "cannot start qwfn-pack: %s",
+   "не удалось запустить qwfn-pack: %s"
+  ],
+  [
+   "qwfn-pack exited with code %d",
+   "qwfn-pack завершился с кодом %d"
+  ],
+  [
+   "the build was cancelled",
+   "сборка отменена"
   ]
  ]
 }

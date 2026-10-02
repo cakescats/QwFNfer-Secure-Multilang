@@ -25,7 +25,7 @@ State lives in ~/.cache/qwfn-console (or $QWFN_CONSOLE_DIR): config.json (model
 locations, custom tiers, tune results, the last served model, accounts and the API
 key; mode 0600), server.log, selftest.json.
 """
-import argparse, glob, hashlib, http.client, http.cookies, http.server, ipaddress, json, math, mmap, os, random, signal, socket, ssl, struct, subprocess, sys, threading, time, urllib.parse, urllib.request
+import argparse, glob, hashlib, http.client, http.cookies, http.server, ipaddress, json, math, mmap, os, random, re, signal, socket, ssl, struct, subprocess, sys, threading, time, urllib.parse, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qwfn_auth, qwfn_i18n
 
@@ -76,7 +76,7 @@ STATE = {"proc": None, "model": None, "settings": None, "started": 0.0, "log": o
 LOCK = threading.Lock()
 
 # ---- persistent config: model locations, custom tiers, tune results, the last served model
-CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0, "auth": {}, "cpu_mode": "all", "cpu_auto": True}
+CONFIG = {"locations": [], "custom": {}, "tune": {}, "last": {}, "headroom_gb": 3.0, "auth": {}, "cpu_mode": "all", "cpu_auto": True, "pack_dir": ""}
 def load_config():
     try:
         c = json.load(open(CONFIG_FILE))
@@ -332,6 +332,35 @@ def repo_label(path, loc):
         if x.startswith("models--"): return x[8:].replace("--", "/")
     return os.path.relpath(os.path.dirname(path), loc["path"]) if loc["kind"] != "file" else os.path.dirname(path)
 
+# ---- expert packs (qwfn-pack) -------------------------------------------------
+# A pack holds a checkpoint's routed experts one contiguous block per (layer, expert), laid out
+# as the engine's RAM-tier slots: a decode miss is then one read instead of three. Measured on
+# the reference machine (KIOXIA KXG8, 2026-10-02), the console's server with the pack and
+# --io-uring against the thread pool without it: +6.4% decode on the Abliterated Q4_K_M,
+# identical outputs. The engine checks the pack's fingerprint and ignores one that does not match.
+def pack_dir():
+    return _expand(CONFIG.get("pack_dir") or "") or os.path.join(LOG_DIR, "packs")
+
+def pack_bin():
+    b = os.path.join(os.path.dirname(SERVER_BIN), "qwfn-pack" + (".exe" if os.name == "nt" else ""))
+    return b if os.path.exists(b) else None
+
+def pack_name(model_path):
+    return shard_stem(os.path.basename(model_path)) + ".qwpk"
+
+def find_pack(model_path, model_dir):
+    """The model's expert pack: <stem>.qwpk in the pack folder or next to the shards."""
+    for d in (pack_dir(), model_dir):
+        p = os.path.join(d, pack_name(model_path))
+        if os.path.isfile(p): return p
+    return None
+
+def ggml_patched():
+    """Whether the ggml next to the engine carries qwfnfer's ggml-cuda patches (the bundle writes
+    ggml-patches.txt): early routing keeps two CUDA graphs per layer and needs patch 01's larger
+    graph cache, or the graphs evict each other every token."""
+    return os.path.exists(os.path.join(os.path.dirname(SERVER_BIN), "ggml-patches.txt"))
+
 def scan_models(skipped=None):
     """The models the console can serve. `skipped` collects every GGUF that was found but left
     out, with the reason: a scan that finds a download and rejects it must say so, not go quiet."""
@@ -381,6 +410,8 @@ def scan_models(skipped=None):
                         "geom": gguf_geom(shard_files),
                         "mmproj": mm, "mmproj_gb": round(os.stat(mm).st_size / 1e9, 2) if mm else 0.0,
                         "mtp": mtp, "mtp_gb": round(os.stat(mtp).st_size / 1e9, 2) if mtp else 0.0})
+            pk = find_pack(f, d)
+            out[-1].update(pack=pk, pack_gb=round(os.stat(pk).st_size / 1e9, 1) if pk else 0.0)
     return out
 
 def find_model(models, ref):
@@ -1031,9 +1062,13 @@ def recommend(model, hw, preset="coding", vision=None, state_host=None, kv=None,
                       "vram_served": chosen["vram_served"], "prefill_tps_long": chosen["prefill_tps"], "lend_gb": chosen["lend_gb"]},
         "tiers": tiers, "calibration": {**calib, "cores": hw.get("cpu_cores"), "cpu_threads": hw.get("cpu_threads")},
         "custom_saved": bool(custom), "tune": tune or None,
+        # The expert pack is used when there is one (Linux: it needs io_uring's in-place reads);
+        # early routing is on where the bundled ggml carries the patches it needs.
+        "pack": model.get("pack"), "pack_gb": model.get("pack_gb", 0.0), "use_pack": os.name != "nt",
+        "early_route": ggml_patched(), "ggml_patched": ggml_patched(),
     }
     if preset == "custom":
-        for k in ("think", "think_budget", "skip_miss", "spec_block", "mtp", "port", "reserve", "vision"):
+        for k in ("think", "think_budget", "skip_miss", "spec_block", "mtp", "port", "reserve", "vision", "use_pack", "early_route"):
             if k in custom: out[k] = custom[k]
         out["mtp"] = bool(out["mtp"]) and bool(model.get("mtp")); out["vision"] = bool(out["vision"]) and bool(model.get("mmproj"))
     return out
@@ -1101,6 +1136,7 @@ def server_argv(model, s):
     if s.get("vision"): argv += ["--mmproj", model["mmproj"]]
     if s.get("state_host") in ("idx", "kv", "kv,idx"): argv += ["--state-host", s["state_host"]]
     if s.get("prefill_decode_max"): argv += ["--prefill-decode-max", str(int(s["prefill_decode_max"]))]
+    if model.get("pack") and s.get("use_pack", True) and os.name != "nt": argv.append("--io-uring")   # the pack pays off only with in-place reads
     if s.get("mtp") and s.get("mtp_drafts"): argv += ["--mtp-drafts", str(int(s["mtp_drafts"]))]
     return argv
 
@@ -1170,6 +1206,13 @@ def start_server(model, s):
                         break
         elif os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
             env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        if model.get("pack") and s.get("use_pack", True) and os.name != "nt":
+            env["QWFN_EXPERT_PACK"] = model["pack"]
+            log.write(f"[console] expert pack: {model['pack']}\n")
+        if s.get("early_route"):
+            env["QWFN_EARLY_ROUTE"] = "1"
+            log.write("[console] early routing on\n" + ("" if ggml_patched() else "[console] note: the ggml next to the engine is not marked as patched (ggml-patches.txt); with stock ggml early routing is slower\n"))
+        log.flush()
         try:
             proc = subprocess.Popen(argv, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=env)
         except Exception as e:
@@ -1246,6 +1289,55 @@ def live_state():
         st["state"] = "loading"
     return st
 
+# ---- building a pack in the background ------------------------------------------
+PACK_JOB = {"model": None, "proc": None, "pct": 0.0, "line": "", "error": None, "done": False, "out": None, "cancelled": False}
+
+def pack_job_state():
+    j = PACK_JOB
+    return {"model": j["model"], "running": bool(j["proc"] and j["proc"].poll() is None), "pct": round(j["pct"], 1),
+            "line": j["line"], "error": j["error"], "done": j["done"], "out": j["out"], "pack_dir": pack_dir(), "tool": bool(pack_bin())}
+
+def start_pack(model):
+    if PACK_JOB["proc"] and PACK_JOB["proc"].poll() is None: return {"error": "a pack is already being built: " + str(PACK_JOB["model"])}
+    tool = pack_bin()
+    if not tool: return {"error": "qwfn-pack was not found next to the engine (build it: cmake --build build --target qwfn-pack)"}
+    if os.name == "nt": return {"error": "expert packs are Linux-only for now (the engine reads them over io_uring)"}
+    d = pack_dir(); os.makedirs(d, exist_ok=True)
+    out = os.path.join(d, pack_name(model["path"]))
+    env = dict(os.environ); bindir = os.path.dirname(SERVER_BIN)
+    if os.path.exists(os.path.join(bindir, "libggml-base.so.0")):
+        env["LD_LIBRARY_PATH"] = bindir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    try:
+        proc = subprocess.Popen([tool, model["path"], out, "--verify", "64"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    except Exception as e:
+        return {"error": f"cannot start qwfn-pack: {e}"}
+    PACK_JOB.update(model=model["name"], proc=proc, pct=0.0, line="starting", error=None, done=False, out=out, cancelled=False)
+    def reader():
+        buf = b""; last_err = None
+        while True:
+            ch = proc.stdout.read(1)
+            if not ch: break
+            if ch in (b"\r", b"\n"):
+                ln = buf.decode("utf-8", "replace").strip(); buf = b""
+                if not ln: continue
+                PACK_JOB["line"] = ln
+                m = re.search(r"layer +(\d+)/(\d+)", ln)
+                if m: PACK_JOB["pct"] = 100.0 * int(m.group(1)) / max(1, int(m.group(2)))
+                if ln.startswith("error"): last_err = ln
+            else:
+                buf += ch
+        rc = proc.wait()
+        PACK_JOB["done"] = True
+        if rc != 0:
+            # qwfn-pack preallocates the whole pack as <out>.partial and renames it only when done:
+            # a failed or cancelled build leaves tens of GB that nothing will resume from.
+            try: os.unlink(out + ".partial")
+            except OSError: pass
+            PACK_JOB["error"] = "the build was cancelled" if PACK_JOB["cancelled"] else (last_err or f"qwfn-pack exited with code {rc}")
+        else: PACK_JOB["pct"] = 100.0
+    threading.Thread(target=reader, daemon=True).start()
+    return {"ok": True, "out": out}
+
 def status():
     st = live_state()
     p = STATE["proc"]; alive = st["console_started"]; port = st["port"]
@@ -1260,6 +1352,7 @@ def status():
                 STATE["ext_model"] = os.path.basename(os.path.dirname(mf)) if mf else (props.get("model") or None)
                 st["model"] = STATE["ext_model"]; st["model_path"] = mf or None
     st["log"] = log_tail(40)
+    st["pack_job"] = pack_job_state()
     st["engines"] = engines_running(max_age=4.0)
     st["tiers_built"] = log_tiers() if st["state"] in ("ready", "busy") and alive else {}
     return st
@@ -1890,16 +1983,25 @@ class H(http.server.BaseHTTPRequestHandler):
                 CONFIG["cpu_auto"] = bool(body["cpu_auto"]); save_config()
             if body.get("cpu_mode") in ("all", "pcores"):
                 CONFIG["cpu_mode"] = body["cpu_mode"]; save_config()
+            if "pack_dir" in body:
+                CONFIG["pack_dir"] = str(body.get("pack_dir") or ""); save_config()
             if "headroom_gb" in body:
                 try: CONFIG["headroom_gb"] = min(16.0, max(0.5, float(body["headroom_gb"]))); save_config()
                 except Exception: return self._json({"error": "headroom must be a number of GB"})
             return self._json({"ok": True, "headroom_gb": headroom_gb(), "cpu_mode": cpu_mode(), "cpu_auto": cpu_auto()})
+        if self.path == "/api/pack":
+            if body.get("cancel"):
+                if PACK_JOB["proc"] and PACK_JOB["proc"].poll() is None: PACK_JOB["cancelled"] = True; PACK_JOB["proc"].terminate()
+                return self._json({"ok": True})
+            models = scan_models(); model = find_model(models, body.get("model"))
+            if not model: return self._json({"error": "no models"}, 404)
+            return self._json(start_pack(model))
         if self.path == "/api/custom":
             name = str(body.get("model") or "")
             if not name: return self._json({"error": "which model?"})
             if body.get("delete"): CONFIG["custom"].pop(name, None); save_config(); return self._json({"ok": True})
             s = body.get("settings") or {}
-            keep = {k: s[k] for k in ("ctx", "kv", "ram", "threads", "batch", "reserve", "port", "think", "think_budget", "skip_miss", "spec_block", "vision", "mtp", "state_host") if k in s}
+            keep = {k: s[k] for k in ("ctx", "kv", "ram", "threads", "batch", "reserve", "port", "think", "think_budget", "skip_miss", "spec_block", "vision", "mtp", "state_host", "use_pack", "early_route") if k in s}
             keep["saved"] = time.strftime("%Y-%m-%d %H:%M")
             CONFIG["custom"][name] = keep; save_config()
             return self._json({"ok": True})
