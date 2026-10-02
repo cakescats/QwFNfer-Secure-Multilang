@@ -67,7 +67,13 @@ jobs:
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
             -DCMAKE_C_FLAGS="-include $H -fno-math-errno" -DCMAKE_CXX_FLAGS="-include $H -fno-math-errno" \
             -DCMAKE_CUDA_FLAGS="-Xcompiler=-fno-math-errno -Xcompiler=-include,$H"
-          cmake --build "$L/build" -j 4
+          # library targets only (the fork's app/ wants a generated build-info.h); in GGML_BACKEND_DL mode
+          # ggml depends on every backend module, so the CPU variants and ggml-cuda come with it
+          cmake --build "$L/build" -j 4 --target ggml llama
+          for so in libggml-base.so.0 libggml.so.0 libllama.so.0 libggml-cuda.so; do
+            [ -e "$L/build/bin/$so" ] || { echo "$so was not built" >&2; ls "$L/build/bin" >&2; exit 1; }
+          done
+          ls "$L/build/bin"/libggml-cpu-*.so > /dev/null || { echo "no CPU variants were built" >&2; exit 1; }
           cp "$RUNNER_TEMP/ggml-patches.txt" "$L/build/bin/"
       - name: Save the llama.cpp build (also when a later step fails)
         if: steps.llama-cache.outputs.cache-hit != 'true'
