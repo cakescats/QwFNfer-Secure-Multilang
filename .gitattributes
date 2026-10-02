@@ -1,0 +1,2 @@
+# The ggml patches are applied with git apply to an LF checkout of llama.cpp: keep them LF on Windows too
+*.patch -text

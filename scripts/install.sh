@@ -42,7 +42,7 @@ say "Installing into $DEST"
 rm -rf "$DEST"; mkdir -p "$DEST" "$BIN"
 unzip -q "$tmp/$NAME.zip" -d "$tmp/x"
 mv "$tmp/x/$NAME"/* "$DEST"/
-chmod +x "$DEST/qwfnfer" "$DEST/bin/qwfn-server" "$DEST/bin/qwfn-tok"
+chmod +x "$DEST/qwfnfer" "$DEST/bin/qwfn-server" "$DEST/bin/qwfn-tok"; [ ! -f "$DEST/bin/qwfn-pack" ] || chmod +x "$DEST/bin/qwfn-pack"
 need=$(cat "$DEST/GLIBC" 2>/dev/null || echo 2.34)
 python3 -c "import sys; v=lambda x: tuple(map(int, x.split('.'))); sys.exit(0 if v('$glibc') >= v('$need') else 1)" || die "this bundle needs glibc $need (yours: $glibc): use a newer distribution, or build from source (README)"
 ln -sfn "$DEST/qwfnfer" "$BIN/qwfnfer"

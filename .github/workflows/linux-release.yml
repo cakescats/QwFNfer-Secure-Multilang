@@ -1,0 +1,104 @@
+name: linux-release
+on:
+  push:
+    branches: [ 'merge/**' ]   # a test build of a merge branch: one CUDA arch, no release
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.4-perf); empty = build and test only, no release'
+        required: false
+        default: ''
+
+# Builds the Linux bundle the way scripts/package.sh documents it, on the oldest runner the
+# bundle's runtime allows (Ubuntu 24.04: package.sh takes libstdc++/libgomp/liburing from noble):
+# CUDA 13 from NVIDIA's apt repository (compiler and redistributable libraries only, no driver),
+# llama.cpp at the revision the README pins (Unsloth ca14269, the one the engine is validated and
+# measured against) with patches/ggml-cuda applied, a portable ggml (GGML_NATIVE=OFF, every CPU
+# variant), the portable engine and qwfn-pack, package.sh's checks, install.sh as the smoke test.
+env:
+  # A release covers every supported GPU; a test build only the one it is tested on (RTX 30, sm_86).
+  CUDA_ARCHS: ${{ github.event_name == 'push' && '86' || '75;80;86;89;90;120' }}
+  LLAMA_SHA: ca1426903fabe9af26cd10c42034cb4bbd2e0e11
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write   # publish the release + upload the zip
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (CUDA 13 from NVIDIA's repository, no driver)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build liburing-dev zstd binutils unzip
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update -q
+          # the newest CUDA 13.x the repository has: cuda-nvcc-13-1 -> 13-1
+          ver=$(apt-cache search --names-only '^cuda-nvcc-13-[0-9]+$' | cut -d' ' -f1 | sed 's/^cuda-nvcc-//' | sort -V | tail -1)
+          [ -n "$ver" ] || { echo "no CUDA 13 compiler in NVIDIA's repository" >&2; exit 1; }
+          sudo apt-get install -y -q cuda-nvcc-$ver cuda-cudart-dev-$ver cuda-cccl-$ver cuda-driver-dev-$ver libcublas-dev-$ver
+          cu=/usr/local/cuda-${ver/-/.}
+          "$cu/bin/nvcc" --version | tail -2
+          echo "CUDA_HOME=$cu" >> "$GITHUB_ENV"; echo "$cu/bin" >> "$GITHUB_PATH"
+          echo "CUDA_LIBS=$cu/targets/x86_64-linux/lib" >> "$GITHUB_ENV"
+      - name: Cached llama.cpp build
+        id: llama-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/llama.cpp
+          key: llama-ca14269-cuda13-${{ env.CUDA_ARCHS }}-${{ hashFiles('patches/ggml-cuda/*.patch', 'cmake/glibc_compat.h') }}-v1
+      - name: Build llama.cpp (pinned, patches/ggml-cuda, portable)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          L=$RUNNER_TEMP/llama.cpp
+          git init -q "$L"
+          git -C "$L" fetch -q --depth 1 https://github.com/unslothai/llama.cpp "$LLAMA_SHA"
+          git -C "$L" checkout -q FETCH_HEAD
+          : > "$RUNNER_TEMP/ggml-patches.txt"
+          for p in patches/ggml-cuda/*.patch; do
+            git -C "$L" apply "$PWD/$p" || { echo "$p does not apply to llama.cpp $LLAMA_SHA" >&2; exit 1; }
+            basename "$p" >> "$RUNNER_TEMP/ggml-patches.txt"
+          done
+          H=$PWD/cmake/glibc_compat.h
+          cmake -S "$L" -B "$L/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS" "-DCMAKE_CUDA_COMPILER=$CUDA_HOME/bin/nvcc" \
+            -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DCMAKE_C_FLAGS="-include $H -fno-math-errno" -DCMAKE_CXX_FLAGS="-include $H -fno-math-errno" \
+            -DCMAKE_CUDA_FLAGS="-Xcompiler=-fno-math-errno -Xcompiler=-include,$H"
+          cmake --build "$L/build" -j 4
+          cp "$RUNNER_TEMP/ggml-patches.txt" "$L/build/bin/"
+      - name: Save the llama.cpp build (also when a later step fails)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/llama.cpp
+          key: llama-ca14269-cuda13-${{ env.CUDA_ARCHS }}-${{ hashFiles('patches/ggml-cuda/*.patch', 'cmake/glibc_compat.h') }}-v1
+      - name: Package bundle
+        run: |
+          VERSION=${{ inputs.tag || '' }}
+          export VERSION=${VERSION:-$(git describe --tags --always)}
+          LLAMA_CPP_ROOT=$RUNNER_TEMP/llama.cpp GGML_LIBS=$RUNNER_TEMP/llama.cpp/build/bin scripts/package.sh
+          unzip -l dist/qwfnfer-linux-x86_64-cuda.zip | grep -E "qwfn-(server|tok|pack)$|ggml-patches.txt|libggml-cuda.so"
+      - name: Smoke test (install.sh, the engine loads, usage prints)
+        run: QWFN_ZIP=$PWD/dist/qwfnfer-linux-x86_64-cuda.zip QWFN_HOME=$RUNNER_TEMP/qwfnfer QWFN_BIN=$RUNNER_TEMP/qbin scripts/install.sh
+      - name: Keep the build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build-logs
+          path: build-portable*.log
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwfnfer-linux-x86_64-cuda
+          path: dist/qwfnfer-linux-x86_64-cuda.zip
+      - name: Publish release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          prerelease: true
+          generate_release_notes: false
+          files: dist/qwfnfer-linux-x86_64-cuda.zip

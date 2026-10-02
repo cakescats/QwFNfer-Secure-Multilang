@@ -72,7 +72,7 @@ OUT=dist/$NAME
 echo "== engine (portable build against $GGML_LIBS)"
 cmake -S . -B build-portable -G Ninja -DCMAKE_BUILD_TYPE=Release -DQWFN_PORTABLE=ON \
       -DLLAMA_CPP_ROOT="$LLAMA_CPP_ROOT" -DLLAMA_CPP_BUILD="$GGML_LIBS" > build-portable.cmake.log 2>&1 || { tail -20 build-portable.cmake.log; exit 1; }
-cmake --build build-portable --target qwfn-server qwfn-tok | tail -2
+cmake --build build-portable --target qwfn-server qwfn-tok qwfn-pack | tail -2
 
 have_runtime=yes
 for so in $RUNTIME_SOS; do [ -f "$RUNTIME_LIBS/$so" ] || have_runtime=no; done
@@ -115,7 +115,9 @@ fi
 
 echo "== bundle $OUT"
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/tools/console"
-cp build-portable/qwfn-server build-portable/qwfn-tok "$OUT/bin/"
+cp build-portable/qwfn-server build-portable/qwfn-tok build-portable/qwfn-pack "$OUT/bin/"
+# ggml-patches.txt: the ggml was built with patches/ggml-cuda applied (the console turns early routing on)
+[ -f "$GGML_LIBS/ggml-patches.txt" ] && cp "$GGML_LIBS/ggml-patches.txt" "$OUT/bin/"
 # real files under their sonames: a zip carries no symlinks
 for so in libggml-base.so.0 libggml.so.0 libllama.so.0 libggml-cuda.so; do cp -L "$GGML_LIBS/$so" "$OUT/bin/"; done
 for so in "$GGML_LIBS"/libggml-cpu-*.so; do cp -L "$so" "$OUT/bin/"; done
@@ -125,7 +127,7 @@ cp tools/qwfn_console.py tools/qwfn_auth.py tools/qwfn_i18n.py tools/qwfn_router
 cp tools/console/index.html tools/console/login.html tools/console/console.css "$OUT/tools/console/"
 mkdir -p "$OUT/tools/console/i18n"; cp tools/console/i18n/*.json "$OUT/tools/console/i18n/"
 mkdir -p "$OUT/tools/console/img"; cp tools/console/img/*.png "$OUT/tools/console/img/"
-cp scripts/qwfnfer "$OUT/qwfnfer"; chmod +x "$OUT/qwfnfer" "$OUT/bin/qwfn-server" "$OUT/bin/qwfn-tok"
+cp scripts/qwfnfer "$OUT/qwfnfer"; chmod +x "$OUT/qwfnfer" "$OUT/bin/qwfn-server" "$OUT/bin/qwfn-tok" "$OUT/bin/qwfn-pack"
 mkdir -p "$OUT/scripts"; cp scripts/claude-desktop.sh scripts/gen-cert.sh "$OUT/scripts/"; chmod +x "$OUT/scripts/claude-desktop.sh" "$OUT/scripts/gen-cert.sh"
 cp README.md LICENSE "$OUT/"; echo "$VERSION" > "$OUT/VERSION"
 cat > "$OUT/INSTALL.txt" <<EOF
@@ -142,7 +144,8 @@ Everything the engine needs is in bin/ except the NVIDIA driver. See README.md.
 EOF
 
 echo "== checks"
-missing=$(LD_LIBRARY_PATH="$PWD/$OUT/bin" ldd "$OUT/bin/qwfn-server" "$OUT/bin/libggml-cuda.so" | grep "not found" || true)
+# libcuda.so.1 is the driver's: the target system has it, a build machine without a GPU need not
+missing=$(LD_LIBRARY_PATH="$PWD/$OUT/bin" ldd "$OUT/bin/qwfn-server" "$OUT/bin/qwfn-pack" "$OUT/bin/libggml-cuda.so" | grep "not found" | grep -v "libcuda\.so\.1 " || true)
 [ -z "$missing" ] || { echo "unresolved libraries:"; echo "$missing"; exit 1; }
 outside=$(LD_LIBRARY_PATH="$PWD/$OUT/bin" ldd "$OUT/bin/qwfn-server" "$OUT/bin/libggml-cuda.so" | sed -n 's/.*=> \(.*\) (0x.*/\1/p' | grep -v -F "$PWD/$OUT/bin/" | grep -v -E "/(libc|libm|libdl|libpthread|librt|libcuda|ld-linux)[.-]" | sort -u || true)
 [ -z "$outside" ] || echo "note: resolved outside the bundle (expected only base-system libraries): $outside"

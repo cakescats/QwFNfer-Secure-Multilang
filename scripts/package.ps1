@@ -72,6 +72,8 @@ foreach ($dll in @('ggml-base.dll', 'ggml.dll', 'llama.dll', 'ggml-cuda.dll')) {
   Copy-Item $f.FullName "$Out\bin\"
 }
 Get-ChildItem -Path $GgmlLibs -Filter 'ggml-cpu*.dll' -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName "$Out\bin\" }
+# ggml-patches.txt: the ggml was built with patches\ggml-cuda applied (the console turns early routing on)
+if (Test-Path (Join-Path $GgmlLibs 'ggml-patches.txt')) { Copy-Item (Join-Path $GgmlLibs 'ggml-patches.txt') "$Out\bin\" }
 foreach ($pat in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll')) {
   Get-ChildItem -Path $CudaDir -Filter $pat | ForEach-Object { Copy-Item $_.FullName "$Out\bin\" }
 }

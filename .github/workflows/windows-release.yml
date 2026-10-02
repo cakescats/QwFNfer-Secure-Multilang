@@ -50,7 +50,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/llama.cpp
-          key: llama-e85e15cf-cuda13-${{ env.CUDA_ARCHS }}-v1
+          key: llama-e85e15cf-cuda13-${{ env.CUDA_ARCHS }}-${{ hashFiles('patches/ggml-cuda/*.patch') }}-v2
       - name: Build llama.cpp (pinned upstream, CUDA backend)
         shell: pwsh
         run: |
@@ -63,22 +63,39 @@ jobs:
           # Older pins (e.g. the Unsloth b10798 mix) fail every Flash-Next start
           # with "unknown model architecture: 'qwen4exp'" in the vocab loader.
           git init $env:RUNNER_TEMP\llama.cpp
+          git -C $env:RUNNER_TEMP\llama.cpp config core.autocrlf false   # LF sources: the patches below apply byte for byte
           git -C $env:RUNNER_TEMP\llama.cpp remote add origin https://github.com/ggerganov/llama.cpp
           git -C $env:RUNNER_TEMP\llama.cpp fetch --depth 1 origin e85e15cf6d810cd1268498c2e5b657bb3ece47bc
           git -C $env:RUNNER_TEMP\llama.cpp checkout FETCH_HEAD
+          # qwfnfer's ggml-cuda patches (patches/ggml-cuda): 02 fuses the hyper-connection ops (bit-exact).
+          # 01 lifts a 64-graph cache cap that this upstream revision no longer has (it evicts by age), so
+          # it is skipped here when common.cuh has no max_cuda_graphs. Anything else that does not apply fails.
+          $applied = @()
+          foreach ($p in Get-ChildItem patches\ggml-cuda\*.patch | Sort-Object Name) {
+            git -C $env:RUNNER_TEMP\llama.cpp apply --check $p.FullName 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              git -C $env:RUNNER_TEMP\llama.cpp apply $p.FullName; if ($LASTEXITCODE) { throw "$($p.Name): git apply failed" }
+              $applied += $p.Name
+            } elseif ($p.Name -like '01-*' -and -not (Select-String -Quiet 'max_cuda_graphs' "$env:RUNNER_TEMP\llama.cpp\ggml\src\ggml-cuda\common.cuh")) {
+              Write-Host "$($p.Name): not needed, this ggml has no CUDA graph cache cap"; $applied += "$($p.Name) (not needed: no graph cache cap)"
+            } else { throw "$($p.Name) does not apply to llama.cpp e85e15cf" }
+          }
+          $global:LASTEXITCODE = 0
           cmake -S $env:RUNNER_TEMP\llama.cpp -B $env:RUNNER_TEMP\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CUDA=ON `
             "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" "-DCMAKE_CUDA_COMPILER=$cu/bin/nvcc.exe" "-DCUDAToolkit_ROOT=$cu" `
             -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF `
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF
           cmake --build $env:RUNNER_TEMP\llama.cpp\build --target ggml-base ggml ggml-cpu ggml-cuda llama
+          if ($LASTEXITCODE) { throw "llama.cpp build failed" }
+          $applied | Out-File -Encoding ascii "$env:RUNNER_TEMP\llama.cpp\build\bin\ggml-patches.txt"
           "GGML_LIBS=$env:RUNNER_TEMP\llama.cpp\build\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Save the llama.cpp build (also when a later step fails)
         if: steps.llama-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/llama.cpp
-          key: llama-e85e15cf-cuda13-${{ env.CUDA_ARCHS }}-v1
+          key: llama-e85e15cf-cuda13-${{ env.CUDA_ARCHS }}-${{ hashFiles('patches/ggml-cuda/*.patch') }}-v2
       - name: Package bundle
         shell: pwsh
         run: |
