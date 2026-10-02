@@ -1,0 +1,219 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7c1ec42..c865506 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -69,6 +69,7 @@
+ #include "ggml-cuda/cumsum.cuh"
+ #include "ggml-cuda/fill.cuh"
+ #include "ggml-cuda/lightning-indexer.cuh"
++#include "ggml-cuda/hc-fuse.cuh"
+ #include "ggml.h"
+ 
+ #include <algorithm>
+@@ -3454,6 +3455,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // qwfnfer: the hyper-connection combine and the mixer's gated-stream transpose (hc-fuse.cuh)
++    if (ggml_cuda_hc_fuse_enabled() && (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY)) {
++        int skip = ggml_cuda_try_hc_combine(*cuda_ctx, cgraph, i);
++        if (!skip && node->op == GGML_OP_UNARY) skip = ggml_cuda_try_hc_gate_t(*cuda_ctx, cgraph, i);
++        if (!skip && node->op == GGML_OP_SCALE) skip = ggml_cuda_try_scale_silu(*cuda_ctx, cgraph, i);
++        if (skip) return skip;
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+diff --git a/ggml/src/ggml-cuda/hc-fuse.cu b/ggml/src/ggml-cuda/hc-fuse.cu
+new file mode 100644
+index 0000000..4569015
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-fuse.cu
+@@ -0,0 +1,160 @@
++#include "hc-fuse.cuh"
++#include "unary.cuh"
++
++#include "ggml-impl.h"
++
++#include <cstdlib>
++#include <cstring>
++
++bool ggml_cuda_hc_fuse_enabled() {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_FUSE_HC"); return !e || atoi(e) != 0; }();
++    return on;
++}
++
++static bool is_sigmoid(const ggml_tensor * t) {
++    return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID;
++}
++
++// Whether t's bytes overlap dst's: a fused kernel must not write where it still reads (the allocator laid
++// memory out for the unfused kernels, whose inputs may already be dead when a later node is written).
++static bool overlaps(const ggml_tensor * dst, const ggml_tensor * t) {
++    const char * a0 = (const char *) dst->data, * a1 = a0 + ggml_nbytes(dst);
++    const char * b0 = (const char *) t->data,   * b1 = b0 + ggml_nbytes(t);
++    return a0 < b1 && b0 < a1;
++}
++
++static void scale_params(const ggml_tensor * t, float & s, float & b) {
++    memcpy(&s, (const float *) t->op_params + 0, sizeof(float));
++    memcpy(&b, (const float *) t->op_params + 1, sizeof(float));
++}
++
++// ---------------------------------------------------------------------------------------- hc_combine
++
++static __global__ void k_hc_combine(const float * res, const float * blk, const float * inj, float * dst,
++                                    const int E, const int H, const bool has_s1,
++                                    const float s1, const float b1, const float s2, const float b2) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= E * H) return;
++    const int e = i % E, c = i / E;
++    // The SCALE kernel's expression (scale * x + bias), then op_sigmoid's, then the second SCALE's.
++    const float x   = has_s1 ? s1 * inj[c] + b1 : inj[c];
++    const float sig = 1.0f / (1.0f + expf(-x));
++    const float w   = s2 * sig + b2;
++    // OUT_PROD (one product, K = 1) and ADD, rounded separately as the two kernels round them.
++    dst[i] = __fadd_rn(res[i], __fmul_rn(blk[e], w));
++}
++
++int ggml_cuda_try_hc_combine(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_tensor ** nodes = cgraph->nodes;
++    const int n = cgraph->n_nodes;
++    int k = i;
++    bool has_s1 = false; float s1 = 1.0f, b1 = 0.0f;
++    if (nodes[k]->op == GGML_OP_SCALE) {
++        if (k + 1 >= n || !is_sigmoid(nodes[k + 1]) || nodes[k + 1]->src[0] != nodes[k]) return 0;
++        has_s1 = true; scale_params(nodes[k], s1, b1); k++;
++    } else if (!is_sigmoid(nodes[k])) {
++        return 0;
++    }
++    if (k + 4 >= n) return 0;
++    const ggml_tensor * sig = nodes[k], * sc2 = nodes[k + 1], * w3 = nodes[k + 2], * op = nodes[k + 3];
++    ggml_tensor * add = nodes[k + 4];
++    if (sc2->op != GGML_OP_SCALE || sc2->src[0] != sig) return 0;
++    if (w3->op != GGML_OP_RESHAPE || w3->src[0] != sc2) return 0;
++    if (op->op != GGML_OP_OUT_PROD || op->src[1] != w3) return 0;
++    if (add->op != GGML_OP_ADD) return 0;
++    const ggml_tensor * res = add->src[1] == op ? add->src[0] : add->src[0] == op ? add->src[1] : nullptr;
++    if (!res) return 0;
++    const ggml_tensor * inj = has_s1 ? nodes[i]->src[0] : sig->src[0];
++    const ggml_tensor * b3  = op->src[0];
++    const int64_t E = res->ne[0], H = res->ne[1];
++    // One token, F32, contiguous, the shapes hc_combine builds.
++    if (res->ne[2] != 1 || res->ne[3] != 1 || add->ne[0] != E || add->ne[1] != H) return 0;
++    if (b3->ne[0] != E || ggml_nelements(b3) != E || ggml_nelements(inj) != H) return 0;
++    for (const ggml_tensor * t : { res, b3, inj, (const ggml_tensor *) add }) {
++        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) return 0;
++    }
++    // res may be dst itself (an in-place add reads and writes each element once, in one thread); blk and
++    // inj are read by every thread and must not be overwritten.
++    if (overlaps(add, b3) || overlaps(add, inj)) return 0;
++    float s2, b2; scale_params(sc2, s2, b2);
++
++    const int count = k + 5 - i;
++    static const ggml_op ops_s1[] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_OUT_PROD, GGML_OP_ADD };
++    const ggml_op * ops = has_s1 ? ops_s1 : ops_s1 + 1;
++    const int out_idx = i + count - 1;
++    if (!ggml_can_fuse_subgraph(cgraph, i, count, ops, &out_idx, 1)) return 0;
++
++    const int total = (int) (E * H), bs = 256;
++    k_hc_combine<<<(total + bs - 1) / bs, bs, 0, ctx.stream()>>>(
++        (const float *) res->data, (const float *) b3->data, (const float *) inj->data, (float *) add->data,
++        (int) E, (int) H, has_s1, s1, b1, s2, b2);
++    return count - 1;
++}
++
++// ----------------------------------------------------------------------------------------- hc_gate_t
++
++static __global__ void k_hc_gate_t(const float * u, const float * xn, float * dst, const int E, const int H) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= E * H) return;
++    const int e = i % E, c = i / E;
++    const float g = 1.0f / (1.0f + expf(-u[i]));      // op_sigmoid
++    dst[c + e * H] = __fmul_rn(xn[i], g);             // op_mul, then CONT of the (1,0) permute: a copy
++}
++
++int ggml_cuda_try_hc_gate_t(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_tensor ** nodes = cgraph->nodes;
++    if (i + 4 >= cgraph->n_nodes || !is_sigmoid(nodes[i])) return 0;
++    const ggml_tensor * sig = nodes[i], * mul = nodes[i + 1], * r3 = nodes[i + 2], * pm = nodes[i + 3];
++    ggml_tensor * cont = nodes[i + 4];
++    if (mul->op != GGML_OP_MUL || r3->op != GGML_OP_RESHAPE || pm->op != GGML_OP_PERMUTE || cont->op != GGML_OP_CONT) return 0;
++    if (r3->src[0] != mul || pm->src[0] != r3 || cont->src[0] != pm) return 0;
++    const ggml_tensor * xn = mul->src[1] == sig ? mul->src[0] : mul->src[0] == sig ? mul->src[1] : nullptr;
++    const ggml_tensor * u  = sig->src[0];
++    if (!xn || !ggml_are_same_shape(xn, sig)) return 0;
++    // The (1,0,2,3) permute of [E, H, 1] into a contiguous [H, E, 1].
++    const int32_t * ax = (const int32_t *) pm->op_params;
++    if (ax[0] != 1 || ax[1] != 0 || ax[2] != 2 || ax[3] != 3) return 0;
++    const int64_t E = r3->ne[0], H = r3->ne[1];
++    if (r3->ne[2] != 1 || r3->ne[3] != 1 || cont->ne[0] != H || cont->ne[1] != E) return 0;
++    for (const ggml_tensor * t : { u, xn, (const ggml_tensor *) cont }) {
++        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) return 0;
++    }
++    // dst[c + e*H] is written from element e + c*E: any overlap with the inputs would be read after written.
++    if (overlaps(cont, u) || overlaps(cont, xn)) return 0;
++    static const ggml_op ops[] = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT };
++    const int out_idx = i + 4;
++    if (!ggml_can_fuse_subgraph(cgraph, i, 5, ops, &out_idx, 1)) return 0;
++
++    const int total = (int) (E * H), bs = 256;
++    k_hc_gate_t<<<(total + bs - 1) / bs, bs, 0, ctx.stream()>>>(
++        (const float *) u->data, (const float *) xn->data, (float *) cont->data, (int) E, (int) H);
++    return 4;
++}
++
++// ------------------------------------------------------------------------------------------ scale_silu
++
++static __global__ void k_scale_silu(const float * x, float * dst, const int n, const float s, const float b) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) return;
++    dst[i] = ggml_cuda_op_silu_single(s * x[i] + b);   // the SCALE kernel's expression, then op_silu's
++}
++
++int ggml_cuda_try_scale_silu(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
++    ggml_tensor ** nodes = cgraph->nodes;
++    if (i + 1 >= cgraph->n_nodes || nodes[i]->op != GGML_OP_SCALE) return 0;
++    const ggml_tensor * sc = nodes[i];
++    ggml_tensor * si = nodes[i + 1];
++    if (si->op != GGML_OP_UNARY || ggml_get_unary_op(si) != GGML_UNARY_OP_SILU || si->src[0] != sc) return 0;
++    const ggml_tensor * x = sc->src[0];
++    if (x->type != GGML_TYPE_F32 || si->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(si)) return 0;
++    if (ggml_nelements(x) != ggml_nelements(si)) return 0;
++    // One thread per element reads x[i] and writes dst[i]: an in-place layout (dst == x) is safe, a shifted overlap is not.
++    if (si->data != x->data && overlaps(si, x)) return 0;
++    static const ggml_op ops[] = { GGML_OP_SCALE, GGML_OP_UNARY };
++    const int out_idx = i + 1;
++    if (!ggml_can_fuse_subgraph(cgraph, i, 2, ops, &out_idx, 1)) return 0;
++    float s, b; scale_params(sc, s, b);
++    const int n = (int) ggml_nelements(si), bs = 256;
++    k_scale_silu<<<(n + bs - 1) / bs, bs, 0, ctx.stream()>>>((const float *) x->data, (float *) si->data, n, s, b);
++    return 1;
++}
+diff --git a/ggml/src/ggml-cuda/hc-fuse.cuh b/ggml/src/ggml-cuda/hc-fuse.cuh
+new file mode 100644
+index 0000000..8ce6387
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-fuse.cuh
+@@ -0,0 +1,20 @@
++#pragma once
++// Hyper-connection fusions for one-token decode graphs (qwfnfer, Qwen3.8-Flash-Next).
++//
++// hc_combine: [SCALE] -> SIGMOID -> SCALE -> RESHAPE -> OUT_PROD -> ADD, i.e.
++//     dst[e, c] = res[e, c] + blk[e] * (s2 * sigmoid(s1 * inj[c] + b1) + b2)
++// hc_gate_t:  SIGMOID -> MUL -> RESHAPE -> PERMUTE(1,0,2,3) -> CONT, i.e.
++//     dst[c, e] = xn[e, c] * sigmoid(u[e, c])   (the transposed gated streams the stream-mean matmul reads)
++//
++// Both reproduce the unfused kernels' arithmetic exactly (same expressions under the same
++// -use_fast_math flags; the product and the sum rounded separately, as two kernels round them),
++// so a graph computes the same bits with or without them. GGML_CUDA_FUSE_HC=0 turns them off.
++#include "common.cuh"
++
++bool ggml_cuda_hc_fuse_enabled();
++
++// Returns the number of nodes after i that the fusion consumed (0: no match).
++int ggml_cuda_try_hc_combine(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
++// SCALE -> SILU (the hc mixer's low-rank branch): silu(s * x + b) in one kernel.
++int ggml_cuda_try_scale_silu(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
++int ggml_cuda_try_hc_gate_t(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);

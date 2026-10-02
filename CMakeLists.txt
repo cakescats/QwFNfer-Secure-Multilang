@@ -251,6 +251,7 @@ function(qwfn_tool name)
 endfunction()
 
 qwfn_tool(qwfn-iobench  SOURCES tools/qwfn_iobench.cpp        LIBS qwfn_core)
+qwfn_tool(qwfn-opbench  SOURCES tools/qwfn_opbench.cpp        LIBS qwfn_core)
 if(NOT WIN32)   # POSIX file calls; the pack format itself (src/qwfn_pack.cpp) is portable
   qwfn_tool(qwfn-pack   SOURCES tools/qwfn_pack.cpp           LIBS qwfn_core)
 endif()
