@@ -170,6 +170,17 @@ cp scripts/qwfn-console.service ~/.config/systemd/user/ && systemctl --user daem
 
 Модель, ярус и флаги меняются в веб-консоли: служба при следующем старте поднимет то, что запускалось последним.
 
+**Другая сборка движка.** Консоль запускает `build/qwfn-server` из своего каталога (в пакете — `bin/`). Чтобы служба работала с другой сборкой или со своими переменными и флагами, задайте `QWFN_SERVER` в drop-in: `scripts/qwfn-console-engine.conf` направляет его на обёртку, `scripts/qwfn-server-wrapper.sh` — её пример (путь к бинарнику, `LD_LIBRARY_PATH`, пакет экспертов по модели, ранний роутинг, дополнительные флаги).
+
+```bash
+mkdir -p ~/.config/systemd/user/qwfn-console.service.d
+cp scripts/qwfn-console-engine.conf ~/.config/systemd/user/qwfn-console.service.d/engine.conf
+cp scripts/qwfn-server-wrapper.sh ~/ && chmod +x ~/qwfn-server-wrapper.sh   # и пропишите в ней BIN
+systemctl --user daemon-reload && systemctl --user restart qwfn-console
+```
+
+`systemctl --user cat qwfn-console` показывает службу вместе с drop-in. Чтобы вернуться к сборке из каталога, удалите `engine.conf`, затем daemon-reload и restart.
+
 ## Вход, доступ и языки
 
 <p align="center"><img src="docs/img/console-login-ru.png" width="45%" alt="Вход в консоль"> <img src="docs/img/console-access-ru.png" width="53%" alt="Вкладка «Доступ»"></p>

@@ -168,6 +168,17 @@ To have it start at boot without logging in: `loginctl enable-linger $USER`.
 
 Model, tier and flags are chosen in the web console; the service brings up whatever was served last.
 
+**Another engine build.** The console runs `build/qwfn-server` from its own checkout (`bin/` in a bundle). To serve with a different build, or with your own environment and flags, set `QWFN_SERVER` in a drop-in: `scripts/qwfn-console-engine.conf` points it at a wrapper, `scripts/qwfn-server-wrapper.sh` is an example (binary path, `LD_LIBRARY_PATH`, per-model expert pack, early routing, extra flags).
+
+```bash
+mkdir -p ~/.config/systemd/user/qwfn-console.service.d
+cp scripts/qwfn-console-engine.conf ~/.config/systemd/user/qwfn-console.service.d/engine.conf
+cp scripts/qwfn-server-wrapper.sh ~/ && chmod +x ~/qwfn-server-wrapper.sh   # then set BIN in it
+systemctl --user daemon-reload && systemctl --user restart qwfn-console
+```
+
+`systemctl --user cat qwfn-console` shows the unit with its drop-ins. Delete `engine.conf`, daemon-reload and restart to go back to the checkout's build.
+
 ## Sign-in, access and languages
 
 <p align="center"><img src="docs/img/console-login-en.png" width="45%" alt="Signing in to the console"> <img src="docs/img/console-access-en.png" width="53%" alt="The Access tab"></p>

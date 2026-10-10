@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Добавлено
+
+- **Служба с другой сборкой движка:** пример drop-in `scripts/qwfn-console-engine.conf` (`QWFN_SERVER`, закомментированный `LimitMEMLOCK`) и обёртки `scripts/qwfn-server-wrapper.sh` (путь к бинарнику, пакет экспертов по модели, ранний роутинг, `--io-uring`); раздел в README.
+
 ## [0.2.3-cakescats.3] — 2026-10-03
 
 Ускорение декода на 13%, пакеты экспертов и ранний роутинг в консоли, слитые форки (Intel Arc, Windows), сборки для скачивания под Linux и Windows.
