@@ -1,13 +1,17 @@
 # qwfn console + model server. The console starts the last served model and tier (--start);
-# stopping the service stops the server first (SIGINT -> the console's own shutdown).
+# stopping the service stops the server first (SIGINT -> the console's own shutdown). A model
+# server that crashes takes the console down with status 1 (--exit-on-crash), so Restart= brings
+# both back; five failures within ten minutes and systemd gives up (`systemctl --user reset-failed`).
 [Unit]
 Description=qwfn console and model server (Qwen3.8-Flash-Next)
 After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h/QwFNfer
-ExecStart=/usr/bin/python3 %h/QwFNfer/tools/qwfn_console.py --start
+ExecStart=/usr/bin/python3 %h/QwFNfer/tools/qwfn_console.py --start --exit-on-crash
 Environment=PYTHONUNBUFFERED=1
 KillSignal=SIGINT
 TimeoutStopSec=90

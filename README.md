@@ -148,7 +148,7 @@ The server listens on `http://127.0.0.1:8080`; the API key for clients is on the
 
 ## As a service (autostart and control)
 
-The console can run as a systemd user service: it starts at boot, brings up the last served model and tier on its own (`--start`), is restarted if it fails, and stops the model server first when it is stopped. Adjust the repository path in the unit (`WorkingDirectory`, `ExecStart`).
+The console can run as a systemd user service: it starts at boot, brings up the last served model and tier on its own (`--start`), is restarted if it fails, and stops the model server first when it is stopped. If the model server crashes, the console exits with status 1 (`--exit-on-crash`) and systemd restarts both; after five failures within ten minutes it gives up (`systemctl --user reset-failed qwfn-console` clears that). Adjust the repository path in the unit (`WorkingDirectory`, `ExecStart`).
 
 ```bash
 cp scripts/qwfn-console.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now qwfn-console

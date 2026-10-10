@@ -2007,11 +2007,32 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._json({"ok": True})
         self._json({"error": "not found"}, 404)
 
+# ---- --exit-on-crash: a model server that dies takes the console down with it ----------
+# Under systemd the console outlives a crashed engine, so Restart=on-failure never fires and the
+# service reads "active" with nothing serving. With --exit-on-crash the console exits with status 1
+# when the server exits on its own; systemd restarts it and --start serves the last model again.
+STOPPING = threading.Event()   # SIGINT seen: systemd stops the service, the server gets it too
+EXIT = {"code": 0}
+
+def watch_server(srv):
+    excused = None   # a server that died while a tune or a self-test ran: they report it themselves
+    while not STOPPING.wait(5):
+        with LOCK:
+            p = STATE["proc"]
+            if not p or p.poll() is None or p is excused: continue
+            if TUNE["running"] or SELFTEST["running"]: excused = p; continue
+            code = p.returncode
+        if STOPPING.is_set(): return
+        print("--exit-on-crash: the model server exited on its own (code %s); exiting for a restart. Its log ends with:" % code, flush=True)
+        for l in log_tail(8): print("  " + l, flush=True)
+        EXIT["code"] = 1; srv.shutdown(); return
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--port", type=int, default=8090); ap.add_argument("--server-port", type=int, default=8080)
     ap.add_argument("--host", default="127.0.0.1", help="address to listen on: 127.0.0.1 (default), or 0.0.0.0 for the local network")
     ap.add_argument("--tls-cert", help="PEM certificate: serve HTTPS (scripts/gen-cert.sh makes a self-signed one)"); ap.add_argument("--tls-key", help="PEM private key for --tls-cert")
     ap.add_argument("--start", action="store_true", help="start the last served model and tier right away")
+    ap.add_argument("--exit-on-crash", action="store_true", help="for a service: exit with status 1 when the model server exits on its own, or when --start cannot start it, so the service manager restarts the console")
     ap.add_argument("--model", help="with --start: a model path or name instead of the last one. A path to a .gguf shard (or the folder holding the shards) also works when it lives outside every scanned location: its folder is added to the saved locations and rescanned"); ap.add_argument("--preset", help="with --start: chat | coding | coding_plus | custom")
     a = ap.parse_args(); STATE["port"] = a.server_port
     if a.model and os.path.exists(a.model):
@@ -2057,9 +2078,16 @@ def main():
             s = recommend(m, hardware(), a.preset or last.get("preset") or "coding")
             r = start_server(m, s)
             print("--start: " + (r.get("error") or "started %s (%s tier) on port %d" % (m["name"], s["preset"], s["port"])), flush=True)
+        if a.exit_on_crash and not (m and r.get("ok")): sys.exit(1)
+    if a.exit_on_crash:
+        def on_sigint(signum, frame):
+            STOPPING.set(); raise KeyboardInterrupt
+        signal.signal(signal.SIGINT, on_sigint)
+        threading.Thread(target=watch_server, args=(srv,), daemon=True).start()
     try: srv.serve_forever()
     except KeyboardInterrupt: pass
-    finally: stop_server()
+    finally: STOPPING.set(); stop_server()
+    sys.exit(EXIT["code"])
 
 if __name__ == "__main__":
     main()
